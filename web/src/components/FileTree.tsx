@@ -1,6 +1,6 @@
 import { useEffect, useRef } from 'react'
 import { useVirtualizer } from '@tanstack/react-virtual'
-import type { ChangedFile } from '../api'
+import type { ChangedFile, ViewedState } from '../api'
 import { fileLabel, type TreeRow } from '../tree'
 
 const ROW_HEIGHT = 22
@@ -10,8 +10,11 @@ interface Props {
   rows: TreeRow[]
   files: ChangedFile[]
   currentPath: string | null
+  /** Viewed marks of the paths GitHub lists; other files get no checkbox. */
+  viewed: ReadonlyMap<string, ViewedState>
   onOpen(path: string): void
   onToggle(key: string): void
+  onToggleViewed(path: string, viewed: boolean): void
 }
 
 function Chevron({ expanded }: { expanded: boolean }) {
@@ -42,7 +45,23 @@ function Counts({ file }: { file: ChangedFile }) {
   )
 }
 
-export function FileTree({ rows, files, currentPath, onOpen, onToggle }: Props) {
+function ViewedProgress({ viewed }: { viewed: ReadonlyMap<string, ViewedState> }) {
+  if (viewed.size === 0) return null
+  let done = 0
+  for (const state of viewed.values()) if (state === 'VIEWED') done++
+  return (
+    <div className="tree-footer" title="GitHub 上的已看状态，包括生成的文件">
+      <span>
+        已看 {done}/{viewed.size}
+      </span>
+      <div className="progress">
+        <div className="progress-bar" style={{ width: `${(done / viewed.size) * 100}%` }} />
+      </div>
+    </div>
+  )
+}
+
+export function FileTree({ rows, files, currentPath, viewed, onOpen, onToggle, onToggleViewed }: Props) {
   const scrollRef = useRef<HTMLDivElement>(null)
   const virtualizer = useVirtualizer({
     count: rows.length,
@@ -80,10 +99,11 @@ export function FileTree({ rows, files, currentPath, onOpen, onToggle }: Props) 
               const f = row.file
               const { name, renamedFrom } = fileLabel(f)
               const selected = f.path === currentPath
+              const mark = viewed.get(f.path)
               return (
                 <div
                   key={row.key}
-                  className={`tree-row tree-file${selected ? ' is-selected' : ''}`}
+                  className={`tree-row tree-file${selected ? ' is-selected' : ''}${mark === 'VIEWED' ? ' is-viewed' : ''}`}
                   style={style}
                   role="treeitem"
                   aria-selected={selected}
@@ -102,6 +122,18 @@ export function FileTree({ rows, files, currentPath, onOpen, onToggle }: Props) 
                     {name}
                   </span>
                   <Counts file={f} />
+                  {mark === 'DISMISSED' && <span className="dismissed-dot" title="看过之后又被修改" />}
+                  {mark !== undefined && (
+                    <input
+                      type="checkbox"
+                      className="viewed-box"
+                      checked={mark === 'VIEWED'}
+                      title={mark === 'VIEWED' ? '已看' : '标记为已看'}
+                      aria-label={`已看 ${f.path}`}
+                      onClick={(e) => e.stopPropagation()}
+                      onChange={(e) => onToggleViewed(f.path, e.target.checked)}
+                    />
+                  )}
                 </div>
               )
             }
@@ -123,6 +155,7 @@ export function FileTree({ rows, files, currentPath, onOpen, onToggle }: Props) 
           })}
         </div>
       </div>
+      <ViewedProgress viewed={viewed} />
     </div>
   )
 }

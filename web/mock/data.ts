@@ -18,6 +18,7 @@ export interface MockPr {
   head: { ref: string; sha: string }
   mergeBase: string
   nodeId: string
+  viewer: string
 }
 
 export interface MockChangedFile {
@@ -32,6 +33,7 @@ export interface MockChangedFile {
   deletions?: number
   binary: boolean
   generated: boolean
+  viewed?: 'VIEWED' | 'UNVIEWED' | 'DISMISSED'
 }
 
 interface Spec {
@@ -486,6 +488,28 @@ function buildFiles(): MockChangedFile[] {
 
 export const files: MockChangedFile[] = buildFiles()
 
+/** Paths whose PUT /viewed fails: a GitHub error, and a head that moved meanwhile (409). */
+export const VIEWED_FAILS = 'data/big.csv'
+export const VIEWED_STALE = 'README.md'
+
+/**
+ * Viewed marks as GitHub would report them. The copied file has none, like a path GitHub's
+ * rename detection does not list, so it gets no checkbox.
+ */
+export const viewed = new Map<string, NonNullable<MockChangedFile['viewed']>>(
+  files.filter((f) => f.status !== 'C').map((f) => [f.path, 'UNVIEWED']),
+)
+viewed.set('src/app/config.json', 'VIEWED')
+viewed.set('Cargo.lock', 'VIEWED')
+viewed.set('src/styles/theme.css', 'DISMISSED')
+
+export function filesWithViewed(): MockChangedFile[] {
+  return files.map((f) => {
+    const v = viewed.get(f.path)
+    return v ? { ...f, viewed: v } : f
+  })
+}
+
 export function prSummary(host: string, owner: string, repo: string, n: number): MockPr {
   return {
     host,
@@ -500,5 +524,6 @@ export function prSummary(host: string, owner: string, repo: string, n: number):
     head: { ref: 'feat/slug-redirects', sha: 'b'.repeat(40) },
     mergeBase: 'c'.repeat(40),
     nodeId: 'PR_kwDOMOCK',
+    viewer: 'mock-reviewer',
   }
 }

@@ -1,4 +1,4 @@
-// HTTP client for the tideline backend. Types mirror docs/m0-skeleton.md.
+// HTTP client for the tideline backend. Types mirror docs/m0-skeleton.md and docs/m1-review-context.md.
 
 export interface PrSummary {
   host: string
@@ -13,7 +13,12 @@ export interface PrSummary {
   head: { ref: string; sha: string }
   mergeBase: string
   nodeId: string
+  /** Login of the user the server's GitHub token belongs to. */
+  viewer: string
 }
+
+/** DISMISSED: viewed, then changed by a later push. */
+export type ViewedState = 'VIEWED' | 'UNVIEWED' | 'DISMISSED'
 
 export type FileStatus = 'A' | 'M' | 'D' | 'R' | 'C' | 'T'
 
@@ -32,6 +37,8 @@ export interface ChangedFile {
   deletions?: number
   binary: boolean
   generated: boolean
+  /** Only on the full PR file list, and only for paths GitHub lists. */
+  viewed?: ViewedState
 }
 
 export interface ApiErrorBody {
@@ -54,6 +61,7 @@ const CODE_MESSAGES: Record<string, string> = {
   github_error: 'GitHub 请求失败',
   git_error: 'git 操作失败',
   bad_request: '请求参数不正确',
+  stale_head: 'PR 已经有新的提交，请先刷新',
 }
 
 export class ApiError extends Error {
@@ -116,6 +124,16 @@ export async function getPr(r: RepoRef, n: number, refresh = false): Promise<PrS
 export async function getPrFiles(r: RepoRef, n: number, refresh = false): Promise<ChangedFile[]> {
   const res = await request(`${repoBase(r)}/pulls/${n}/files${refresh ? '?refresh=1' : ''}`)
   return (await res.json()) as ChangedFile[]
+}
+
+/** Marks (`viewed`) or unmarks a file as viewed; `head` is the head the page shows. */
+export async function setViewed(r: RepoRef, n: number, path: string, viewed: boolean, head: string): Promise<ViewedState> {
+  const res = await request(`${repoBase(r)}/pulls/${n}/viewed`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path, viewed, head }),
+  })
+  return ((await res.json()) as { viewed: ViewedState }).viewed
 }
 
 /** Raw blob response; the caller decides whether to read the body (see Content-Length checks). */

@@ -214,6 +214,11 @@ kbd {
   color: #a86a12;
 }
 
+.chip-dismissed {
+  background: #f76d4726;
+  color: #c4502e;
+}
+
 kbd {
   padding: 0 4px;
   border: 1px solid var(--line);
@@ -532,6 +537,54 @@ kbd {
   flex: none;
   font-family: var(--code-font);
   font-size: 11px;
+}
+
+.tree-file.is-viewed .status-letter,
+.tree-file.is-viewed .file-name,
+.tree-file.is-viewed .counts {
+  opacity: 0.5;
+}
+
+.viewed-box {
+  flex: none;
+  margin: 0 0 0 2px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.dismissed-dot {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--syn-numbers);
+}
+
+.tree-footer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 26px;
+  flex: none;
+  padding: 0 10px;
+  border-top: 1px solid var(--line);
+  color: var(--fg);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.progress {
+  flex: 1;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--second-bg);
+  overflow: hidden;
+}
+
+.progress-bar {
+  height: 100%;
+  background: var(--accent);
+  transition: width 120ms;
 }
 
 /* Diff pane ---------------------------------------------------------------------- */
@@ -861,4 +914,27 @@ kbd {
 .monaco-editor .diff-hidden-lines .center {
   font-family: var(--ui-font);
   font-size: 12px;
+}
+
+/* Toast ---------------------------------------------------------------------------- */
+
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 36px;
+  z-index: 200;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  max-width: min(640px, 90vw);
+  padding: 8px 12px;
+  border-radius: 4px;
+  background: var(--fg);
+  color: #fff;
+  box-shadow: 0 4px 16px rgb(0 0 0 / 18%);
+}
+
+.toast .btn {
+  flex: none;
 }

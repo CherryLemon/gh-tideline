@@ -1,11 +1,23 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { getPr, getPrFiles, errorMessage, type ChangedFile, type PrSummary, type RepoRef } from '../api'
+import {
+  ApiError,
+  getPr,
+  getPrFiles,
+  errorMessage,
+  setViewed,
+  type ChangedFile,
+  type PrSummary,
+  type RepoRef,
+  type ViewedState,
+} from '../api'
 import { fileQuery, navigate, type PrRoute } from '../router'
 import { GENERATED_KEY, ancestorKeys, buildTree } from '../tree'
 import { usePersistentState } from '../storage'
+import { ViewedSync, isTypingTarget, nextUnviewed, viewedMap } from '../viewed'
 import { DiffPane, type ChangeInfo, type DiffPaneHandle, type PendingJump } from './DiffPane'
 import { FileTree } from './FileTree'
 import { FileFinder } from './FileFinder'
+import { Toast, type ToastMessage } from './Toast'
 
 interface Props {
   route: PrRoute
@@ -46,12 +58,12 @@ export function PrPage({ route, search }: Props) {
     }
   }, [load])
 
-  const refresh = () => {
+  const refresh = useCallback(() => {
     setRefreshing(true)
     load(true)
       .then(setData, (e: unknown) => setError(errorMessage(e)))
       .finally(() => setRefreshing(false))
-  }
+  }, [load])
 
   useEffect(() => {
     if (data) document.title = `#${data.pr.number} ${data.pr.title} · ${data.pr.owner}/${data.pr.repo}`
@@ -101,6 +113,35 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
   const pendingJump = useRef<PendingJump | null>(null)
   const pane = useRef<DiffPaneHandle>(null)
 
+  const [toast, setToast] = useState<ToastMessage | null>(null)
+  const toastId = useRef(0)
+  const showToast = useCallback((text: string, action?: ToastMessage['action']) => {
+    setToast({ id: ++toastId.current, text, action })
+  }, [])
+  const dismissToast = useCallback(() => setToast(null), [])
+
+  // Viewed marks: one sync per loaded file list; a refresh (new data) starts over from the server's marks.
+  const [marks, setMarks] = useState<ReadonlyMap<string, ViewedState>>(() => viewedMap(files))
+  const sync = useRef<ViewedSync | null>(null)
+  useEffect(() => {
+    const s = new ViewedSync(
+      viewedMap(files),
+      (path, viewed) => setViewed(repo, pr.number, path, viewed, pr.head.sha),
+      () => setMarks(s.snapshot()),
+      (path, e) => {
+        if (e instanceof ApiError && e.code === 'stale_head') showToast(e.message, { label: '刷新', run: onRefresh })
+        else showToast(`无法更新 ${path} 的已看状态：${errorMessage(e)}`)
+      },
+    )
+    sync.current = s
+    setMarks(s.snapshot())
+    return () => {
+      s.dispose()
+      sync.current = null
+    }
+  }, [repo, pr.number, pr.head.sha, files, showToast, onRefresh])
+  const toggleViewed = useCallback((path: string, viewed: boolean) => sync.current?.set(path, viewed), [])
+
   const requested = new URLSearchParams(search).get('file')
   const currentIndex = order.findIndex((f) => f.path === requested)
   const current = currentIndex >= 0 ? order[currentIndex] : null
@@ -141,14 +182,29 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
     })
   }, [])
 
+  /** `v`: toggles the current file; marking it viewed moves on to the next unviewed file. */
+  const toggleCurrentViewed = () => {
+    const s = sync.current
+    if (!current || !s) return
+    if (!s.has(current.path)) {
+      showToast('GitHub 的文件列表里没有这个路径，无法标记已看')
+      return
+    }
+    const viewed = !s.isViewed(current.path)
+    s.set(current.path, viewed)
+    if (!viewed) return
+    const next = nextUnviewed(order, currentIndex, s.snapshot())
+    if (next !== null) openFile(order[next].path)
+  }
+
   // Keep the latest navigation state for the window-level key handler.
-  const nav = useRef({ order, currentIndex, openFile, finderOpen })
-  nav.current = { order, currentIndex, openFile, finderOpen }
+  const nav = useRef({ order, currentIndex, openFile, finderOpen, toggleCurrentViewed })
+  nav.current = { order, currentIndex, openFile, finderOpen, toggleCurrentViewed }
 
   useEffect(() => {
     let lastShift = 0
     const onKeyDown = (e: KeyboardEvent) => {
-      const { order, currentIndex, openFile, finderOpen } = nav.current
+      const { order, currentIndex, openFile, finderOpen, toggleCurrentViewed } = nav.current
       if (e.key === 'Shift') {
         if (e.repeat) return
         const now = performance.now()
@@ -188,6 +244,11 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
       if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'p') {
         consume()
         setFinderOpen(true)
+        return
+      }
+      if (plain && !e.shiftKey && e.key === 'v' && !e.repeat && !e.isComposing && !isTypingTarget(e.target)) {
+        consume()
+        toggleCurrentViewed()
       }
     }
     window.addEventListener('keydown', onKeyDown, true)
@@ -253,7 +314,15 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
 
       <div className="main">
         <aside className="sidebar">
-          <FileTree rows={tree.rows} files={files} currentPath={current?.path ?? null} onOpen={openFile} onToggle={toggle} />
+          <FileTree
+            rows={tree.rows}
+            files={files}
+            currentPath={current?.path ?? null}
+            viewed={marks}
+            onOpen={openFile}
+            onToggle={toggle}
+            onToggleViewed={toggleViewed}
+          />
         </aside>
         <div className="splitter" onMouseDown={startResize} />
         <section className="content">
@@ -266,6 +335,7 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
               sideBySide={sideBySide}
               ignoreTrimWhitespace={ignoreWs}
               pendingJump={pendingJump}
+              headerActions={<ViewedCheck path={current.path} mark={marks.get(current.path)} onToggle={toggleViewed} />}
               onChangeInfo={setChangeInfo}
             />
           ) : (
@@ -290,6 +360,7 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
         <span className="hint"><kbd>Shift+F7</kbd> 上一处</span>
         <span className="hint"><kbd>Alt+↓</kbd>/<kbd>Alt+↑</kbd> 下/上一个文件</span>
         <span className="hint"><kbd>Shift Shift</kbd>/<kbd>Ctrl+P</kbd> 查找文件</span>
+        <span className="hint"><kbd>v</kbd> 已看</span>
       </footer>
 
       {finderOpen && (
@@ -302,6 +373,20 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
           }}
         />
       )}
+      {toast && <Toast toast={toast} onDismiss={dismissToast} />}
     </div>
+  )
+}
+
+function ViewedCheck({ path, mark, onToggle }: { path: string; mark: ViewedState | undefined; onToggle(path: string, viewed: boolean): void }) {
+  if (mark === undefined) return null
+  return (
+    <>
+      {mark === 'DISMISSED' && <span className="chip chip-dismissed">看过之后又被修改</span>}
+      <label className="check" title="快捷键 v">
+        <input type="checkbox" checked={mark === 'VIEWED'} onChange={(e) => onToggle(path, e.target.checked)} />
+        已看
+      </label>
+    </>
   )
 }

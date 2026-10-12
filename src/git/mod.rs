@@ -416,7 +416,10 @@ impl Repo {
             .await
             .unwrap_or_default();
         for path in removed {
-            eprintln!("gh-tideline: removed stale git lock file {}", path.display());
+            eprintln!(
+                "gh-tideline: removed stale git lock file {}",
+                path.display()
+            );
         }
         if !state.hardened {
             self.harden().await?;
@@ -535,6 +538,26 @@ impl Repo {
                 &base_spec,
                 &head_spec,
             ],
+            None,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Pins a local commit with `refs/dr/pull/<n>/c/<sha>` so a future gc keeps it.
+    /// `protocol.allow=never`: if the commit were missing, `update-ref` would otherwise
+    /// lazily fetch it with its whole history.
+    pub async fn protect_commit(
+        &self,
+        _guard: &RepoGuard,
+        number: u64,
+        sha: &str,
+    ) -> Result<(), GitFailure> {
+        debug_assert!(is_oid(sha));
+        let name = format!("refs/dr/pull/{number}/c/{sha}");
+        self.git(
+            None,
+            &["-c", "protocol.allow=never", "update-ref", &name, sha],
             None,
         )
         .await
@@ -724,8 +747,10 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir =
-            std::env::temp_dir().join(format!("gh-tideline-test-{name}-{}-{nanos}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "gh-tideline-test-{name}-{}-{nanos}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }

@@ -4,6 +4,7 @@ mod git;
 mod github;
 mod pr;
 mod server;
+mod state;
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -96,7 +97,8 @@ async fn run(cli: Cli) -> Result<(), String> {
     std::fs::write(&server_json, info.to_string())
         .map_err(|e| format!("{}: {e}", server_json.display()))?;
 
-    let pr_service = Arc::new(pr::PrService::new(repos));
+    let state_db = state::StateDb::open(&paths.cache_dir.join("state.sqlite"))?;
+    let pr_service = Arc::new(pr::PrService::new(repos, state_db));
     let state = server::state(
         port,
         secret.clone(),

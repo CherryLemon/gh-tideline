@@ -39,6 +39,8 @@ interface Props {
   ignoreTrimWhitespace: boolean
   /** Set by the page before switching files with F7 / Shift+F7; applied once the diff is computed. */
   pendingJump: React.MutableRefObject<PendingJump | null>
+  /** Controls shown at the right end of the file header. */
+  headerActions?: React.ReactNode
   onChangeInfo(info: ChangeInfo | null): void
 }
 
@@ -72,7 +74,7 @@ function endLine(c: Monaco.editor.ILineChange, side: 'original' | 'modified'): n
 }
 
 export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
-  { repo, file, nextFile, sideBySide, ignoreTrimWhitespace, pendingJump, onChangeInfo },
+  { repo, file, nextFile, sideBySide, ignoreTrimWhitespace, pendingJump, headerActions, onChangeInfo },
   ref,
 ) {
   const editorRef = useRef<DiffEditorT | null>(null)
@@ -329,7 +331,7 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
 
   return (
     <div className="diff-pane">
-      <FileHeader file={file} plainReason={state.kind === 'text' ? state.plainReason : null} />
+      <FileHeader file={file} plainReason={state.kind === 'text' ? state.plainReason : null} actions={headerActions} />
       <div className="diff-body">
         <div className={`diff-editor${showEditor ? '' : ' is-hidden'}`}>
           <DiffEditor
@@ -419,7 +421,7 @@ function SubmoduleDiff({ file }: { file: ChangedFile }) {
   )
 }
 
-function FileHeader({ file, plainReason }: { file: ChangedFile; plainReason: string | null }) {
+function FileHeader({ file, plainReason, actions }: { file: ChangedFile; plainReason: string | null; actions?: React.ReactNode }) {
   const renamed = file.oldPath && file.oldPath !== file.path
   const modeChanged = file.oldMode !== file.newMode && file.oldMode !== '000000' && file.newMode !== '000000'
   return (
@@ -443,6 +445,8 @@ function FileHeader({ file, plainReason }: { file: ChangedFile; plainReason: str
       )}
       {file.generated && <span className="chip">generated</span>}
       {plainReason && <span className="chip chip-warn">{plainReason}</span>}
+      <span className="spacer" />
+      {actions}
     </div>
   )
 }

@@ -6,10 +6,11 @@ pub mod security;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, put};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
@@ -18,6 +19,7 @@ use crate::error::AppError;
 use crate::git::is_oid;
 use crate::pr::PrService;
 use crate::pr::target::valid_name;
+use crate::state::PrKey;
 use security::{AuthTokens, Policy, Sessions};
 
 /// Lifetime of a browser session (server-side and cookie `Max-Age`).
@@ -69,6 +71,10 @@ pub fn router(state: AppState) -> Router {
             "/api/{host}/{owner}/{repo}/pulls/{n}/files",
             get(pull_files),
         )
+        .route(
+            "/api/{host}/{owner}/{repo}/pulls/{n}/viewed",
+            put(set_viewed),
+        )
         .route("/api/{host}/{owner}/{repo}/blobs/{oid}", get(blob))
         .fallback(fallback)
         .layer(axum::middleware::from_fn_with_state(
@@ -102,7 +108,9 @@ async fn auth(
     state
         .tokens
         .redeem(q.t.as_deref().unwrap_or_default(), unix_now())
-        .map_err(|e| AppError::unauthorized(format!("{e}; run `gh-tideline` again for a new one")))?;
+        .map_err(|e| {
+            AppError::unauthorized(format!("{e}; run `gh-tideline` again for a new one"))
+        })?;
     let cookie = format!(
         "{}={}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
         state.policy.cookie_name,
@@ -170,7 +178,41 @@ async fn pull_files(
     Query(q): Query<RefreshQuery>,
 ) -> Result<Response, AppError> {
     let data = load_pr(&state, params, q).await?;
-    Ok(Json(&data.files).into_response())
+    Ok(Json(data.files_with_viewed()).into_response())
+}
+
+#[derive(Deserialize)]
+struct ViewedBody {
+    path: String,
+    viewed: bool,
+    head: String,
+}
+
+async fn set_viewed(
+    State(state): State<AppState>,
+    Path((host, owner, repo, n)): Path<(String, String, String, String)>,
+    body: Bytes,
+) -> Result<Response, AppError> {
+    check_repo(&state, &host, &owner, &repo)?;
+    let number = parse_pr_number(&n)?;
+    let body: ViewedBody = serde_json::from_slice(&body)
+        .map_err(|e| AppError::bad_request(format!("invalid request body: {e}")))?;
+    if !is_oid(&body.head) {
+        return Err(AppError::bad_request(
+            "head must be 40 (or 64) lowercase hex characters",
+        ));
+    }
+    let key = PrKey {
+        host,
+        owner,
+        repo,
+        number,
+    };
+    let viewed = state
+        .pr
+        .set_viewed(&key, &body.path, body.viewed, &body.head)
+        .await?;
+    Ok(Json(json!({ "path": body.path, "viewed": viewed })).into_response())
 }
 
 async fn blob(

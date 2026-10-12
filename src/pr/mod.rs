@@ -3,7 +3,7 @@
 pub mod target;
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -11,7 +11,8 @@ use serde::Serialize;
 use crate::error::AppError;
 use crate::git::parse::GITLINK_MODE;
 use crate::git::{ChangedFile, GitAuth, GitFailure, ObjectLookup, Repo, RepoGuard, Repos};
-use crate::github::{Github, Tokens};
+use crate::github::{Github, Tokens, ViewedState};
+use crate::state::{PrKey, StateDb};
 
 const CACHE_TTL: Duration = Duration::from_secs(30);
 /// With `refresh`, a result whose computation started at most this long before the request
@@ -41,14 +42,53 @@ pub struct PrSummary {
     pub head: RefInfo,
     pub merge_base: String,
     pub node_id: String,
+    pub viewer: String,
 }
 
 pub struct PrData {
     pub summary: PrSummary,
     pub files: Vec<ChangedFile>,
+    /// The viewer's viewed marks, keyed by GitHub's own file paths (its rename detection
+    /// may differ from ours). Updated in place after a successful `set_viewed`.
+    viewed: Mutex<HashMap<String, ViewedState>>,
 }
 
-type PrKey = (String, String, String, u64);
+/// A [`ChangedFile`] plus the viewer's viewed mark (only for paths GitHub lists).
+#[derive(Serialize)]
+pub struct FileWithViewed<'a> {
+    #[serde(flatten)]
+    file: &'a ChangedFile,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    viewed: Option<ViewedState>,
+}
+
+impl PrData {
+    pub fn files_with_viewed(&self) -> Vec<FileWithViewed<'_>> {
+        let viewed = self.viewed.lock().expect("viewed map poisoned");
+        self.files
+            .iter()
+            .map(|file| FileWithViewed {
+                file,
+                viewed: viewed.get(&file.path).copied(),
+            })
+            .collect()
+    }
+
+    /// Whether every file GitHub lists, except files we classify as generated, is VIEWED.
+    fn fully_viewed(&self) -> bool {
+        let generated: std::collections::HashSet<&str> = self
+            .files
+            .iter()
+            .filter(|f| f.generated)
+            .map(|f| f.path.as_str())
+            .collect();
+        self.viewed
+            .lock()
+            .expect("viewed map poisoned")
+            .iter()
+            .all(|(path, state)| *state == ViewedState::Viewed || generated.contains(path.as_str()))
+    }
+}
 
 struct Cached {
     /// When the pipeline run that produced `data` started.
@@ -63,7 +103,8 @@ pub struct PrService {
     repos: Repos,
     github: Github,
     tokens: Tokens,
-    cache: std::sync::Mutex<HashMap<PrKey, CacheSlot>>,
+    state: StateDb,
+    cache: Mutex<HashMap<PrKey, CacheSlot>>,
 }
 
 fn git_err(e: GitFailure) -> AppError {
@@ -71,13 +112,23 @@ fn git_err(e: GitFailure) -> AppError {
 }
 
 impl PrService {
-    pub fn new(repos: Repos) -> Self {
+    pub fn new(repos: Repos, state: StateDb) -> Self {
         PrService {
             repos,
             github: Github::new(),
             tokens: Tokens::default(),
+            state,
             cache: Default::default(),
         }
+    }
+
+    fn slot(&self, key: &PrKey) -> CacheSlot {
+        self.cache
+            .lock()
+            .expect("PR cache poisoned")
+            .entry(key.clone())
+            .or_default()
+            .clone()
     }
 
     /// Returns the PR summary and file list, reusing a result younger than 30 s unless
@@ -94,20 +145,13 @@ impl PrService {
         refresh: bool,
     ) -> Result<Arc<PrData>, AppError> {
         let requested = Instant::now();
-        let key = (
-            host.to_string(),
-            owner.to_string(),
-            repo.to_string(),
+        let key = PrKey {
+            host: host.to_string(),
+            owner: owner.to_string(),
+            repo: repo.to_string(),
             number,
-        );
-        let slot = self
-            .cache
-            .lock()
-            .expect("PR cache poisoned")
-            .entry(key.clone())
-            .or_default()
-            .clone();
-        let mut slot = slot.lock_owned().await;
+        };
+        let mut slot = self.slot(&key).lock_owned().await;
         if let Some(c) = slot.as_ref() {
             let usable = if refresh {
                 c.started + REFRESH_COALESCE >= requested
@@ -120,9 +164,12 @@ impl PrService {
         }
         let service = Arc::clone(self);
         let task = tokio::spawn(async move {
-            let (host, owner, repo, number) = key;
             let started = Instant::now();
-            let data = Arc::new(service.load(&host, &owner, &repo, number).await?);
+            let data = Arc::new(
+                service
+                    .load(&key.host, &key.owner, &key.repo, key.number)
+                    .await?,
+            );
             *slot = Some(Cached {
                 started,
                 finished: Instant::now(),
@@ -172,6 +219,16 @@ impl PrService {
         let mut files = range_files(&repo, &mut guard, &auth, &merge_base, &head).await?;
         drop(guard);
 
+        let viewed: HashMap<String, ViewedState> = pr
+            .files
+            .iter()
+            .map(|f| {
+                (
+                    f.path.clone(),
+                    f.viewer_viewed_state.unwrap_or(ViewedState::Unviewed),
+                )
+            })
+            .collect();
         let gh_counts: HashMap<&str, (u64, u64)> = pr
             .files
             .iter()
@@ -208,9 +265,104 @@ impl PrService {
                 },
                 merge_base,
                 node_id: pr.id,
+                viewer: pr.viewer,
             },
             files,
+            viewed: Mutex::new(viewed),
         })
+    }
+
+    /// Marks or unmarks `path` as viewed on GitHub. `head` is the head the client shows: if
+    /// the PR has moved on, GitHub would also mark changes the user has not seen, so this
+    /// fails with `stale_head` instead. Once every non-generated file is viewed, the head is
+    /// remembered as seen (the fallback baseline for "since your last review").
+    pub async fn set_viewed(
+        self: &Arc<Self>,
+        key: &PrKey,
+        path: &str,
+        viewed: bool,
+        head: &str,
+    ) -> Result<ViewedState, AppError> {
+        let data = self
+            .open(&key.host, &key.owner, &key.repo, key.number, false)
+            .await?;
+        if !data
+            .viewed
+            .lock()
+            .expect("viewed map poisoned")
+            .contains_key(path)
+        {
+            return Err(AppError::bad_request(format!(
+                "{path:?} is not a file of this pull request"
+            )));
+        }
+        let token = self.tokens.get(&key.host).await?;
+        let current = self
+            .github
+            .head_oid(&key.host, &token, &key.owner, &key.repo, key.number)
+            .await?;
+        if current != head || current != data.summary.head.sha {
+            return Err(AppError::stale_head(
+                "the pull request has new commits; refresh before marking files as viewed",
+            ));
+        }
+        self.github
+            .set_viewed(&key.host, &token, &data.summary.node_id, path, viewed)
+            .await?;
+        let state = if viewed {
+            ViewedState::Viewed
+        } else {
+            ViewedState::Unviewed
+        };
+        data.viewed
+            .lock()
+            .expect("viewed map poisoned")
+            .insert(path.to_string(), state);
+
+        // Bookkeeping that must not delay (or fail) the response.
+        let service = Arc::clone(self);
+        let key = key.clone();
+        let path = path.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = service.after_set_viewed(&key, data, &path, state).await {
+                eprintln!("gh-tideline: recording the viewed state failed: {e}");
+            }
+        });
+        Ok(state)
+    }
+
+    async fn after_set_viewed(
+        &self,
+        key: &PrKey,
+        data: Arc<PrData>,
+        path: &str,
+        state: ViewedState,
+    ) -> Result<(), String> {
+        // A refresh that ran concurrently may have read the mark from before the mutation.
+        let current = self.slot(key).lock().await.as_ref().map(|c| c.data.clone());
+        if let Some(current) = current
+            && !Arc::ptr_eq(&current, &data)
+            && current.summary.head.sha == data.summary.head.sha
+        {
+            current
+                .viewed
+                .lock()
+                .expect("viewed map poisoned")
+                .insert(path.to_string(), state);
+        }
+        if state != ViewedState::Viewed || !data.fully_viewed() {
+            return Ok(());
+        }
+        let head = &data.summary.head.sha;
+        let repo = self.repos.repo(&key.host, &key.owner, &key.repo);
+        let guard = repo.lock().await.map_err(|e| e.to_string())?;
+        repo.protect_commit(&guard, key.number, head)
+            .await
+            .map_err(|e| e.to_string())?;
+        drop(guard);
+        self.state
+            .set_seen_head(key, head, crate::server::unix_now())
+            .await
     }
 
     /// Raw bytes of a blob from the cache repo. A local read comes first and takes no lock.
