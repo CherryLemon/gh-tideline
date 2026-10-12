@@ -68,10 +68,18 @@ Tideline sits in between:
 
 ## Install
 
-Requirements:
-- Rust (stable)
-- git ≥ 2.40
-- Node.js and pnpm (to build the frontend)
+Tideline needs git ≥ 2.40 at runtime. Prebuilt binaries are available for Linux and macOS (amd64 and arm64). Windows is not supported yet.
+
+**As a gh extension (recommended)**
+
+```bash
+gh extension install CherryLemon/gh-tideline
+gh extension upgrade tideline   # later, to update
+```
+
+**Standalone binary:** download `gh-tideline-<os>-<arch>` from [Releases](https://github.com/CherryLemon/gh-tideline/releases), make it executable and put it on your PATH.
+
+**From source:** requires Rust (stable), Node.js and pnpm.
 
 ```bash
 git clone https://github.com/CherryLemon/gh-tideline.git
@@ -80,17 +88,17 @@ make build                                  # builds the frontend, then cargo bu
 cp target/release/gh-tideline ~/.local/bin/ # or any directory on your PATH
 ```
 
-The result is a single binary with the web UI embedded.
-
-> Prebuilt releases are not published yet. Once they are, `gh extension install CherryLemon/gh-tideline` will install it and you can run it as `gh tideline`.
+Either way, you get a single binary with the web UI embedded.
 
 ## Usage
 
+Run it as `gh tideline` when installed as an extension, or as `gh-tideline` otherwise.
+
 ```bash
-gh-tideline https://github.com/owner/repo/pull/123   # a /files suffix etc. also works
-gh-tideline owner/repo#123
-gh-tideline 123                                      # inside a clone; the repo is taken from origin
-gh-tideline                                          # opens the home page, where you can paste a PR link
+gh tideline https://github.com/owner/repo/pull/123   # a /files suffix etc. also works
+gh tideline owner/repo#123
+gh tideline 123                                      # inside a clone; the repo is taken from origin
+gh tideline                                          # opens the home page, where you can paste a PR link
 ```
 
 **Authentication**
@@ -150,6 +158,8 @@ make dev     # prints the dev workflow
 
 - **Without a backend:** run `pnpm dev:mock` to work on the UI against a built-in fake PR.
 - **After frontend changes:** debug builds read `web/dist` from disk, so the result of `pnpm build` shows up without recompiling the backend.
+
+**Releasing:** bump `version` in `Cargo.toml` (and `Cargo.lock` via `cargo check`), commit, then push a matching tag such as `v0.2.0`. The [release workflow](.github/workflows/release.yml) tests, builds the binaries and publishes the GitHub release.
 
 ## License
 

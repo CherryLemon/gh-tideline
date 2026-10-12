@@ -1,0 +1,126 @@
+name: Release
+
+# Push a tag like v0.1.0 to publish a release. Asset names follow the gh precompiled-extension
+# convention (gh-tideline-<os>-<arch>), so `gh extension install CherryLemon/gh-tideline` picks
+# the right binary.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build and publish, e.g. v0.1.0"
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  web:
+    name: Build web UI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: web/package.json  # version comes from its packageManager field
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - name: Install, test, build
+        working-directory: web
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm test
+          pnpm build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+          if-no-files-found: error
+
+  build:
+    name: Build ${{ matrix.asset }}
+    needs: web
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          # Older Ubuntu images keep the glibc requirement low.
+          - { os: ubuntu-22.04,     target: x86_64-unknown-linux-gnu,  asset: gh-tideline-linux-amd64 }
+          - { os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu, asset: gh-tideline-linux-arm64 }
+          - { os: macos-latest,     target: aarch64-apple-darwin,      asset: gh-tideline-darwin-arm64 }
+          - { os: macos-latest,     target: x86_64-apple-darwin,       asset: gh-tideline-darwin-amd64 }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+      - name: Check the UI is present
+        # rust-embed uses allow_missing, so without this a release could ship with no UI.
+        run: test -f web/dist/index.html
+      - name: Check tag matches Cargo.toml version
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          [ "v$version" = "$TAG" ] || { echo "tag $TAG != Cargo.toml v$version"; exit 1; }
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Test
+        # Cross-compiled x86_64 macOS binaries can't be tested on the arm64 runner without Rosetta.
+        if: matrix.target != 'x86_64-apple-darwin'
+        run: cargo test --locked --target ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          mkdir -p out
+          cp target/${{ matrix.target }}/release/gh-tideline out/${{ matrix.asset }}
+          chmod +x out/${{ matrix.asset }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: out/${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: gh-tideline-*
+          path: out
+          merge-multiple: true
+      - name: Checksums
+        working-directory: out
+        run: sha256sum gh-tideline-* > SHA256SUMS && cat SHA256SUMS
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" out/* --clobber
+          else
+            gh release create "$TAG" out/* --title "$TAG" --generate-notes --verify-tag
+          fi
