@@ -143,7 +143,7 @@ The local server holds your GitHub token, so it treats every website and every o
   - tree-sitter based go to definition and find usages
   - Sticky header showing the current function or class
 
-Design details are in [`docs/design.md`](docs/design.md); the M0 implementation contract is in [`docs/m0-skeleton.md`](docs/m0-skeleton.md). Both are in Chinese.
+Design details are in [`docs/design.md`](docs/design.md).
 
 ## Development
 

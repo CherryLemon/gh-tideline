@@ -1,5 +1,5 @@
 // Loading file contents for the diff view: blob fetching, degradation rules and the
-// model LRU (docs/m0-skeleton.md "降级规则", design.md §5.2, §8).
+// model LRU (design.md §5.2, §8).
 import type * as Monaco from 'monaco-editor/editor/editor.api'
 import { getBlob, type ChangedFile, type RepoRef } from '../api'
 import { LIMITS, decideText, fileDisplay, imageType, isSafeBlobMime, measure, type ImageType, type SideMeasure, type TextMeta } from '../degrade'

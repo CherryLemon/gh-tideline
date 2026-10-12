@@ -1,5 +1,5 @@
 // Dev-only Vite plugin that answers /api/* with the fake PR from ./data.ts, following the
-// contract in docs/m0-skeleton.md (error shape, blob headers, X-DR requirement).
+// server's API contract (error shape, blob headers, X-DR requirement).
 // Loaded from vite.config.ts only in `--mode mock`; never part of the production build.
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Plugin } from 'vite'

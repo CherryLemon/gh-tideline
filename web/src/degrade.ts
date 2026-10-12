@@ -1,5 +1,5 @@
-// How a changed file is displayed: the degradation rules of docs/m0-skeleton.md ("降级规则",
-// design.md §5.2) and the image-type decisions behind design.md §8. Pure, no DOM or Monaco.
+// How a changed file is displayed: the degradation rules of design.md §5.2 and the
+// image-type decisions behind design.md §8. Pure, no DOM or Monaco.
 import type { ChangedFile } from './api'
 
 export const LIMITS = {

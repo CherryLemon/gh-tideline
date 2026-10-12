@@ -2,7 +2,7 @@ import type * as Monaco from 'monaco-editor/editor/editor.api'
 
 export const SANDY_BEACH_THEME = 'sandy-beach'
 
-// Material Theme UI "Sandy Beach" palette (docs/m0-skeleton.md).
+// Material Theme UI "Sandy Beach" palette.
 const ui = {
   background: '#FFF8ED',
   foreground: '#546E7A',

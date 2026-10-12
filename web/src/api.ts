@@ -1,4 +1,4 @@
-// HTTP client for the tideline backend. Types mirror docs/m0-skeleton.md and docs/m1-review-context.md.
+// HTTP client for the tideline backend. Types mirror the JSON the Rust server sends (design.md §6).
 
 export interface PrSummary {
   host: string
