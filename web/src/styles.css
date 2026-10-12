@@ -552,12 +552,8 @@ kbd {
   cursor: pointer;
 }
 
-.dismissed-dot {
-  flex: none;
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--syn-numbers);
+.tree-file.is-dismissed .file-name {
+  color: var(--syn-numbers);
 }
 
 .tree-footer {
@@ -937,4 +933,20 @@ kbd {
 
 .toast .btn {
   flex: none;
+}
+
+.toast-close {
+  flex: none;
+  padding: 0 2px;
+  border: 0;
+  background: none;
+  color: inherit;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0.7;
+}
+
+.toast-close:hover {
+  opacity: 1;
 }

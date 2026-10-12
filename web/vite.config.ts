@@ -3,15 +3,19 @@ import react from '@vitejs/plugin-react'
 
 const BACKEND = 'http://127.0.0.1:7457'
 
+const DEV_ORIGINS = new Set(['http://localhost:5173', 'http://127.0.0.1:5173'])
+
 // changeOrigin rewrites Host to 127.0.0.1:7457, which the backend's Host check accepts.
-// Non-GET requests also need a backend Origin (the page's is http://localhost:5173).
+// Non-GET requests also need a backend Origin; only this dev server's own pages get one,
+// so other origins still fail the backend's check.
 const proxy: Record<string, ProxyOptions> = {
   '/api': {
     target: BACKEND,
     changeOrigin: true,
     configure: (server) =>
       server.on('proxyReq', (req) => {
-        if (req.getHeader('origin')) req.setHeader('origin', BACKEND)
+        const origin = req.getHeader('origin')
+        if (typeof origin === 'string' && DEV_ORIGINS.has(origin)) req.setHeader('origin', BACKEND)
       }),
   },
   '/__auth': { target: BACKEND, changeOrigin: true },

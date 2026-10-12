@@ -501,4 +501,47 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn pull_request_response_with_viewer_and_viewed_states() {
+        let body = r#"{"data": {
+            "viewer": {"login": "me"},
+            "repository": {"pullRequest": {
+                "id": "PR_x", "title": "t", "state": "OPEN", "url": "https://github.com/o/r/pull/1",
+                "author": null,
+                "baseRefName": "main", "baseRefOid": "1111111111111111111111111111111111111111",
+                "headRefName": "f", "headRefOid": "2222222222222222222222222222222222222222",
+                "files": {"pageInfo": {"hasNextPage": false, "endCursor": null}, "nodes": [
+                    {"path": "a", "additions": 1, "deletions": 0, "changeType": "MODIFIED", "viewerViewedState": "VIEWED"},
+                    {"path": "b", "additions": 0, "deletions": 2, "changeType": "MODIFIED", "viewerViewedState": "DISMISSED"},
+                    {"path": "c", "additions": 0, "deletions": 0, "changeType": "ADDED", "viewerViewedState": null},
+                    {"path": "d", "additions": 0, "deletions": 0, "changeType": "ADDED", "viewerViewedState": "SOMETHING_NEW"},
+                    {"path": "e", "additions": 0, "deletions": 0, "changeType": "ADDED"}
+                ]}
+            }}
+        }}"#;
+        let resp: GqlResponse<GqlData> = serde_json::from_str(body).unwrap();
+        let data = resp.data.unwrap();
+        assert_eq!(data.viewer.login, "me");
+        let pr = data.repository.unwrap().pull_request.unwrap();
+        assert!(pr.author.is_none());
+        let states: Vec<Option<ViewedState>> = pr
+            .files
+            .unwrap()
+            .nodes
+            .unwrap()
+            .into_iter()
+            .map(|f| f.viewer_viewed_state)
+            .collect();
+        assert_eq!(
+            states,
+            [
+                Some(ViewedState::Viewed),
+                Some(ViewedState::Dismissed),
+                None,
+                None,
+                None
+            ]
+        );
+    }
 }

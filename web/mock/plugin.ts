@@ -96,7 +96,10 @@ export function mockApi(): Plugin {
             return
           }
           error(res, 404, 'not_found', `no route for ${url.pathname}`)
-        })()
+        })().catch((e: unknown) => {
+          // E.g. the page navigated away while a request body was still arriving.
+          if (!res.headersSent && !res.destroyed) error(res, 500, 'mock_error', String(e))
+        })
       })
     },
   }

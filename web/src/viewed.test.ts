@@ -87,6 +87,71 @@ describe('ViewedSync', () => {
     await settle()
     expect(changes()).toBe(before)
   })
+
+  it('sends nothing more once disposed, even if an intent is pending', async () => {
+    const { sync, calls, settle } = setup({ a: 'UNVIEWED' })
+    sync.set('a', true)
+    sync.set('a', false)
+    sync.dispose()
+    calls[0].resolve('VIEWED')
+    await settle()
+    expect(calls).toHaveLength(1)
+  })
+})
+
+describe('ViewedSync.rebase', () => {
+  it('takes server marks for idle paths and keeps busy ones', async () => {
+    const { sync, calls } = setup({ a: 'UNVIEWED', b: 'UNVIEWED', c: 'VIEWED' })
+    sync.set('a', true)
+    sync.rebase(
+      new Map<string, ViewedState>([
+        ['a', 'UNVIEWED'],
+        ['b', 'VIEWED'],
+      ]),
+      performance.now(),
+    )
+    const marks = sync.snapshot()
+    expect(marks.get('a')).toBe('VIEWED') // in flight: intent wins
+    expect(marks.get('b')).toBe('VIEWED') // changed elsewhere: taken
+    expect(marks.has('c')).toBe(false) // no longer listed
+    expect(sync.has('c')).toBe(false)
+    expect(calls).toHaveLength(1)
+  })
+
+  it('ignores a list requested before the last request for a path settled', async () => {
+    const { sync, calls, settle } = setup({ a: 'UNVIEWED' })
+    const before = performance.now() - 1
+    sync.set('a', true)
+    calls[0].resolve('VIEWED')
+    await settle()
+    // A refresh sent before the mark landed still reports the old state.
+    sync.rebase(new Map<string, ViewedState>([['a', 'UNVIEWED']]), before)
+    expect(sync.snapshot().get('a')).toBe('VIEWED')
+    // A later one is authoritative (e.g. unmarked on github.com).
+    sync.rebase(new Map<string, ViewedState>([['a', 'UNVIEWED']]), performance.now() + 1)
+    expect(sync.snapshot().get('a')).toBe('UNVIEWED')
+  })
+
+  it('ignores a list requested before one already taken', () => {
+    const { sync } = setup({ a: 'UNVIEWED' })
+    const t = performance.now()
+    sync.rebase(new Map<string, ViewedState>([['a', 'VIEWED']]), t + 2)
+    sync.rebase(new Map<string, ViewedState>([['a', 'UNVIEWED']]), t + 1)
+    expect(sync.snapshot().get('a')).toBe('VIEWED')
+  })
+
+  it('drops the intent of a path no longer listed, also once its request settles', async () => {
+    const { sync, calls, settle } = setup({ a: 'UNVIEWED', b: 'UNVIEWED' })
+    sync.set('a', true)
+    sync.set('a', false)
+    sync.rebase(new Map<string, ViewedState>([['b', 'UNVIEWED']]), performance.now())
+    expect(sync.snapshot().has('a')).toBe(false)
+    calls[0].resolve('VIEWED')
+    await settle()
+    expect(sync.snapshot().has('a')).toBe(false)
+    expect(sync.has('a')).toBe(false)
+    expect(calls).toHaveLength(1)
+  })
 })
 
 describe('nextUnviewed', () => {
@@ -110,6 +175,22 @@ describe('nextUnviewed', () => {
     ])
     expect(nextUnviewed(order, 0, marks)).toBeNull()
     expect(nextUnviewed([], 0, marks)).toBeNull()
+  })
+
+  it('prefers files that are not generated', () => {
+    const files = [
+      { path: 'a', generated: false },
+      { path: 'lock', generated: true },
+      { path: 'b', generated: false },
+    ]
+    const marks = new Map<string, ViewedState>([
+      ['a', 'VIEWED'],
+      ['lock', 'UNVIEWED'],
+      ['b', 'UNVIEWED'],
+    ])
+    expect(nextUnviewed(files, 0, marks)).toBe(2)
+    marks.set('b', 'VIEWED')
+    expect(nextUnviewed(files, 2, marks)).toBe(1)
   })
 })
 

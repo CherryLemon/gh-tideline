@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import {
   ApiError,
   getPr,
@@ -24,9 +24,20 @@ interface Props {
   search: string
 }
 
-type Data = { pr: PrSummary; files: ChangedFile[] }
+/** `requestedAt`: `performance.now()` when the requests were sent (see `ViewedSync.rebase`). */
+type Data = { pr: PrSummary; files: ChangedFile[]; requestedAt: number }
 
 const DOUBLE_SHIFT_MS = 350
+
+/**
+ * `v`, also with Caps Lock on or a non-Latin layout (then by physical key). Not while an
+ * IME composes (`Process`, keyCode 229): that `v` is input.
+ */
+function isVKey(e: KeyboardEvent): boolean {
+  if (e.isComposing || e.keyCode === 229) return false
+  if (e.key === 'v' || e.key === 'V') return true
+  return e.key.length === 1 && !/^[a-z]$/i.test(e.key) && e.code === 'KeyV'
+}
 
 export function PrPage({ route, search }: Props) {
   const repo = useMemo<RepoRef>(
@@ -38,9 +49,10 @@ export function PrPage({ route, search }: Props) {
   const [refreshing, setRefreshing] = useState(false)
 
   const load = useCallback(
-    async (refresh: boolean) => {
+    async (refresh: boolean): Promise<Data> => {
+      const requestedAt = performance.now()
       const [pr, files] = await Promise.all([getPr(repo, route.number, refresh), getPrFiles(repo, route.number, refresh)])
-      return { pr, files }
+      return { pr, files, requestedAt }
     },
     [repo, route.number],
   )
@@ -58,11 +70,18 @@ export function PrPage({ route, search }: Props) {
     }
   }, [load])
 
+  // The newest refresh wins, so overlapping ones cannot bring back an older list.
+  const refreshSeq = useRef(0)
   const refresh = useCallback(() => {
+    const seq = ++refreshSeq.current
+    const latest = () => seq === refreshSeq.current
     setRefreshing(true)
     load(true)
-      .then(setData, (e: unknown) => setError(errorMessage(e)))
-      .finally(() => setRefreshing(false))
+      .then(
+        (d) => latest() && setData(d),
+        (e: unknown) => latest() && setError(errorMessage(e)),
+      )
+      .finally(() => latest() && setRefreshing(false))
   }, [load])
 
   useEffect(() => {
@@ -99,7 +118,7 @@ interface ViewProps {
 }
 
 function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
-  const { pr, files } = data
+  const { pr, files, requestedAt } = data
   const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(() => new Set([GENERATED_KEY]))
   const tree = useMemo(() => buildTree(files, collapsed as Set<string>), [files, collapsed])
   const order = tree.order
@@ -120,13 +139,15 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
   }, [])
   const dismissToast = useCallback(() => setToast(null), [])
 
-  // Viewed marks: one sync per loaded file list; a refresh (new data) starts over from the server's marks.
+  // Viewed marks: one sync per head, so a refresh cannot lose a request in flight; a new
+  // head starts over (pending intents were made against the old one).
   const [marks, setMarks] = useState<ReadonlyMap<string, ViewedState>>(() => viewedMap(files))
   const sync = useRef<ViewedSync | null>(null)
+  const head = pr.head.sha
   useEffect(() => {
     const s = new ViewedSync(
       viewedMap(files),
-      (path, viewed) => setViewed(repo, pr.number, path, viewed, pr.head.sha),
+      (path, viewed) => setViewed(repo, pr.number, path, viewed, head),
       () => setMarks(s.snapshot()),
       (path, e) => {
         if (e instanceof ApiError && e.code === 'stale_head') showToast(e.message, { label: '刷新', run: onRefresh })
@@ -135,11 +156,17 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
     )
     sync.current = s
     setMarks(s.snapshot())
+    // E.g. "PR 已经更新" about the previous head.
+    setToast(null)
     return () => {
       s.dispose()
       sync.current = null
     }
-  }, [repo, pr.number, pr.head.sha, files, showToast, onRefresh])
+    // `files` only seeds a new sync; later lists of the same head go through rebase below.
+  }, [repo, pr.number, head, showToast, onRefresh])
+  useEffect(() => {
+    sync.current?.rebase(viewedMap(files), requestedAt)
+  }, [files, requestedAt])
   const toggleViewed = useCallback((path: string, viewed: boolean) => sync.current?.set(path, viewed), [])
 
   const requested = new URLSearchParams(search).get('file')
@@ -199,7 +226,9 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
 
   // Keep the latest navigation state for the window-level key handler.
   const nav = useRef({ order, currentIndex, openFile, finderOpen, toggleCurrentViewed })
-  nav.current = { order, currentIndex, openFile, finderOpen, toggleCurrentViewed }
+  useLayoutEffect(() => {
+    nav.current = { order, currentIndex, openFile, finderOpen, toggleCurrentViewed }
+  })
 
   useEffect(() => {
     let lastShift = 0
@@ -246,7 +275,7 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
         setFinderOpen(true)
         return
       }
-      if (plain && !e.shiftKey && e.key === 'v' && !e.repeat && !e.isComposing && !isTypingTarget(e.target)) {
+      if (plain && !e.shiftKey && isVKey(e) && !e.repeat && !e.isComposing && !isTypingTarget(e.target)) {
         consume()
         toggleCurrentViewed()
       }

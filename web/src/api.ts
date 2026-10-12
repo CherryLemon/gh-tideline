@@ -61,7 +61,7 @@ const CODE_MESSAGES: Record<string, string> = {
   github_error: 'GitHub 请求失败',
   git_error: 'git 操作失败',
   bad_request: '请求参数不正确',
-  stale_head: 'PR 已经有新的提交，请先刷新',
+  stale_head: 'PR 已经更新，请先刷新',
 }
 
 export class ApiError extends Error {
@@ -71,8 +71,9 @@ export class ApiError extends Error {
 
   constructor(status: number, code: string, detail: string) {
     const base = CODE_MESSAGES[code] ?? `请求失败（HTTP ${status}）`
-    // 401 always shows the fixed instruction; other codes append the server detail.
-    super(code === 'unauthorized' || !detail || detail === base ? base : `${base}：${detail}`)
+    // These always show the fixed text; other codes append the server detail.
+    const fixed = code === 'unauthorized' || code === 'stale_head'
+    super(fixed || !detail || detail === base ? base : `${base}：${detail}`)
     this.name = 'ApiError'
     this.status = status
     this.code = code

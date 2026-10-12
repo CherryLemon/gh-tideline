@@ -9,14 +9,19 @@ export interface ToastMessage {
 
 const TOAST_MS = 3000
 
-/** Transient notice at the bottom of the page; `onDismiss` must be stable. */
+/**
+ * Notice at the bottom of the page. Plain ones go away after 3 s; one with an action stays
+ * until it is used or closed, so the button cannot vanish under the pointer. `onDismiss`
+ * must be stable.
+ */
 export function Toast({ toast, onDismiss }: { toast: ToastMessage; onDismiss(): void }) {
+  const { action } = toast
   useEffect(() => {
+    if (action) return
     const timer = setTimeout(onDismiss, TOAST_MS)
     return () => clearTimeout(timer)
-  }, [toast.id, onDismiss])
+  }, [toast.id, action, onDismiss])
 
-  const { action } = toast
   return (
     <div className="toast" role="status">
       <span className="toast-text">{toast.text}</span>
@@ -29,6 +34,11 @@ export function Toast({ toast, onDismiss }: { toast: ToastMessage; onDismiss(): 
           }}
         >
           {action.label}
+        </button>
+      )}
+      {action && (
+        <button className="toast-close" onClick={onDismiss} title="关闭" aria-label="关闭">
+          ×
         </button>
       )}
     </div>

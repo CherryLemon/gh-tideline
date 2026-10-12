@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 /// Schema migrations; `PRAGMA user_version` is the number already applied.
 const MIGRATIONS: &[&str] = &["CREATE TABLE seen_head (
@@ -69,6 +69,21 @@ impl StateDb {
             .map_err(|e| format!("state database: {e}"))
     }
 
+    /// The last head the user finished viewing in this tool, if any.
+    pub async fn seen_head(&self, pr: &PrKey) -> Result<Option<String>, String> {
+        let pr = pr.clone();
+        self.call(move |c| {
+            c.query_row(
+                "SELECT head_sha FROM seen_head
+                 WHERE host = ?1 AND owner = ?2 AND repo = ?3 AND number = ?4",
+                params![pr.host, pr.owner, pr.repo, pr.number as i64],
+                |r| r.get(0),
+            )
+            .optional()
+        })
+        .await
+    }
+
     /// Remembers `head` as the last head the user finished viewing in this tool.
     pub async fn set_seen_head(&self, pr: &PrKey, head: &str, at: u64) -> Result<(), String> {
         let pr = pr.clone();
@@ -99,6 +114,9 @@ impl StateDb {
 fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let applied: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if applied < 0 {
+        return Err(rusqlite::Error::IntegralValueOutOfRange(0, applied));
+    }
     // A newer gh-tideline may have migrated further; leave its schema alone.
     if applied >= MIGRATIONS.len() as i64 {
         return Ok(());
@@ -142,6 +160,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         let db = StateDb::open(&path).unwrap();
+        assert_eq!(db.seen_head(&key()).await.unwrap(), None);
         db.set_seen_head(&key(), "a".repeat(40).as_str(), 10)
             .await
             .unwrap();
@@ -149,6 +168,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(seen(&path), vec![("b".repeat(40), 20)]);
+        assert_eq!(db.seen_head(&key()).await.unwrap(), Some("b".repeat(40)));
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
 

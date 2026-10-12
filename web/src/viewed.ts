@@ -7,11 +7,16 @@ export type SendViewed = (path: string, viewed: boolean) => Promise<ViewedState>
  * Holds the confirmed marks from the server plus the user's pending intents. The UI shows
  * the intent right away; per path only one request is in flight, and when it settles the
  * latest intent is sent if it still differs. A failed request drops the intent (rollback).
+ * One instance lives as long as the page shows one head; refreshes go through `rebase`.
  */
 export class ViewedSync {
   private readonly confirmed: Map<string, ViewedState>
   private readonly intent = new Map<string, boolean>()
   private readonly inflight = new Set<string>()
+  /** When the last request for a path settled (`performance.now()`). */
+  private readonly settled = new Map<string, number>()
+  /** `requestedAt` of the newest list taken by `rebase`. */
+  private rebasedAt = -Infinity
   private disposed = false
 
   constructor(
@@ -47,28 +52,55 @@ export class ViewedSync {
     if (!this.inflight.has(path)) this.pump(path)
   }
 
-  /** Stops notifying; requests still in flight complete silently. */
+  /**
+   * Takes the marks of a file list requested at `requestedAt` (`performance.now()`), except
+   * for paths with a request in flight or pending, or one that settled after the request
+   * was sent: the server may have read those before our change reached GitHub. A list
+   * requested before one already taken is ignored. Paths no longer listed are dropped,
+   * with their pending intent.
+   */
+  rebase(marks: ReadonlyMap<string, ViewedState>, requestedAt: number): void {
+    if (this.disposed || requestedAt < this.rebasedAt) return
+    this.rebasedAt = requestedAt
+    for (const path of [...this.confirmed.keys()]) {
+      if (marks.has(path)) continue
+      this.confirmed.delete(path)
+      this.intent.delete(path)
+    }
+    for (const [path, state] of marks) {
+      const busy = this.inflight.has(path) || this.intent.has(path)
+      if (busy || (this.settled.get(path) ?? -Infinity) >= requestedAt) continue
+      this.confirmed.set(path, state)
+    }
+    this.onChange()
+  }
+
+  /** Stops notifying and sending; a request in flight completes, nothing follows it. */
   dispose(): void {
     this.disposed = true
   }
 
   private pump(path: string): void {
+    if (this.disposed) return
     const want = this.intent.get(path)
     if (want === undefined) return
     if ((this.confirmed.get(path) === 'VIEWED') === want) {
       this.intent.delete(path)
-      if (!this.disposed) this.onChange()
+      this.onChange()
       return
     }
     this.inflight.add(path)
     this.send(path, want).then(
       (state) => {
         this.inflight.delete(path)
-        this.confirmed.set(path, state)
+        this.settled.set(path, performance.now())
+        // Unless a refresh dropped the path meanwhile.
+        if (this.confirmed.has(path)) this.confirmed.set(path, state)
         this.pump(path)
       },
       (error: unknown) => {
         this.inflight.delete(path)
+        this.settled.set(path, performance.now())
         this.intent.delete(path)
         if (this.disposed) return
         this.onChange()
@@ -87,19 +119,22 @@ export function viewedMap(files: readonly ChangedFile[]): Map<string, ViewedStat
 
 /**
  * Index of the next file after `current` (in tree order, wrapping around) that has a mark
- * and is not VIEWED; null if there is none.
+ * and is not VIEWED, preferring files that are not generated; null if there is none.
  */
 export function nextUnviewed(
-  order: readonly { path: string }[],
+  order: readonly { path: string; generated?: boolean }[],
   current: number,
   marks: ReadonlyMap<string, ViewedState>,
 ): number | null {
+  let generated: number | null = null
   for (let step = 1; step < order.length; step++) {
     const i = (current + step + order.length) % order.length
     const mark = marks.get(order[i].path)
-    if (mark !== undefined && mark !== 'VIEWED') return i
+    if (mark === undefined || mark === 'VIEWED') continue
+    if (!order[i].generated) return i
+    generated ??= i
   }
-  return null
+  return generated
 }
 
 const NON_TEXT_INPUTS = new Set(['checkbox', 'radio', 'button', 'submit', 'reset', 'range', 'color', 'file', 'image'])

@@ -74,20 +74,52 @@ impl PrData {
             .collect()
     }
 
-    /// Whether every file GitHub lists, except files we classify as generated, is VIEWED.
     fn fully_viewed(&self) -> bool {
-        let generated: std::collections::HashSet<&str> = self
-            .files
-            .iter()
-            .filter(|f| f.generated)
-            .map(|f| f.path.as_str())
-            .collect();
-        self.viewed
-            .lock()
-            .expect("viewed map poisoned")
-            .iter()
-            .all(|(path, state)| *state == ViewedState::Viewed || generated.contains(path.as_str()))
+        let marks = self.viewed.lock().expect("viewed map poisoned");
+        fully_viewed(&self.files, &marks, &marks)
     }
+}
+
+/// Whether `marks` has every file the user can mark here as VIEWED: every file of ours that
+/// GitHub listed in `markable`, except generated ones. Paths only GitHub lists (its rename
+/// detection differs from ours) get no checkbox, so they cannot be required. A required
+/// path missing from `marks` (e.g. a truncated list) counts as not viewed.
+fn fully_viewed(
+    files: &[ChangedFile],
+    markable: &HashMap<String, ViewedState>,
+    marks: &HashMap<String, ViewedState>,
+) -> bool {
+    files
+        .iter()
+        .filter(|f| !f.generated && markable.contains_key(&f.path))
+        .all(|f| marks.get(&f.path) == Some(&ViewedState::Viewed))
+}
+
+/// Rejects a viewed-mark change the user cannot have meant: a head other than the one the
+/// page shows (`client_head`) and the one `data` was built from (409, GitHub would also
+/// mark changes the user has not seen), or a path GitHub does not list (400).
+fn check_viewed_request(
+    data: &PrData,
+    path: &str,
+    client_head: &str,
+    current_head: &str,
+) -> Result<(), AppError> {
+    if current_head != client_head || current_head != data.summary.head.sha {
+        return Err(AppError::stale_head(
+            "the pull request has new commits; refresh before marking files as viewed",
+        ));
+    }
+    if !data
+        .viewed
+        .lock()
+        .expect("viewed map poisoned")
+        .contains_key(path)
+    {
+        return Err(AppError::bad_request(format!(
+            "{path:?} is not a file of this pull request"
+        )));
+    }
+    Ok(())
 }
 
 struct Cached {
@@ -103,8 +135,11 @@ pub struct PrService {
     repos: Repos,
     github: Github,
     tokens: Tokens,
-    state: StateDb,
+    /// None if the state database could not be opened; viewed marks still work.
+    state: Option<StateDb>,
     cache: Mutex<HashMap<PrKey, CacheSlot>>,
+    /// Detached work after a response (see [`PrService::set_viewed`]), awaited on shutdown.
+    bookkeeping: Mutex<tokio::task::JoinSet<()>>,
 }
 
 fn git_err(e: GitFailure) -> AppError {
@@ -112,13 +147,14 @@ fn git_err(e: GitFailure) -> AppError {
 }
 
 impl PrService {
-    pub fn new(repos: Repos, state: StateDb) -> Self {
+    pub fn new(repos: Repos, state: Option<StateDb>) -> Self {
         PrService {
             repos,
             github: Github::new(),
             tokens: Tokens::default(),
             state,
             cache: Default::default(),
+            bookkeeping: Default::default(),
         }
     }
 
@@ -129,6 +165,11 @@ impl PrService {
             .entry(key.clone())
             .or_default()
             .clone()
+    }
+
+    /// The last loaded snapshot, however old (waits for a load in progress).
+    async fn cached(&self, key: &PrKey) -> Option<Arc<PrData>> {
+        self.slot(key).lock().await.as_ref().map(|c| c.data.clone())
     }
 
     /// Returns the PR summary and file list, reusing a result younger than 30 s unless
@@ -283,29 +324,27 @@ impl PrService {
         viewed: bool,
         head: &str,
     ) -> Result<ViewedState, AppError> {
-        let data = self
-            .open(&key.host, &key.owner, &key.repo, key.number, false)
-            .await?;
-        if !data
-            .viewed
-            .lock()
-            .expect("viewed map poisoned")
-            .contains_key(path)
-        {
-            return Err(AppError::bad_request(format!(
-                "{path:?} is not a file of this pull request"
-            )));
-        }
         let token = self.tokens.get(&key.host).await?;
         let current = self
             .github
             .head_oid(&key.host, &token, &key.owner, &key.repo, key.number)
             .await?;
-        if current != head || current != data.summary.head.sha {
+        if current != head {
             return Err(AppError::stale_head(
                 "the pull request has new commits; refresh before marking files as viewed",
             ));
         }
+        // Any snapshot of this head will do, past its TTL too: only its file list and node id
+        // are needed, and GitHub itself rejects a path that is no longer part of the PR.
+        // Without one, load this head (a merely recent snapshot may still have another).
+        let data = match self.cached(key).await {
+            Some(data) if data.summary.head.sha == current => data,
+            _ => {
+                self.open(&key.host, &key.owner, &key.repo, key.number, true)
+                    .await?
+            }
+        };
+        check_viewed_request(&data, path, head, &current)?;
         self.github
             .set_viewed(&key.host, &token, &data.summary.node_id, path, viewed)
             .await?;
@@ -323,7 +362,9 @@ impl PrService {
         let service = Arc::clone(self);
         let key = key.clone();
         let path = path.to_string();
-        tokio::spawn(async move {
+        let mut tasks = self.bookkeeping.lock().expect("bookkeeping poisoned");
+        while tasks.try_join_next().is_some() {}
+        tasks.spawn(async move {
             if let Err(e) = service.after_set_viewed(&key, data, &path, state).await {
                 eprintln!("gh-tideline: recording the viewed state failed: {e}");
             }
@@ -338,31 +379,56 @@ impl PrService {
         path: &str,
         state: ViewedState,
     ) -> Result<(), String> {
-        // A refresh that ran concurrently may have read the mark from before the mutation.
-        let current = self.slot(key).lock().await.as_ref().map(|c| c.data.clone());
-        if let Some(current) = current
-            && !Arc::ptr_eq(&current, &data)
-            && current.summary.head.sha == data.summary.head.sha
-        {
-            current
-                .viewed
-                .lock()
-                .expect("viewed map poisoned")
-                .insert(path.to_string(), state);
-        }
-        if state != ViewedState::Viewed || !data.fully_viewed() {
+        // A refresh that ran concurrently may have read the mark from before the mutation,
+        // and the marks of later requests land in the snapshot now cached.
+        let target = match self.cached(key).await {
+            Some(current) if current.summary.head.sha == data.summary.head.sha => current,
+            _ => data,
+        };
+        target
+            .viewed
+            .lock()
+            .expect("viewed map poisoned")
+            .insert(path.to_string(), state);
+        if state != ViewedState::Viewed || !target.fully_viewed() {
             return Ok(());
         }
-        let head = &data.summary.head.sha;
+        let Some(db) = &self.state else {
+            return Ok(());
+        };
+        let head = &target.summary.head.sha;
+        if db.seen_head(key).await?.as_ref() == Some(head) {
+            return Ok(());
+        }
+        // Our marks may be stale (another tab, github.com). Recording a head the user has not
+        // fully seen would hide changes later, so confirm with GitHub, once per head.
+        let token = self.tokens.get(&key.host).await.map_err(|e| e.message)?;
+        let fresh = self
+            .github
+            .pull_request(&key.host, &token, &key.owner, &key.repo, key.number)
+            .await
+            .map_err(|e| e.message)?;
+        let marks: HashMap<String, ViewedState> = fresh
+            .files
+            .into_iter()
+            .map(|f| {
+                (
+                    f.path,
+                    f.viewer_viewed_state.unwrap_or(ViewedState::Unviewed),
+                )
+            })
+            .collect();
+        let markable = target.viewed.lock().expect("viewed map poisoned").clone();
+        if fresh.head_oid != *head || !fully_viewed(&target.files, &markable, &marks) {
+            return Ok(());
+        }
         let repo = self.repos.repo(&key.host, &key.owner, &key.repo);
         let guard = repo.lock().await.map_err(|e| e.to_string())?;
         repo.protect_commit(&guard, key.number, head)
             .await
             .map_err(|e| e.to_string())?;
         drop(guard);
-        self.state
-            .set_seen_head(key, head, crate::server::unix_now())
-            .await
+        db.set_seen_head(key, head, crate::clock::unix_now()).await
     }
 
     /// Raw bytes of a blob from the cache repo. A local read comes first and takes no lock.
@@ -420,9 +486,21 @@ impl PrService {
         }
     }
 
-    /// Waits for in-flight git work (see [`Repos::drain`]).
+    /// Waits for detached bookkeeping, then for in-flight git work (see [`Repos::drain`]).
+    /// Bookkeeping still running at the deadline is cancelled first, so it cannot start git
+    /// work that the repo drain no longer waits for.
     pub async fn drain(&self, timeout: Duration) {
-        self.repos.drain(timeout).await;
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut tasks =
+            std::mem::take(&mut *self.bookkeeping.lock().expect("bookkeeping poisoned"));
+        let _ = tokio::time::timeout_at(deadline, async {
+            while tasks.join_next().await.is_some() {}
+        })
+        .await;
+        tasks.shutdown().await;
+        self.repos
+            .drain(deadline.saturating_duration_since(tokio::time::Instant::now()))
+            .await;
     }
 }
 
@@ -597,5 +675,113 @@ mod tests {
         assert!(!is_generated("Cargo.lock", Some(&opted_out)));
         let opted_out_false = attrs(&[("linguist-generated", "false")]);
         assert!(!is_generated("yarn.lock", Some(&opted_out_false)));
+    }
+
+    fn file(path: &str, generated: bool) -> ChangedFile {
+        ChangedFile {
+            path: path.to_string(),
+            old_path: None,
+            status: "M".to_string(),
+            old_oid: None,
+            new_oid: None,
+            old_mode: "100644".to_string(),
+            new_mode: "100644".to_string(),
+            additions: None,
+            deletions: None,
+            binary: false,
+            generated,
+        }
+    }
+
+    fn marks(entries: &[(&str, ViewedState)]) -> HashMap<String, ViewedState> {
+        entries.iter().map(|(p, s)| (p.to_string(), *s)).collect()
+    }
+
+    const HEAD: &str = "1111111111111111111111111111111111111111";
+    const OTHER: &str = "2222222222222222222222222222222222222222";
+
+    fn data(files: Vec<ChangedFile>, viewed: HashMap<String, ViewedState>) -> PrData {
+        let r = |sha: &str| RefInfo {
+            name: "x".to_string(),
+            sha: sha.to_string(),
+        };
+        PrData {
+            summary: PrSummary {
+                host: "github.com".to_string(),
+                owner: "o".to_string(),
+                repo: "r".to_string(),
+                number: 1,
+                title: String::new(),
+                author: String::new(),
+                state: "OPEN".to_string(),
+                url: String::new(),
+                base: r(OTHER),
+                head: r(HEAD),
+                merge_base: OTHER.to_string(),
+                node_id: "PR_x".to_string(),
+                viewer: "me".to_string(),
+            },
+            files,
+            viewed: Mutex::new(viewed),
+        }
+    }
+
+    #[test]
+    fn fully_viewed_needs_every_markable_non_generated_file() {
+        use ViewedState::*;
+        let files = vec![file("a", false), file("b", false), file("Cargo.lock", true)];
+        let own = |m: &HashMap<String, ViewedState>| fully_viewed(&files, m, m);
+        // One file viewed is not enough.
+        assert!(!own(&marks(&[("a", Viewed), ("b", Unviewed)])));
+        // Dismissed means changed since it was viewed.
+        assert!(!own(&marks(&[("a", Viewed), ("b", Dismissed)])));
+        // Generated files are not required.
+        assert!(own(&marks(&[
+            ("a", Viewed),
+            ("b", Viewed),
+            ("Cargo.lock", Unviewed)
+        ])));
+        // Paths only GitHub lists (a rename it sees as delete + add) have no checkbox here.
+        assert!(own(&marks(&[
+            ("a", Viewed),
+            ("b", Viewed),
+            ("old/b", Unviewed)
+        ])));
+        // Our files GitHub does not list cannot be marked either.
+        assert!(own(&marks(&[("a", Viewed)])));
+        // Checked against a fresh list: a markable path it lacks (truncated) is not viewed.
+        let markable = marks(&[("a", Viewed), ("b", Viewed)]);
+        assert!(!fully_viewed(&files, &markable, &marks(&[("a", Viewed)])));
+        assert!(!fully_viewed(&files, &markable, &HashMap::new()));
+        assert!(fully_viewed(
+            &files,
+            &markable,
+            &marks(&[("a", Viewed), ("b", Viewed)])
+        ));
+    }
+
+    #[test]
+    fn viewed_requests_are_checked_against_the_head_and_github_paths() {
+        use crate::error::ErrorCode;
+        let d = data(
+            vec![file("a", false)],
+            marks(&[("a", ViewedState::Unviewed)]),
+        );
+        let code = |r: Result<(), AppError>| r.map_err(|e| e.code);
+        assert_eq!(code(check_viewed_request(&d, "a", HEAD, HEAD)), Ok(()));
+        // The page shows an older head, or GitHub has moved on since the snapshot.
+        assert_eq!(
+            code(check_viewed_request(&d, "a", OTHER, HEAD)),
+            Err(ErrorCode::StaleHead)
+        );
+        assert_eq!(
+            code(check_viewed_request(&d, "a", OTHER, OTHER)),
+            Err(ErrorCode::StaleHead)
+        );
+        // A path GitHub does not list (ours only, or made up).
+        assert_eq!(
+            code(check_viewed_request(&d, "../a", HEAD, HEAD)),
+            Err(ErrorCode::BadRequest)
+        );
     }
 }

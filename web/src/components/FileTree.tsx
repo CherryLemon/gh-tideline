@@ -103,11 +103,11 @@ export function FileTree({ rows, files, currentPath, viewed, onOpen, onToggle, o
               return (
                 <div
                   key={row.key}
-                  className={`tree-row tree-file${selected ? ' is-selected' : ''}${mark === 'VIEWED' ? ' is-viewed' : ''}`}
+                  className={`tree-row tree-file${selected ? ' is-selected' : ''}${mark === 'VIEWED' ? ' is-viewed' : ''}${mark === 'DISMISSED' ? ' is-dismissed' : ''}`}
                   style={style}
                   role="treeitem"
                   aria-selected={selected}
-                  title={renamedFrom ? `${f.oldPath} → ${f.path}` : f.path}
+                  title={(renamedFrom ? `${f.oldPath} → ${f.path}` : f.path) + (mark === 'DISMISSED' ? '\n看过之后又被修改' : '')}
                   data-path={f.path}
                   onClick={() => onOpen(f.path)}
                 >
@@ -122,7 +122,6 @@ export function FileTree({ rows, files, currentPath, viewed, onOpen, onToggle, o
                     {name}
                   </span>
                   <Counts file={f} />
-                  {mark === 'DISMISSED' && <span className="dismissed-dot" title="看过之后又被修改" />}
                   {mark !== undefined && (
                     <input
                       type="checkbox"

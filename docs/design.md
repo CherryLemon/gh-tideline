@@ -264,7 +264,7 @@ diff 计算超时后结果会很难看，所以超过上表阈值的文件根本
 - **读：** `pullRequest.files(first:100, after:$cursor) { nodes { path viewerViewedState } }`。状态有三种：VIEWED、UNVIEWED、DISMISSED。
 - **写：** `markFileAsViewed(input:{pullRequestId, path})`，取消用 `unmarkFileAsViewed`。重命名的文件用新路径。
 - **前端先更新界面再发请求。** 请求失败就回滚，并弹提示。
-- **记录本地 head：** 用户在本工具里把文件标记为已看时，同时在 `state.sqlite` 里记下当前的 head SHA，给 5.6 当兜底基线用。
+- **记录本地 head：** 用户在本工具里把能勾选的文件（生成文件除外）全部标记为已看之后，在 `state.sqlite` 里记下当前的 head SHA，给 5.6 当兜底基线用。只标记一个文件就记 head 是错的，细则见 `docs/m1-review-context.md`。
 
 ### 5.4 评论线程展示（M1，只读）
 
@@ -297,7 +297,7 @@ diff 计算超时后结果会很难看，所以超过上表阈值的文件根本
 
 **1. 确定基线（旧的 head，记作 H_old）：** 按下面的优先顺序取。
   1. 当前用户在这个 PR 上最近一次 review 的 `commit.oid`。
-     查询：`reviews(last:1, author:$viewerLogin, states:[APPROVED, CHANGES_REQUESTED, COMMENTED, DISMISSED])`。
+     查询：`reviews(last:20, author:$viewerLogin, states:[APPROVED, CHANGES_REQUESTED, COMMENTED, DISMISSED])`，从新到旧取第一个不是"纯回复"的。
      必须带 `states`：不带的话可能取到用户还没提交的 PENDING review，它就在当前 head 上，得到的 diff 是空的。
      还要跳过"纯回复"的 review：push 之后只在线程里回复一句，GitHub 也会生成一个正文为空、commit 等于新 head 的 COMMENTED review（见 `docs/m1-review-context.md` S11）。
   2. 本工具在 `state.sqlite` 里记录的、上次看到的 head。
@@ -365,7 +365,7 @@ tree_entries(commit_oid, path, blob_oid)
 | GET | `/blobs/{oid}` | 文件原始字节，带 `Cache-Control: immutable` | M0 |
 | GET | `/pulls/{n}/commits` | 提交列表 | M1 |
 | GET | `/pulls/{n}/threads` | 评论线程 | M1 |
-| PUT | `/pulls/{n}/viewed` | 请求体 `{path, viewed}` | M1 |
+| PUT | `/pulls/{n}/viewed` | 请求体 `{path, viewed, head}`；`head` 不是当前 head 时返回 409 `stale_head` | M1 |
 | GET | `/pulls/{n}/since-review` | 返回 `{from, to, mode: direct \| rebased \| fallback, baseline}` | M1 |
 | GET | `/revs/{sha}/symbols?path=` | 一个文件的符号 | M2 |
 | GET | `/revs/{sha}/definitions?name=&lang=` | 查定义 | M2 |
@@ -489,6 +489,7 @@ interface ChangedFile {
 | S6（M2） | DiffEditor 里的 sticky scroll 会不会用我们自定义的 DocumentSymbolProvider | 写原型测 | 自己画一个顶部的函数或类名提示条 |
 | S7 | 已确认（M1 阶段 0）：GraphQL 和 REST 一样最多返回 250 个，返回的是以 head 结尾的最近 250 个；`totalCount` 是真实总数 | — | 超过上限时在界面上提示 |
 | S8 | 已确认（M1 阶段 0，Monaco 0.57）：view zone 两侧会自动对齐；只有在新文件编辑器上 `setSelections` 才能可靠地展开折叠区；单栏模式下原文件一侧放不了 zone；卡片用 view zone 加 overlay widget 才能不随代码横向滚动；生产构建在 CSP 响应头下正常 | — | 已有对应做法，见 `docs/m1-review-context.md` |
+| S10 | 已确认（M1 阶段 0）：gh 的 OAuth token（`repo` scope）可以调用 `markFileAsViewed` / `unmarkFileAsViewed`；路径不在 PR 里返回 `UNPROCESSABLE`；push 之后改到的已看文件变成 DISMISSED。fine-grained PAT 未测 | — | 权限错误映射成 `github_error`，界面回滚并提示 |
 
 ## 11. 待定问题
 

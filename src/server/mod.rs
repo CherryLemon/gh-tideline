@@ -15,6 +15,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::clock::unix_now;
 use crate::error::AppError;
 use crate::git::is_oid;
 use crate::pr::PrService;
@@ -33,14 +34,6 @@ pub struct Inner {
 }
 
 pub type AppState = Arc<Inner>;
-
-/// Current Unix time in seconds.
-pub fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
 
 /// `started_at` (Unix seconds) is the server start: older authorization tokens are refused.
 pub fn state(
