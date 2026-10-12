@@ -276,6 +276,7 @@ diff 计算超时后结果会很难看，所以超过上表阈值的文件根本
   - 过时的线程和已解决的线程：放在侧栏列表里，默认折叠。
   - 文件级评论（`subjectType: FILE`）没有行号，即使没过时 `line` 也是 null。显示在文件顶部。
   - 有评论的行如果落在被 `hideUnchangedRegions` 折叠的区域里，view zone 会看不见。这些行必须强制展开。
+  - 实现细节（单栏模式下 LEFT 线程的放法、卡片不随代码横向滚动、强制展开的顺序）见 M1 计划文档 `docs/m1-review-context.md`，依据是 S8 的实测结果。
 - **行号可以直接用。** GitHub 的 `line` 是整个文件里的行号，正好对应我们的整文件 model，不需要换算。
 - **安全：** `bodyHTML` 虽然是 GitHub 渲染好的，还是要再用 DOMPurify 清理一遍。
 
@@ -298,6 +299,7 @@ diff 计算超时后结果会很难看，所以超过上表阈值的文件根本
   1. 当前用户在这个 PR 上最近一次 review 的 `commit.oid`。
      查询：`reviews(last:1, author:$viewerLogin, states:[APPROVED, CHANGES_REQUESTED, COMMENTED, DISMISSED])`。
      必须带 `states`：不带的话可能取到用户还没提交的 PENDING review，它就在当前 head 上，得到的 diff 是空的。
+     还要跳过"纯回复"的 review：push 之后只在线程里回复一句，GitHub 也会生成一个正文为空、commit 等于新 head 的 COMMENTED review（见 `docs/m1-review-context.md` S11）。
   2. 本工具在 `state.sqlite` 里记录的、上次看到的 head。
 
 **2. 抓取 H_old，并算出它的 merge-base（记作 M_old）。**
@@ -480,12 +482,13 @@ interface ChangedFile {
 | 编号 | 要验证什么 | 怎么验证 | 不行的话怎么办 |
 |---|---|---|---|
 | S1 | 功能已确认可用，还剩两点：① 在大仓库上的速度；② git over HTTPS 的 `http.extraHeader` 用 `Bearer <token>` 还是 `Basic base64(x-access-token:<token>)` | 拿 microsoft/vscode、torvalds/linux 的真实 PR 测从零开始到看到文件树的时间；两种认证头各试一次 | 改用完整历史的 blob:none 部分克隆 |
-| S2 | 已确认可用，只要 GitHub 还没回收。剩下要验证的是：旧提交被回收后的错误表现 | 找一个很久以前被 force-push 过的 PR 试 | 只能用本地缓存，否则提示不可用 |
+| S2 | 已确认（M1 阶段 0，S9）：cli/cli 2020 年被 force-push 掉的提交今天仍能按 SHA 抓到；不存在的提交 `git fetch` 报 `upload-pack: not our ref`，`compare` 返回 404 | — | 只能用本地缓存，否则提示不可用 |
 | S3 | Monaco 单实例加 model LRU，在 1000 个文件的 PR 上内存占用和切换耗时如何；`hideUnchangedRegions` 好不好用 | 写一个原型页面测 | 调整 LRU 大小，或者换 CodeMirror 6 的 merge 视图 |
 | S4 | 已确认：能正常工作，只批量预取一次。不用再验证 | — | — |
 | S5 | 3000 个文件的 PR，GraphQL 分页（30 页）会消耗多少速率限额 | 看响应里的 rateLimit 字段 | 用 ETag 做条件请求，并缓存结果 |
 | S6（M2） | DiffEditor 里的 sticky scroll 会不会用我们自定义的 DocumentSymbolProvider | 写原型测 | 自己画一个顶部的函数或类名提示条 |
-| S7 | GraphQL 的 `commits` 有没有 250 条的上限 | 找一个超过 250 个提交的 PR 测 | 超过上限时在界面上提示 |
+| S7 | 已确认（M1 阶段 0）：GraphQL 和 REST 一样最多返回 250 个，返回的是以 head 结尾的最近 250 个；`totalCount` 是真实总数 | — | 超过上限时在界面上提示 |
+| S8 | 已确认（M1 阶段 0，Monaco 0.57）：view zone 两侧会自动对齐；只有在新文件编辑器上 `setSelections` 才能可靠地展开折叠区；单栏模式下原文件一侧放不了 zone；卡片用 view zone 加 overlay widget 才能不随代码横向滚动；生产构建在 CSP 响应头下正常 | — | 已有对应做法，见 `docs/m1-review-context.md` |
 
 ## 11. 待定问题
 
