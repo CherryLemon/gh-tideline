@@ -15,15 +15,13 @@
   <img src="docs/images/screenshot.png" alt="Tideline showing cli/cli#14507 side by side in the Sandy Beach theme" width="900">
 </p>
 
-> *Tideline*: the line the tide leaves on the sand, marking where things changed.
-
 ## Why
 
 Reviewing a sizeable PR on github.com is tiring:
 
 - You only see hunks. Getting more context means clicking "expand" over and over.
 - Large files start collapsed, and big PRs get sluggish.
-- Keyboard navigation is weak.
+- Keyboard navigation is weak (spike edit).
 
 JetBrains IDEs review PRs much better, but first you have to clone the repo, open the project and wait for indexing.
 

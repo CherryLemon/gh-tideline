@@ -1,3 +1,4 @@
+// spike: renamed from fuzzy.ts with an edit
 // Subsequence fuzzy matching for the file finder. Matches in the file name rank above
 // matches spread over directories; consecutive characters and word starts score higher.
 

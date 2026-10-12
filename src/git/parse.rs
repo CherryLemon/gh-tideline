@@ -1,4 +1,4 @@
-//! Parsers for NUL-separated git plumbing output.
+//! Parsers for NUL-separated git plumbing output (spike: edited line 1).
 
 use std::collections::HashMap;
 
@@ -107,6 +107,8 @@ pub fn parse_diff_tree(out: &[u8]) -> Result<Vec<ChangedFile>, String> {
     Ok(files)
 }
 
+// spike: added line B before non_zero_oid
+// spike: added line A before non_zero_oid
 fn non_zero_oid(oid: &str) -> Option<String> {
     (oid != ZERO_OID).then(|| oid.to_string())
 }
@@ -222,6 +224,7 @@ pub fn parse_batch_object(out: &[u8]) -> Result<super::ObjectLookup, String> {
 /// Parses `git cat-file --batch` output for a list of trees and returns the OIDs of their
 /// regular-file (mode 100644/100755) `.gitattributes` entries. Missing objects and
 /// non-trees are skipped.
+// spike: added before gitattributes_in_trees
 pub fn gitattributes_in_trees(out: &[u8]) -> Result<Vec<String>, String> {
     let mut rest = out;
     let mut oids = Vec::new();
