@@ -36,6 +36,11 @@ interface Props {
   repo: RepoRef
   /** A changed file (diffed), or an unchanged file of the head tree (shown read-only). */
   file: ChangedFile | TreeEntry
+  /**
+   * `file` (unchanged) comes from an older head's listing and may differ at the shown head:
+   * stay loading, without loading it, until the page has the shown head's entry.
+   */
+  provisional?: boolean
   nextFile: ChangedFile | null
   sideBySide: boolean
   ignoreTrimWhitespace: boolean
@@ -96,7 +101,7 @@ function endLine(c: Monaco.editor.ILineChange, side: 'original' | 'modified'): n
 }
 
 export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
-  { repo, file, nextFile, sideBySide, ignoreTrimWhitespace, pendingJump, headerActions, onChangeInfo },
+  { repo, file, provisional = false, nextFile, sideBySide, ignoreTrimWhitespace, pendingJump, headerActions, onChangeInfo },
   ref,
 ) {
   const editorRef = useRef<DiffEditorT | null>(null)
@@ -107,9 +112,12 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
   const [singleWanted, setSingleWanted] = useState(false)
   if (!changed && !singleWanted) setSingleWanted(true)
   const [singleReady, setSingleReady] = useState(false)
-  /** Load state tagged with its file: until the load effect has run for a new file, it is loading. */
+  /**
+   * Load state tagged with its file: until the load effect has run for a new file, it is loading.
+   * A provisional file is loading too, whatever was loaded for its path before.
+   */
   const [loaded, setLoaded] = useState<{ path: string | null; state: PaneState }>({ path: null, state: LOADING })
-  const state = loaded.path === file.path ? loaded.state : LOADING
+  const state = !provisional && loaded.path === file.path ? loaded.state : LOADING
   const [forced, setForced] = useState<ReadonlySet<string>>(() => new Set())
   const [retry, setRetry] = useState(0)
   /** Which editor has some file's models attached; while the next file loads, its content stays visible. */
@@ -311,6 +319,7 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
     const setState = (st: PaneState) => setLoaded({ path: file.path, state: st })
     setState(LOADING)
     onChangeInfoRef.current(null)
+    if (provisional) return
     const load = isChanged(file) ? loadFile(repo, file, isForced) : loadUnchanged(repo, file, isForced)
     load
       .then((res) => {
@@ -390,10 +399,11 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
       imageUrls.forEach((u) => URL.revokeObjectURL(u))
     }
     // `nextFile` is read only for prefetching after a load; changing it must not reload.
-  }, [ready, repo, file, isForced, retry])
+  }, [ready, repo, file, provisional, isForced, retry])
 
-  const showEditor = state.kind === 'text' || (state.kind === 'loading' && attached === 'diff')
-  const showSingle = state.kind === 'single' || (state.kind === 'loading' && attached === 'single')
+  // The attached content may be stale at the new head of a provisional file: show neither editor.
+  const showEditor = !provisional && (state.kind === 'text' || (state.kind === 'loading' && attached === 'diff'))
+  const showSingle = !provisional && (state.kind === 'single' || (state.kind === 'loading' && attached === 'single'))
   const overlay = renderOverlay(state, file, {
     load: () => setForced((s) => new Set(s).add(file.path)),
     retry: () => setRetry((n) => n + 1),

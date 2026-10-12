@@ -47,6 +47,13 @@ type Listing = { head: string; entries: TreeEntry[]; error: null } | { head: str
 const STALE_LISTING = 'PR 已经更新，请先刷新'
 
 /**
+ * A listing that takes longer than this is given up on, so that a request that never
+ * returns ends in an error the user can retry. Normally it takes seconds at most.
+ */
+const LISTING_TIMEOUT_MS = 60_000
+const LISTING_TIMEOUT = `列出项目文件超过 ${LISTING_TIMEOUT_MS / 1000} 秒还没有完成`
+
+/**
  * `v`, also with Caps Lock on or a non-Latin layout (then by physical key). Not while an
  * IME composes (`Process`, keyCode 229): that `v` is input.
  */
@@ -156,17 +163,21 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
   useEffect(() => {
     if (!needListing || haveListing || listingFor.current === head) return
     listingFor.current = head
+    const abort = new AbortController()
+    const timer = setTimeout(() => abort.abort(), LISTING_TIMEOUT_MS)
     const done = (l: Listing) => {
+      clearTimeout(timer)
       if (listingFor.current === head) listingFor.current = null
       // A refresh moved on to another head meanwhile: that one gets its own listing.
       if (headNow.current === head) setListing(l)
     }
-    getPrTree(repo, pr.number, head).then(
-      (t) =>
+    getPrTree(repo, pr.number, head, abort.signal)
+      .then((t) =>
         // The server already serves a newer head than this page shows.
         done(t.head === head ? { head, entries: t.entries, error: null } : { head, entries: null, error: STALE_LISTING, stale: true }),
-      (e: unknown) => done({ head, entries: null, error: errorMessage(e), stale: false }),
-    )
+      )
+      // Also catches a malformed response, so the listing never stays pending.
+      .catch((e: unknown) => done({ head, entries: null, error: abort.signal.aborted ? LISTING_TIMEOUT : errorMessage(e), stale: false }))
   }, [needListing, haveListing, head, repo, pr.number])
   const retryListing = useCallback(() => setListing(null), [])
   // A refresh (even to the same head) also retries a listing that failed.
@@ -258,6 +269,9 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
     changedCurrent ?? (requested !== null ? (entryByPath?.get(requested) ?? null) : null)
   // Still listing the head tree to find out whether ?file= is an unchanged file.
   const resolving = requested !== null && !current && needListing && !haveListing
+  // An unchanged file found in the previous head's listing (standing in while this head's
+  // loads): what it holds at this head is not known yet, so the pane waits.
+  const provisional = current !== null && !changedCurrent && !haveListing
   // Listing it failed: say so (with a way out) rather than replace ?file= with another file.
   const unresolved = requested !== null && !current && haveListing && listing.error !== null ? listing : null
 
@@ -470,6 +484,7 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
               ref={pane}
               repo={repo}
               file={current}
+              provisional={provisional}
               nextFile={nextFile}
               sideBySide={sideBySide}
               ignoreTrimWhitespace={ignoreWs}

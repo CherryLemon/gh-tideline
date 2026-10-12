@@ -145,8 +145,8 @@ export async function getPrFiles(r: RepoRef, n: number, refresh = false): Promis
  * Every file of the head tree, for the full project tree. The server lists `head` if it
  * still has that snapshot, else its current head (compare `PrTree.head`).
  */
-export async function getPrTree(r: RepoRef, n: number, head: string): Promise<PrTree> {
-  const res = await request(`${repoBase(r)}/pulls/${n}/tree?head=${encodeURIComponent(head)}`)
+export async function getPrTree(r: RepoRef, n: number, head: string, signal?: AbortSignal): Promise<PrTree> {
+  const res = await request(`${repoBase(r)}/pulls/${n}/tree?head=${encodeURIComponent(head)}`, { signal })
   return (await res.json()) as PrTree
 }
 
