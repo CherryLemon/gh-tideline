@@ -65,17 +65,19 @@ export interface RepoRef {
   repo: string
 }
 
-export const UNAUTHORIZED_MESSAGE = '请在终端运行 `gh-tideline` 授权此浏览器'
+export const UNAUTHORIZED_MESSAGE = 'Run `gh-tideline` in a terminal to authorize this browser'
+export const STALE_HEAD_MESSAGE = 'The pull request has been updated; refresh to load the new version'
 
 const CODE_MESSAGES: Record<string, string> = {
   unauthorized: UNAUTHORIZED_MESSAGE,
-  forbidden_host: '该域名不在允许列表中（github.com 或配置文件里的 ghe_hosts）',
-  not_found: '找不到该 PR 或文件',
-  no_token: '没有可用的 GitHub token：请设置 GH_TOKEN 或运行 `gh auth login`',
-  github_error: 'GitHub 请求失败',
-  git_error: 'git 操作失败',
-  bad_request: '请求参数不正确',
-  stale_head: 'PR 已经更新，请先刷新',
+  forbidden_host: 'Host not allowed',
+  not_found: 'Not found',
+  no_token: 'No GitHub token',
+  github_error: 'GitHub request failed',
+  git_error: 'Git operation failed',
+  bad_request: 'Invalid request',
+  stale_head: STALE_HEAD_MESSAGE,
+  network: "Can't reach the Tideline server",
 }
 
 export class ApiError extends Error {
@@ -84,10 +86,10 @@ export class ApiError extends Error {
   readonly detail: string
 
   constructor(status: number, code: string, detail: string) {
-    const base = CODE_MESSAGES[code] ?? `请求失败（HTTP ${status}）`
+    const base = CODE_MESSAGES[code] ?? `Request failed (HTTP ${status})`
     // These always show the fixed text; other codes append the server detail.
     const fixed = code === 'unauthorized' || code === 'stale_head'
-    super(fixed || !detail || detail === base ? base : `${base}：${detail}`)
+    super(fixed || !detail || detail === base ? base : `${base}: ${detail}`)
     this.name = 'ApiError'
     this.status = status
     this.code = code
@@ -119,7 +121,7 @@ async function request(path: string, init?: RequestInit): Promise<Response> {
     res = await fetch(path, { ...init, headers, credentials: 'same-origin' })
   } catch (e) {
     if (e instanceof DOMException && e.name === 'AbortError') throw e
-    throw new ApiError(0, 'network', `无法连接到 tideline 服务（${(e as Error).message}）`)
+    throw new ApiError(0, 'network', (e as Error).message)
   }
   if (!res.ok) throw await toApiError(res)
   return res

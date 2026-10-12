@@ -241,7 +241,7 @@ $XDG_CACHE_HOME/tideline/
 | Condition | Handling |
 |---|---|
 | Larger than 1 MB | Turn off syntax highlighting |
-| Larger than 5 MB, or more than 50,000 lines | Don't load automatically; show "点击加载" ("click to load") |
+| Larger than 5 MB, or more than 50,000 lines | Don't load automatically; show a "Load file" button |
 | Longest line over 10,000 characters (minified files) | Turn off highlighting and word-level diff |
 
 Monaco also has two limits of its own that must line up with the table above: `maxComputationTime` (default 5000 ms) and `maxFileSize` (default 50 MB).
@@ -254,7 +254,7 @@ When the diff computation times out, the result looks bad, so files above the th
 **Binary files:**
 - A file that numstat shows as `-	-` is binary.
 - Images: the frontend `fetch`es the bytes, creates a `blob:` URL and compares the two sides with `<img>`. It doesn't use the blob endpoint URL directly as the img src. Section 8 explains why.
-- Other binary files: show only "二进制文件，大小 a → b" ("binary file, size a → b").
+- Other binary files: show only "Binary file, size a → b".
 
 **Ignoring whitespace:** Monaco only supports `ignoreTrimWhitespace` (ignore leading/trailing whitespace), so M0 offers only two settings: "don't ignore" and "ignore leading/trailing whitespace".
 "Ignore all whitespace" would require our own diff computation. That is left for later.
@@ -309,7 +309,7 @@ When the diff computation times out, the result looks bad, so files above the th
   - If the PR's target branch changed midway, or the base branch itself was force-pushed, the value computed this way is unreliable. In that case, go straight to the fallback in the "conflict" row.
 - **Fetching H_old:** tested: commits from before a force-push can still be fetched by SHA, as long as GitHub hasn't garbage-collected them yet.
 - **When the fetch fails:** only the local cache can help (versions viewed earlier are protected by refs; see 4.4).
-  If the cache doesn't have it either, show "上次 review 的版本已不可用" ("the last reviewed version is no longer available").
+  If the cache doesn't have it either, show "The last reviewed version is no longer available".
   Don't fall back to REST `git/trees` / `git/blobs`: they read the same object store, so when git can't fetch an object, they return 404 too.
 
 **3. Compute the diff to show:**
@@ -318,13 +318,13 @@ When the diff computation times out, the result looks bad, so files above the th
 |---|---|
 | `M_old == M_new` (no rebase) | Compare H_old → H_new directly |
 | A rebase happened | First replay the old PR onto the new base: `T = git merge-tree --write-tree --merge-base=M_old M_new H_old`. If there is no conflict, show T → H_new. This leaves only the author's own changes, with no changes from the base branch mixed in |
-| The replay has conflicts | Fall back to H_old → H_new, and show "包含 base 分支的变化" ("includes changes from the base branch") at the top |
+| The replay has conflicts | Fall back to H_old → H_new, and show "Includes changes from the base branch" at the top |
 
 **4. UI:** add an entry "Since your last review (abc1234)" to the commit selector.
 
 ### 5.7 Symbol index and code navigation (M2)
 
-**When to build the index:** when the user first requests go to definition, or after the user turns on "自动建索引" ("build index automatically") in settings. The index builds in the background, and the server pushes progress to the frontend over SSE.
+**When to build the index:** when the user first requests go to definition, or after the user turns on "Build index automatically" in settings. The index builds in the background, and the server pushes progress to the frontend over SSE.
 
 **Steps to build the index:**
 1. `git ls-tree -r -z --long <head>` lists all files in the head version.
@@ -347,7 +347,7 @@ tree_entries(commit_oid, path, blob_oid)
 |---|---|
 | File outline / sticky current function at the top | Convert the definition tags of the file into a Monaco `DocumentSymbolProvider` |
 | Go to definition | Register a Monaco `DefinitionProvider` that asks the server for definitions by `name` and language. Ranking: same file > same directory > others. If the target file is in this PR, open its diff and go to the line. If not, open the head version in a read-only plain editor |
-| Find usages | Query the tags with the same name and `is_definition = false` (`@reference.*` in tags.scm), and list them in the sidebar. The results are approximate, so the UI must say "按名称匹配" ("matched by name") |
+| Find usages | Query the tags with the same name and `is_definition = false` (`@reference.*` in tags.scm), and list them in the sidebar. The results are approximate, so the UI must say "Matched by name" |
 
 **Scope:**
 - By default, index only the head version. When the user requests a jump on the old file (left side), index the merge-base version on demand.

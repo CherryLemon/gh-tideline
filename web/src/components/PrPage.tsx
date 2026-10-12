@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import {
   ApiError,
+  STALE_HEAD_MESSAGE,
   getPr,
   getPrFiles,
   getPrTree,
@@ -44,14 +45,12 @@ const DOUBLE_SHIFT_MS = 350
 /** The head tree of one head: its entries, or why listing it failed. */
 type Listing = { head: string; entries: TreeEntry[]; error: null } | { head: string; entries: null; error: string; stale: boolean }
 
-const STALE_LISTING = 'PR 已经更新，请先刷新'
-
 /**
  * A listing that takes longer than this is given up on, so that a request that never
  * returns ends in an error the user can retry. Normally it takes seconds at most.
  */
 const LISTING_TIMEOUT_MS = 60_000
-const LISTING_TIMEOUT = `列出项目文件超过 ${LISTING_TIMEOUT_MS / 1000} 秒还没有完成`
+const LISTING_TIMEOUT = `Listing the project files timed out after ${LISTING_TIMEOUT_MS / 1000} s`
 
 /**
  * `v`, also with Caps Lock on or a non-Latin layout (then by physical key). Not while an
@@ -116,9 +115,9 @@ export function PrPage({ route, search }: Props) {
     return (
       <div className="page-message">
         <div className="page-message-box">
-          <div className="page-message-title">无法打开 PR</div>
+          <div className="page-message-title">Can't open the pull request</div>
           <div className="page-message-body">{error}</div>
-          <a className="btn" href="/">返回首页</a>
+          <a className="btn" href="/">Back to home</a>
         </div>
       </div>
     )
@@ -126,7 +125,7 @@ export function PrPage({ route, search }: Props) {
   if (!data) {
     return (
       <div className="page-message">
-        <div className="muted">正在打开 {route.owner}/{route.repo} #{route.number}…</div>
+        <div className="muted">Opening {route.owner}/{route.repo} #{route.number}…</div>
       </div>
     )
   }
@@ -174,7 +173,7 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
     getPrTree(repo, pr.number, head, abort.signal)
       .then((t) =>
         // The server already serves a newer head than this page shows.
-        done(t.head === head ? { head, entries: t.entries, error: null } : { head, entries: null, error: STALE_LISTING, stale: true }),
+        done(t.head === head ? { head, entries: t.entries, error: null } : { head, entries: null, error: STALE_HEAD_MESSAGE, stale: true }),
       )
       // Also catches a malformed response, so the listing never stays pending.
       .catch((e: unknown) => done({ head, entries: null, error: abort.signal.aborted ? LISTING_TIMEOUT : errorMessage(e), stale: false }))
@@ -244,13 +243,13 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
       (path, viewed) => setViewed(repo, pr.number, path, viewed, head),
       () => setMarks(s.snapshot()),
       (path, e) => {
-        if (e instanceof ApiError && e.code === 'stale_head') showToast(e.message, { label: '刷新', run: onRefresh })
-        else showToast(`无法更新 ${path} 的已看状态：${errorMessage(e)}`)
+        if (e instanceof ApiError && e.code === 'stale_head') showToast(e.message, { label: 'Refresh', run: onRefresh })
+        else showToast(`Couldn't update the viewed state of ${path}: ${errorMessage(e)}`)
       },
     )
     sync.current = s
     setMarks(s.snapshot())
-    // E.g. "PR 已经更新" about the previous head.
+    // E.g. "The pull request has been updated" about the previous head.
     setToast(null)
     return () => {
       s.dispose()
@@ -335,7 +334,7 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
     // Unchanged files have no viewed mark.
     if (!changedCurrent || !s) return
     if (!s.has(changedCurrent.path)) {
-      showToast('GitHub 的文件列表里没有这个路径，无法标记已看')
+      showToast("GitHub's file list doesn't have this path, so it can't be marked as viewed")
       return
     }
     const viewed = !s.isViewed(changedCurrent.path)
@@ -423,14 +422,14 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
   return (
     <div className="app" style={{ '--tree-width': `${treeWidth}px` } as React.CSSProperties}>
       <header className="topbar">
-        <a className="home-link" href="/" title="首页">
+        <a className="home-link" href="/" title="Home">
           Tideline
         </a>
         <span className="sep" />
         <span className="pr-repo">
           {pr.owner}/{pr.repo}
         </span>
-        <a className="pr-number" href={/^https?:\/\//i.test(pr.url) ? pr.url : undefined} target="_blank" rel="noreferrer" title="在 GitHub 上打开">
+        <a className="pr-number" href={/^https?:\/\//i.test(pr.url) ? pr.url : undefined} target="_blank" rel="noreferrer" title="Open on GitHub">
           #{pr.number}
         </a>
         <span className="pr-title" title={pr.title}>
@@ -443,7 +442,7 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
           <span className="branch">{pr.head.ref}</span>
         </span>
         <span className="spacer" />
-        <div className="segmented" role="group" aria-label="视图模式">
+        <div className="segmented" role="group" aria-label="View mode">
           <button className={sideBySide ? 'is-on' : ''} onClick={() => setSideBySide(true)} aria-pressed={sideBySide}>
             Split
           </button>
@@ -451,12 +450,12 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
             Unified
           </button>
         </div>
-        <label className="check" title="Monaco 只支持忽略行首行尾的空白">
+        <label className="check" title="Ignores whitespace only at the start and end of lines (a Monaco limit)">
           <input type="checkbox" checked={ignoreWs} onChange={(e) => setIgnoreWs(e.target.checked)} />
-          忽略首尾空白
+          Ignore whitespace
         </label>
-        <button className="btn btn-icon" onClick={onRefresh} disabled={refreshing} title="重新从 GitHub 拉取">
-          {refreshing ? '刷新中…' : '刷新'}
+        <button className="btn btn-icon" onClick={onRefresh} disabled={refreshing} title="Fetch the pull request again from GitHub">
+          {refreshing ? 'Refreshing…' : 'Refresh'}
         </button>
       </header>
 
@@ -496,11 +495,11 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
             <div className="pane-msg">
               <div className="pane-error">{unresolved.error}</div>
               <button className="btn" onClick={unresolved.stale ? onRefresh : retryListing}>
-                {unresolved.stale ? '刷新' : '重试'}
+                {unresolved.stale ? 'Refresh' : 'Retry'}
               </button>
             </div>
           ) : (
-            <div className="pane-msg muted">{resolving ? '加载中…' : files.length === 0 ? '这个 PR 没有改动文件' : ''}</div>
+            <div className="pane-msg muted">{resolving ? 'Loading…' : files.length === 0 ? "This pull request doesn't change any files" : ''}</div>
           )}
         </section>
       </div>
@@ -509,19 +508,19 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
         <span className="status-item" data-testid="change-info">
           {changeInfo
             ? changeInfo.total === 0
-              ? '无改动'
-              : `改动 ${changeInfo.index === null ? '–' : changeInfo.index + 1}/${changeInfo.total}`
-            : '改动 –'}
+              ? 'No changes'
+              : `Change ${changeInfo.index === null ? '–' : changeInfo.index + 1}/${changeInfo.total}`
+            : 'Change –'}
         </span>
         <span className="status-item">
-          文件 {currentIndex >= 0 ? currentIndex + 1 : '–'}/{order.length}
+          File {currentIndex >= 0 ? currentIndex + 1 : '–'}/{order.length}
         </span>
         <span className="spacer" />
-        <span className="hint"><kbd>F7</kbd> 下一处改动</span>
-        <span className="hint"><kbd>Shift+F7</kbd> 上一处</span>
-        <span className="hint"><kbd>Alt+↓</kbd>/<kbd>Alt+↑</kbd> 下/上一个文件</span>
-        <span className="hint"><kbd>Shift Shift</kbd>/<kbd>Ctrl+P</kbd> 查找文件</span>
-        <span className="hint"><kbd>v</kbd> 已看</span>
+        <span className="hint"><kbd>F7</kbd> next change</span>
+        <span className="hint"><kbd>Shift+F7</kbd> previous</span>
+        <span className="hint"><kbd>Alt+↓</kbd>/<kbd>Alt+↑</kbd> next/previous file</span>
+        <span className="hint"><kbd>Shift Shift</kbd>/<kbd>Ctrl+P</kbd> find file</span>
+        <span className="hint"><kbd>v</kbd> viewed</span>
       </footer>
 
       {finderOpen && (
@@ -543,10 +542,10 @@ function ViewedCheck({ path, mark, onToggle }: { path: string; mark: ViewedState
   if (mark === undefined) return null
   return (
     <>
-      {mark === 'DISMISSED' && <span className="chip chip-dismissed">看过之后又被修改</span>}
-      <label className="check" title="快捷键 v">
+      {mark === 'DISMISSED' && <span className="chip chip-dismissed">Changed since viewed</span>}
+      <label className="check" title="Shortcut: v">
         <input type="checkbox" checked={mark === 'VIEWED'} onChange={(e) => onToggle(path, e.target.checked)} />
-        已看
+        Viewed
       </label>
     </>
   )

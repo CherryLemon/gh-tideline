@@ -40,9 +40,9 @@ export function measure(text: string, bytes: number): TextMeta {
 export type SideMeasure = { meta: TextMeta } | { tooLargeBytes: number } | null
 
 export const PLAIN_REASONS = {
-  forced: '文件超过 5 MB 或 5 万行，已关闭语法高亮',
-  bytes: '文件大于 1 MB，已关闭语法高亮',
-  longLine: '存在超过 1 万字符的长行（疑似压缩文件），已关闭语法高亮',
+  forced: 'Over 5 MB or 50,000 lines: syntax highlighting off',
+  bytes: 'Over 1 MB: syntax highlighting off',
+  longLine: 'Line over 10,000 characters (likely minified): syntax highlighting off',
 } as const
 
 /**

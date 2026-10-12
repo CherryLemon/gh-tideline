@@ -74,22 +74,22 @@ export function FileFinder({ files, onPick, onClose }: Props) {
 
   return (
     <div className="finder-backdrop" onMouseDown={onClose}>
-      <div className="finder" onMouseDown={(e) => e.stopPropagation()} role="dialog" aria-label="查找文件">
+      <div className="finder" onMouseDown={(e) => e.stopPropagation()} role="dialog" aria-label="Find file">
         <div className="finder-title">
-          <span>查找文件</span>
-          <span className="muted">↑↓ 选择 · Enter 打开 · Esc 关闭</span>
+          <span>Find file</span>
+          <span className="muted">↑↓ select · Enter open · Esc close</span>
         </div>
         <input
           className="finder-input"
           autoFocus
           spellCheck={false}
-          placeholder="输入文件名…"
+          placeholder="Type a file name…"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           onKeyDown={onKeyDown}
         />
         <div className="finder-list" ref={listRef}>
-          {results.length === 0 && <div className="finder-empty muted">没有匹配的文件</div>}
+          {results.length === 0 && <div className="finder-empty muted">No matching files</div>}
           {results.map((r, i) => {
             const p = r.file.path
             const slash = p.lastIndexOf('/') + 1

@@ -37,7 +37,7 @@ export function Toast({ toast, onDismiss }: { toast: ToastMessage; onDismiss(): 
         </button>
       )}
       {action && (
-        <button className="toast-close" onClick={onDismiss} title="关闭" aria-label="关闭">
+        <button className="toast-close" onClick={onDismiss} title="Close" aria-label="Close">
           ×
         </button>
       )}

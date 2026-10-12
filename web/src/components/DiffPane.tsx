@@ -424,7 +424,7 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
               options={EDITOR_OPTIONS}
               keepCurrentModel
               onMount={handleSingleMount}
-              loading={<div className="pane-msg">正在加载编辑器…</div>}
+              loading={<div className="pane-msg">Loading editor…</div>}
             />
           </div>
         )}
@@ -435,7 +435,7 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
             keepCurrentOriginalModel
             keepCurrentModifiedModel
             onMount={handleMount}
-            loading={<div className="pane-msg">正在加载编辑器…</div>}
+            loading={<div className="pane-msg">Loading editor…</div>}
           />
         </div>
         {overlay}
@@ -445,7 +445,7 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
 })
 
 function sideSize(s: SideInfo): string {
-  return s.bytes === null ? '（无）' : formatBytes(s.bytes) + (s.lines ? `，${s.lines.toLocaleString()} 行` : '')
+  return s.bytes === null ? '(none)' : formatBytes(s.bytes) + (s.lines ? `, ${s.lines.toLocaleString()} ${s.lines === 1 ? 'line' : 'lines'}` : '')
 }
 
 /** Both sides of a changed file; only the head of an unchanged one. */
@@ -459,28 +459,28 @@ function renderOverlay(state: PaneState, file: ChangedFile | TreeEntry, actions:
     case 'single':
       return null
     case 'loading':
-      return <div className="pane-msg pane-loading">加载中…</div>
+      return <div className="pane-msg pane-loading">Loading…</div>
     case 'error':
       return (
         <div className="pane-msg">
           <div className="pane-error">{state.message}</div>
-          <button className="btn" onClick={actions.retry}>重试</button>
+          <button className="btn" onClick={actions.retry}>Retry</button>
         </div>
       )
     case 'binary':
       return (
         <div className="pane-msg">
-          <div className="pane-title">二进制文件</div>
-          <div className="pane-sub">大小 {sizeLine(file, state.base, state.head)}</div>
+          <div className="pane-title">Binary file</div>
+          <div className="pane-sub">Size {sizeLine(file, state.base, state.head)}</div>
         </div>
       )
     case 'deferred':
       return (
         <div className="pane-msg">
-          <div className="pane-title">文件过大，未自动加载</div>
+          <div className="pane-title">File too large to load automatically</div>
           <div className="pane-sub">{sizeLine(file, state.base, state.head)}</div>
-          <div className="pane-sub">超过 5 MB 或 5 万行的文件需要手动加载，加载后不做语法高亮。</div>
-          <button className="btn btn-primary" onClick={actions.load}>点击加载</button>
+          <div className="pane-sub">Files over 5 MB or 50,000 lines load on request, without syntax highlighting.</div>
+          <button className="btn btn-primary" onClick={actions.load}>Load file</button>
         </div>
       )
     case 'image':
@@ -494,7 +494,7 @@ function renderOverlay(state: PaneState, file: ChangedFile | TreeEntry, actions:
 function SubmoduleEntry({ entry }: { entry: TreeEntry }) {
   return (
     <div className="pane-msg" data-testid="submodule-diff">
-      <div className="pane-title">子模块</div>
+      <div className="pane-title">Submodule</div>
       <div className="pane-sub submodule-line">
         <SubmoduleSide oid={entry.oid} mode={entry.mode} />
       </div>
@@ -503,10 +503,10 @@ function SubmoduleEntry({ entry }: { entry: TreeEntry }) {
 }
 
 function SubmoduleSide({ oid, mode }: { oid: string | null; mode: string }) {
-  if (!oid) return <span className="muted">（无）</span>
+  if (!oid) return <span className="muted">(none)</span>
   return (
     <code title={oid}>
-      {isGitlink(mode) ? 'Subproject commit ' : '文件 '}
+      {isGitlink(mode) ? 'Subproject commit ' : 'File '}
       {shortSha(oid)}
     </code>
   )
@@ -516,7 +516,7 @@ function SubmoduleSide({ oid, mode }: { oid: string | null; mode: string }) {
 function SubmoduleDiff({ file }: { file: ChangedFile }) {
   return (
     <div className="pane-msg" data-testid="submodule-diff">
-      <div className="pane-title">子模块</div>
+      <div className="pane-title">Submodule</div>
       <div className="pane-sub submodule-line">
         {file.oldOid && file.newOid ? (
           <>
@@ -528,7 +528,7 @@ function SubmoduleDiff({ file }: { file: ChangedFile }) {
           <SubmoduleSide oid={file.oldOid ?? file.newOid} mode={file.oldOid ? file.oldMode : file.newMode} />
         )}
       </div>
-      {(!file.oldOid || !file.newOid) && <div className="pane-sub">{file.oldOid ? '已移除' : '新增'}</div>}
+      {(!file.oldOid || !file.newOid) && <div className="pane-sub">{file.oldOid ? 'Removed' : 'Added'}</div>}
     </div>
   )
 }
@@ -540,8 +540,8 @@ function FileHeader({ file, plainReason, actions }: { file: ChangedFile | TreeEn
         <span className="file-header-path" title={file.path}>
           {file.path}
         </span>
-        <span className="chip" title="这个文件在 PR 里没有改动，显示的是 head 上的内容">
-          未改动
+        <span className="chip" title="This pull request doesn't change this file: showing its content at the head commit">
+          Unchanged
         </span>
         {plainReason && <span className="chip chip-warn">{plainReason}</span>}
         <span className="spacer" />
@@ -566,7 +566,7 @@ function FileHeader({ file, plainReason, actions }: { file: ChangedFile | TreeEn
         )}
       </span>
       {modeChanged && (
-        <span className="chip" title="文件模式变更">
+        <span className="chip" title="File mode changed">
           {file.oldMode} → {file.newMode}
         </span>
       )}

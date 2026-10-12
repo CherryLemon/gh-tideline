@@ -11,7 +11,7 @@ function Side({ label, url, info }: { label: string; url: string | null; info: S
       <div className="image-side-header">
         <span className="image-side-label">{label}</span>
         <span className="muted">
-          {url ? [dims, formatBytes(info.bytes)].filter(Boolean).join(' · ') : '（无）'}
+          {url ? [dims, formatBytes(info.bytes)].filter(Boolean).join(' · ') : '(none)'}
         </span>
       </div>
       <div className="image-canvas">
@@ -22,7 +22,7 @@ function Side({ label, url, info }: { label: string; url: string | null; info: S
             onLoad={(e) => setDims(`${e.currentTarget.naturalWidth} × ${e.currentTarget.naturalHeight}`)}
           />
         ) : (
-          <span className="muted">此侧没有该文件</span>
+          <span className="muted">No file on this side</span>
         )}
       </div>
     </div>

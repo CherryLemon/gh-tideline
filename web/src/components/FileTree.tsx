@@ -66,9 +66,9 @@ function ViewedProgress({ viewed }: { viewed: ReadonlyMap<string, ViewedState> }
   let done = 0
   for (const state of viewed.values()) if (state === 'VIEWED') done++
   return (
-    <div className="tree-footer" title="GitHub 上的已看状态，包括生成的文件">
+    <div className="tree-footer" title="Viewed state on GitHub, generated files included">
       <span>
-        已看 {done}/{viewed.size}
+        Viewed {done}/{viewed.size}
       </span>
       <div className="progress">
         <div className="progress-bar" style={{ width: `${(done / viewed.size) * 100}%` }} />
@@ -114,12 +114,12 @@ export function FileTree({
   return (
     <div className="tree">
       <div className="tree-header">
-        <div className="segmented tree-scope" role="group" aria-label="文件树范围">
-          <button className={scope === 'changed' ? 'is-on' : ''} aria-pressed={scope === 'changed'} onClick={() => onScopeChange('changed')} title="只列出改动的文件">
-            改动 <span className="seg-count">{files.length}</span>
+        <div className="segmented tree-scope" role="group" aria-label="Tree scope">
+          <button className={scope === 'changed' ? 'is-on' : ''} aria-pressed={scope === 'changed'} onClick={() => onScopeChange('changed')} title="Only the files this pull request changes">
+            Changed <span className="seg-count">{files.length}</span>
           </button>
-          <button className={scope === 'all' ? 'is-on' : ''} aria-pressed={scope === 'all'} onClick={() => onScopeChange('all')} title="列出 head 上的整个项目">
-            全部{totalFiles !== null && <span className="seg-count"> {totalFiles}</span>}
+          <button className={scope === 'all' ? 'is-on' : ''} aria-pressed={scope === 'all'} onClick={() => onScopeChange('all')} title="Every file of the project at the head commit">
+            All{totalFiles !== null && <span className="seg-count"> {totalFiles}</span>}
           </button>
         </div>
         <span className="add">+{additions}</span>
@@ -128,12 +128,12 @@ export function FileTree({
       {listing && (
         <div className="tree-listing">
           {listing.kind === 'loading' ? (
-            <span className="muted">正在列出项目文件…</span>
+            <span className="muted">Listing project files…</span>
           ) : (
             <>
               <span className="pane-error">{listing.message}</span>
               <button className="btn" onClick={onRetryListing}>
-                {listing.stale ? '刷新' : '重试'}
+                {listing.stale ? 'Refresh' : 'Retry'}
               </button>
             </>
           )}
@@ -160,7 +160,7 @@ export function FileTree({
                   style={style}
                   role="treeitem"
                   aria-selected={selected}
-                  title={(renamedFrom ? `${f.oldPath} → ${f.path}` : f.path) + (mark === 'DISMISSED' ? '\n看过之后又被修改' : '')}
+                  title={(renamedFrom ? `${f.oldPath} → ${f.path}` : f.path) + (mark === 'DISMISSED' ? '\nChanged since viewed' : '')}
                   data-path={f.path}
                   onClick={() => onOpen(f.path)}
                 >
@@ -180,8 +180,8 @@ export function FileTree({
                       type="checkbox"
                       className="viewed-box"
                       checked={mark === 'VIEWED'}
-                      title={mark === 'VIEWED' ? '已看' : '标记为已看'}
-                      aria-label={`已看 ${f.path}`}
+                      title={mark === 'VIEWED' ? 'Viewed' : 'Mark as viewed'}
+                      aria-label={`Viewed ${f.path}`}
                       onClick={(e) => e.stopPropagation()}
                       onChange={(e) => onToggleViewed(f.path, e.target.checked)}
                     />
@@ -198,7 +198,7 @@ export function FileTree({
                   style={style}
                   role="treeitem"
                   aria-selected={selected}
-                  title={`${row.entry.path}\n未改动`}
+                  title={`${row.entry.path}\nUnchanged`}
                   data-path={row.entry.path}
                   onClick={() => onOpen(row.entry.path)}
                 >
@@ -224,7 +224,7 @@ export function FileTree({
                 {row.kind === 'dir' && <FolderIcon />}
                 <span className="dir-name">{row.name}</span>
                 {count > 0 && (
-                  <span className="dir-count muted" title={full ? `${count} 个改动文件` : undefined}>
+                  <span className="dir-count muted" title={full ? `${count} changed ${count === 1 ? 'file' : 'files'}` : undefined}>
                     {count}
                   </span>
                 )}

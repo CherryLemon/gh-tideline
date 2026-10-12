@@ -143,7 +143,7 @@ async function rasterizeSvg(buf: ArrayBuffer): Promise<string> {
   try {
     await img.decode()
   } catch {
-    throw new Error('无法解析该 SVG 图片')
+    throw new Error("Can't parse this SVG image")
   }
   // SVGs without intrinsic size get the default replaced-element size, as <img> would.
   let w = img.naturalWidth || 300
@@ -156,14 +156,14 @@ async function rasterizeSvg(buf: ArrayBuffer): Promise<string> {
   canvas.height = h
   canvas.getContext('2d')?.drawImage(img, 0, 0, w, h)
   const png = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, 'image/png'))
-  if (!png) throw new Error('无法渲染该 SVG 图片')
+  if (!png) throw new Error("Can't render this SVG image")
   return URL.createObjectURL(png)
 }
 
 function imageUrl(buf: ArrayBuffer, type: ImageType): Promise<string> {
   if (type.kind === 'svg') return rasterizeSvg(buf)
   // Only types that can never become a document with script get a same-origin URL.
-  if (!isSafeBlobMime(type.mime)) return Promise.reject(new Error(`不支持的图片类型 ${type.mime}`))
+  if (!isSafeBlobMime(type.mime)) return Promise.reject(new Error(`Unsupported image type ${type.mime}`))
   return Promise.resolve(URL.createObjectURL(new Blob([buf], { type: type.mime })))
 }
 
