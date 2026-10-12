@@ -9,7 +9,7 @@ Line 8: throwaway content for review-thread spikes.
 Line 9: throwaway content for review-thread spikes.
 Line 10: throwaway content for review-thread spikes.
 Line 11: throwaway content for review-thread spikes.
-Line 12: throwaway content for review-thread spikes.
+Line 12: changed in the second spike commit.
 Line 13: throwaway content for review-thread spikes.
 Line 14: throwaway content for review-thread spikes.
 Line 15: throwaway content for review-thread spikes.
@@ -28,3 +28,4 @@ Line 27: throwaway content for review-thread spikes.
 Line 28: throwaway content for review-thread spikes.
 Line 29: throwaway content for review-thread spikes.
 Line 30: throwaway content for review-thread spikes.
+Line 31: added in the second spike commit.
