@@ -1,18 +1,32 @@
-// Changed-file tree: directory grouping with JetBrains-style compression of
-// single-child directory chains, plus a separate "Generated" group.
-import type { ChangedFile } from './api'
+// File tree: directory grouping with JetBrains-style compression of single-child
+// directory chains. Two shapes: the changed files (with a separate "Generated" group),
+// or the whole head tree with the changed files in place (`prepareFullTree`).
+// The structure is prepared once per file list; rows are emitted per expanded state.
+import type { ChangedFile, TreeEntry } from './api'
+
+/** A changed file, or an unchanged file of the head tree. */
+export type TreeFile = ChangedFile | TreeEntry
+
+export function isChanged(f: TreeFile): f is ChangedFile {
+  return 'status' in f
+}
 
 interface DirNode {
   name: string
   key: string
-  dirs: Map<string, DirNode>
-  files: ChangedFile[]
+  /** Sorted and compressed. */
+  dirs: DirNode[]
+  /** Sorted by base name. */
+  files: TreeFile[]
+  fileCount: number
+  changedCount: number
 }
 
 export type TreeRow =
-  | { kind: 'dir'; key: string; name: string; depth: number; expanded: boolean; fileCount: number }
-  | { kind: 'group'; key: string; name: string; depth: number; expanded: boolean; fileCount: number }
+  | { kind: 'dir'; key: string; name: string; depth: number; expanded: boolean; fileCount: number; changedCount: number }
+  | { kind: 'group'; key: string; name: string; depth: number; expanded: boolean; fileCount: number; changedCount: number }
   | { kind: 'file'; key: string; file: ChangedFile; depth: number }
+  | { kind: 'entry'; key: string; entry: TreeEntry; depth: number }
 
 export const GENERATED_KEY = '::generated'
 
@@ -22,8 +36,15 @@ function baseName(path: string): string {
   return path.slice(path.lastIndexOf('/') + 1)
 }
 
-function buildDir(files: ChangedFile[], keyPrefix: string): DirNode {
-  const root: DirNode = { name: '', key: keyPrefix, dirs: new Map(), files: [] }
+interface RawDir {
+  name: string
+  key: string
+  dirs: Map<string, RawDir>
+  files: TreeFile[]
+}
+
+function rawTree(files: readonly TreeFile[], keyPrefix: string): RawDir {
+  const root: RawDir = { name: '', key: keyPrefix, dirs: new Map(), files: [] }
   for (const f of files) {
     const parts = f.path.split('/')
     let node = root
@@ -40,66 +61,111 @@ function buildDir(files: ChangedFile[], keyPrefix: string): DirNode {
   return root
 }
 
-/** Merge `a/` → `b/` while a directory holds exactly one subdirectory and no files. */
-function compress(node: DirNode): DirNode {
-  let cur = node
-  let name = node.name
-  while (cur.files.length === 0 && cur.dirs.size === 1) {
-    const only = cur.dirs.values().next().value as DirNode
-    name = `${name}/${only.name}`
-    cur = only
+/**
+ * Sorts, counts and compresses: `a/` → `b/` merge while a directory holds exactly one
+ * subdirectory and no files. A merged node takes the key of its deepest directory.
+ * The root itself is never compressed (its children are the top-level rows).
+ */
+function finish(raw: RawDir, isRoot = false): DirNode {
+  let cur = raw
+  let name = raw.name
+  while (!isRoot && cur.files.length === 0 && cur.dirs.size === 1) {
+    cur = cur.dirs.values().next().value as RawDir
+    name = `${name}/${cur.name}`
   }
-  return name === cur.name ? cur : { ...cur, name }
-}
-
-function countFiles(node: DirNode): number {
-  let n = node.files.length
-  for (const d of node.dirs.values()) n += countFiles(d)
-  return n
-}
-
-function sortedDirs(node: DirNode): DirNode[] {
-  return [...node.dirs.values()].map(compress).sort((a, b) => collator.compare(a.name, b.name))
-}
-
-function sortedFiles(node: DirNode): ChangedFile[] {
-  return [...node.files].sort((a, b) => collator.compare(baseName(a.path), baseName(b.path)))
-}
-
-function emit(node: DirNode, depth: number, collapsed: Set<string>, rows: TreeRow[] | null, order: ChangedFile[]): void {
-  for (const d of sortedDirs(node)) {
-    const expanded = !collapsed.has(d.key)
-    rows?.push({ kind: 'dir', key: d.key, name: d.name, depth, expanded, fileCount: countFiles(d) })
-    emit(d, depth + 1, collapsed, expanded ? rows : null, order)
+  const dirs = [...cur.dirs.values()].map((d) => finish(d)).sort((a, b) => collator.compare(a.name, b.name))
+  const files = [...cur.files].sort((a, b) => collator.compare(baseName(a.path), baseName(b.path)))
+  let fileCount = files.length
+  let changedCount = files.filter(isChanged).length
+  for (const d of dirs) {
+    fileCount += d.fileCount
+    changedCount += d.changedCount
   }
-  for (const f of sortedFiles(node)) {
-    rows?.push({ kind: 'file', key: f.path, file: f, depth })
-    order.push(f)
-  }
+  return { name, key: cur.key, dirs, files, fileCount, changedCount }
 }
 
-export interface FileTree {
-  rows: TreeRow[]
-  /** Every file in display order, regardless of collapsed state (used for next/prev file). */
-  order: ChangedFile[]
+interface Section {
+  /** A collapsible group row above the section ("Generated"), or none. */
+  group: { key: string; name: string } | null
+  root: DirNode
 }
 
-export function buildTree(files: ChangedFile[], collapsed: Set<string>): FileTree {
-  const rows: TreeRow[] = []
-  const order: ChangedFile[] = []
+export interface PreparedTree {
+  sections: Section[]
+  /** Every file in display order, regardless of expanded state. */
+  all: TreeFile[]
+}
+
+// Pushed one by one: spreading a 100k-element array into push() overflows the stack.
+function collect(node: DirNode, out: TreeFile[]): void {
+  for (const d of node.dirs) collect(d, out)
+  for (const f of node.files) out.push(f)
+}
+
+function prepared(sections: Section[]): PreparedTree {
+  const all: TreeFile[] = []
+  for (const s of sections) collect(s.root, all)
+  return { sections, all }
+}
+
+/** The changed files, generated ones in their own group after the rest. */
+export function prepareTree(files: readonly ChangedFile[]): PreparedTree {
   const main = files.filter((f) => !f.generated)
   const generated = files.filter((f) => f.generated)
-  emit(buildDir(main, ''), 0, collapsed, rows, order)
+  const sections: Section[] = [{ group: null, root: finish(rawTree(main, ''), true) }]
   if (generated.length > 0) {
-    const expanded = !collapsed.has(GENERATED_KEY)
-    rows.push({ kind: 'group', key: GENERATED_KEY, name: 'Generated', depth: 0, expanded, fileCount: generated.length })
-    emit(buildDir(generated, GENERATED_KEY), 1, collapsed, expanded ? rows : null, order)
+    sections.push({ group: { key: GENERATED_KEY, name: 'Generated' }, root: finish(rawTree(generated, GENERATED_KEY), true) })
   }
-  return { rows, order }
+  return prepared(sections)
+}
+
+/**
+ * The whole head tree (`entries`) with each changed file in place of its entry. Deleted
+ * files are not in the head tree and are added at their old location. Generated files
+ * stay where they are.
+ */
+export function prepareFullTree(changed: readonly ChangedFile[], entries: readonly TreeEntry[]): PreparedTree {
+  const byPath = new Map(changed.map((f) => [f.path, f]))
+  const files: TreeFile[] = []
+  for (const e of entries) {
+    const c = byPath.get(e.path)
+    files.push(c ?? e)
+    byPath.delete(e.path)
+  }
+  // Deletions, plus anything the head tree lacks for another reason.
+  for (const f of byPath.values()) files.push(f)
+  return prepared([{ group: null, root: finish(rawTree(files, ''), true) }])
+}
+
+function emit(node: DirNode, depth: number, isExpanded: (key: string) => boolean, rows: TreeRow[]): void {
+  for (const d of node.dirs) {
+    const expanded = isExpanded(d.key)
+    rows.push({ kind: 'dir', key: d.key, name: d.name, depth, expanded, fileCount: d.fileCount, changedCount: d.changedCount })
+    if (expanded) emit(d, depth + 1, isExpanded, rows)
+  }
+  for (const f of node.files) {
+    if (isChanged(f)) rows.push({ kind: 'file', key: f.path, file: f, depth })
+    else rows.push({ kind: 'entry', key: f.path, entry: f, depth })
+  }
+}
+
+/** Visible rows: only expanded directories are descended into. */
+export function treeRows(tree: PreparedTree, isExpanded: (key: string) => boolean): TreeRow[] {
+  const rows: TreeRow[] = []
+  for (const { group, root } of tree.sections) {
+    if (!group) {
+      emit(root, 0, isExpanded, rows)
+      continue
+    }
+    const expanded = isExpanded(group.key)
+    rows.push({ kind: 'group', key: group.key, name: group.name, depth: 0, expanded, fileCount: root.fileCount, changedCount: root.changedCount })
+    if (expanded) emit(root, 1, isExpanded, rows)
+  }
+  return rows
 }
 
 /** Keys of the tree nodes that must be expanded for `path` to be visible. */
-export function ancestorKeys(file: Pick<ChangedFile, 'path' | 'generated'>): string[] {
+export function ancestorKeys(file: { path: string; generated?: boolean }): string[] {
   const prefix = file.generated ? GENERATED_KEY : ''
   const keys = file.generated ? [GENERATED_KEY] : []
   const parts = file.path.split('/')
@@ -109,6 +175,27 @@ export function ancestorKeys(file: Pick<ChangedFile, 'path' | 'generated'>): str
     keys.push(key)
   }
   return keys
+}
+
+/** Directories of the full tree to open at first: those leading to a changed file. */
+export function defaultExpanded(changed: readonly ChangedFile[]): Set<string> {
+  const keys = new Set<string>()
+  for (const f of changed) for (const k of ancestorKeys({ path: f.path })) keys.add(k)
+  return keys
+}
+
+/**
+ * The nearest changed file after (`dir` 1) or before (-1) `path` in display order; for
+ * stepping from an unchanged file. Null if there is none or `path` is not listed.
+ */
+export function adjacentChanged(all: readonly TreeFile[], path: string, dir: 1 | -1): ChangedFile | null {
+  const at = all.findIndex((f) => f.path === path)
+  if (at < 0) return null
+  for (let i = at + dir; i >= 0 && i < all.length; i += dir) {
+    const f = all[i]
+    if (isChanged(f)) return f
+  }
+  return null
 }
 
 export function fileLabel(file: ChangedFile): { name: string; renamedFrom: string | null } {

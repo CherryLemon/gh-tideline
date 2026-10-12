@@ -1,4 +1,4 @@
-// HTTP client for the tideline backend. Types mirror docs/m0-skeleton.md.
+// HTTP client for the tideline backend. Types mirror the JSON the Rust server sends (design.md §6).
 
 export interface PrSummary {
   host: string
@@ -13,7 +13,12 @@ export interface PrSummary {
   head: { ref: string; sha: string }
   mergeBase: string
   nodeId: string
+  /** Login of the user the server's GitHub token belongs to. */
+  viewer: string
 }
+
+/** DISMISSED: viewed, then changed by a later push. */
+export type ViewedState = 'VIEWED' | 'UNVIEWED' | 'DISMISSED'
 
 export type FileStatus = 'A' | 'M' | 'D' | 'R' | 'C' | 'T'
 
@@ -32,6 +37,22 @@ export interface ChangedFile {
   deletions?: number
   binary: boolean
   generated: boolean
+  /** Only on the full PR file list, and only for paths GitHub lists. */
+  viewed?: ViewedState
+}
+
+/** A file of the head tree (`git ls-tree -r`); gitlinks (mode 160000) carry a commit oid. */
+export interface TreeEntry {
+  path: string
+  mode: string
+  oid: string
+}
+
+export interface PrTree {
+  /** The head commit the listing belongs to. */
+  head: string
+  /** Empty when `head` is not the head that was asked for (the PR has moved on). */
+  entries: TreeEntry[]
 }
 
 export interface ApiErrorBody {
@@ -44,16 +65,19 @@ export interface RepoRef {
   repo: string
 }
 
-export const UNAUTHORIZED_MESSAGE = '请在终端运行 `gh-tideline` 授权此浏览器'
+export const UNAUTHORIZED_MESSAGE = 'Run `gh-tideline` in a terminal to authorize this browser'
+export const STALE_HEAD_MESSAGE = 'The pull request has been updated; refresh to load the new version'
 
 const CODE_MESSAGES: Record<string, string> = {
   unauthorized: UNAUTHORIZED_MESSAGE,
-  forbidden_host: '该域名不在允许列表中（github.com 或配置文件里的 ghe_hosts）',
-  not_found: '找不到该 PR 或文件',
-  no_token: '没有可用的 GitHub token：请设置 GH_TOKEN 或运行 `gh auth login`',
-  github_error: 'GitHub 请求失败',
-  git_error: 'git 操作失败',
-  bad_request: '请求参数不正确',
+  forbidden_host: 'Host not allowed',
+  not_found: 'Not found',
+  no_token: 'No GitHub token',
+  github_error: 'GitHub request failed',
+  git_error: 'Git operation failed',
+  bad_request: 'Invalid request',
+  stale_head: STALE_HEAD_MESSAGE,
+  network: "Can't reach the Tideline server",
 }
 
 export class ApiError extends Error {
@@ -62,9 +86,10 @@ export class ApiError extends Error {
   readonly detail: string
 
   constructor(status: number, code: string, detail: string) {
-    const base = CODE_MESSAGES[code] ?? `请求失败（HTTP ${status}）`
-    // 401 always shows the fixed instruction; other codes append the server detail.
-    super(code === 'unauthorized' || !detail || detail === base ? base : `${base}：${detail}`)
+    const base = CODE_MESSAGES[code] ?? `Request failed (HTTP ${status})`
+    // These always show the fixed text; other codes append the server detail.
+    const fixed = code === 'unauthorized' || code === 'stale_head'
+    super(fixed || !detail || detail === base ? base : `${base}: ${detail}`)
     this.name = 'ApiError'
     this.status = status
     this.code = code
@@ -96,7 +121,7 @@ async function request(path: string, init?: RequestInit): Promise<Response> {
     res = await fetch(path, { ...init, headers, credentials: 'same-origin' })
   } catch (e) {
     if (e instanceof DOMException && e.name === 'AbortError') throw e
-    throw new ApiError(0, 'network', `无法连接到 tideline 服务（${(e as Error).message}）`)
+    throw new ApiError(0, 'network', (e as Error).message)
   }
   if (!res.ok) throw await toApiError(res)
   return res
@@ -116,6 +141,25 @@ export async function getPr(r: RepoRef, n: number, refresh = false): Promise<PrS
 export async function getPrFiles(r: RepoRef, n: number, refresh = false): Promise<ChangedFile[]> {
   const res = await request(`${repoBase(r)}/pulls/${n}/files${refresh ? '?refresh=1' : ''}`)
   return (await res.json()) as ChangedFile[]
+}
+
+/**
+ * Every file of the head tree, for the full project tree. The server lists `head` if it
+ * still has that snapshot, else its current head (compare `PrTree.head`).
+ */
+export async function getPrTree(r: RepoRef, n: number, head: string, signal?: AbortSignal): Promise<PrTree> {
+  const res = await request(`${repoBase(r)}/pulls/${n}/tree?head=${encodeURIComponent(head)}`, { signal })
+  return (await res.json()) as PrTree
+}
+
+/** Marks (`viewed`) or unmarks a file as viewed; `head` is the head the page shows. */
+export async function setViewed(r: RepoRef, n: number, path: string, viewed: boolean, head: string): Promise<ViewedState> {
+  const res = await request(`${repoBase(r)}/pulls/${n}/viewed`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path, viewed, head }),
+  })
+  return ((await res.json()) as { viewed: ViewedState }).viewed
 }
 
 /** Raw blob response; the caller decides whether to read the body (see Content-Length checks). */

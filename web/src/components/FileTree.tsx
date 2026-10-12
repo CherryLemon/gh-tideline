@@ -1,17 +1,36 @@
 import { useEffect, useRef } from 'react'
 import { useVirtualizer } from '@tanstack/react-virtual'
-import type { ChangedFile } from '../api'
+import type { ChangedFile, ViewedState } from '../api'
 import { fileLabel, type TreeRow } from '../tree'
+
+/** Which files the tree lists: the changed ones, or the whole head tree. */
+export type TreeScope = 'changed' | 'all'
+
+/**
+ * Progress of the head tree listing the `all` scope needs; null once it is there. `stale`:
+ * the server has moved on to a newer head, so only a refresh helps.
+ */
+export type ListingState = { kind: 'loading' } | { kind: 'error'; message: string; stale: boolean } | null
 
 const ROW_HEIGHT = 22
 const INDENT = 14
 
 interface Props {
   rows: TreeRow[]
+  /** The changed files (header counts). */
   files: ChangedFile[]
+  scope: TreeScope
+  onScopeChange(scope: TreeScope): void
+  /** Files in the head tree, once listed. */
+  totalFiles: number | null
+  listing: ListingState
+  onRetryListing(): void
   currentPath: string | null
+  /** Viewed marks of the paths GitHub lists; other files get no checkbox. */
+  viewed: ReadonlyMap<string, ViewedState>
   onOpen(path: string): void
   onToggle(key: string): void
+  onToggleViewed(path: string, viewed: boolean): void
 }
 
 function Chevron({ expanded }: { expanded: boolean }) {
@@ -42,7 +61,40 @@ function Counts({ file }: { file: ChangedFile }) {
   )
 }
 
-export function FileTree({ rows, files, currentPath, onOpen, onToggle }: Props) {
+function ViewedProgress({ viewed }: { viewed: ReadonlyMap<string, ViewedState> }) {
+  if (viewed.size === 0) return null
+  let done = 0
+  for (const state of viewed.values()) if (state === 'VIEWED') done++
+  return (
+    <div className="tree-footer" title="Viewed state on GitHub, generated files included">
+      <span>
+        Viewed {done}/{viewed.size}
+      </span>
+      <div className="progress">
+        <div className="progress-bar" style={{ width: `${(done / viewed.size) * 100}%` }} />
+      </div>
+    </div>
+  )
+}
+
+function baseName(path: string): string {
+  return path.slice(path.lastIndexOf('/') + 1)
+}
+
+export function FileTree({
+  rows,
+  files,
+  scope,
+  onScopeChange,
+  totalFiles,
+  listing,
+  onRetryListing,
+  currentPath,
+  viewed,
+  onOpen,
+  onToggle,
+  onToggleViewed,
+}: Props) {
   const scrollRef = useRef<HTMLDivElement>(null)
   const virtualizer = useVirtualizer({
     count: rows.length,
@@ -51,7 +103,7 @@ export function FileTree({ rows, files, currentPath, onOpen, onToggle }: Props) 
     overscan: 16,
   })
 
-  const selectedIndex = rows.findIndex((r) => r.kind === 'file' && r.file.path === currentPath)
+  const selectedIndex = rows.findIndex((r) => (r.kind === 'file' || r.kind === 'entry') && r.key === currentPath)
   useEffect(() => {
     if (selectedIndex >= 0) virtualizer.scrollToIndex(selectedIndex, { align: 'auto' })
   }, [selectedIndex, virtualizer])
@@ -62,11 +114,31 @@ export function FileTree({ rows, files, currentPath, onOpen, onToggle }: Props) 
   return (
     <div className="tree">
       <div className="tree-header">
-        <span className="tree-title">Changes</span>
-        <span className="muted">{files.length} files</span>
+        <div className="segmented tree-scope" role="group" aria-label="Tree scope">
+          <button className={scope === 'changed' ? 'is-on' : ''} aria-pressed={scope === 'changed'} onClick={() => onScopeChange('changed')} title="Only the files this pull request changes">
+            Changed <span className="seg-count">{files.length}</span>
+          </button>
+          <button className={scope === 'all' ? 'is-on' : ''} aria-pressed={scope === 'all'} onClick={() => onScopeChange('all')} title="Every file of the project at the head commit">
+            All{totalFiles !== null && <span className="seg-count"> {totalFiles}</span>}
+          </button>
+        </div>
         <span className="add">+{additions}</span>
         <span className="del">-{deletions}</span>
       </div>
+      {listing && (
+        <div className="tree-listing">
+          {listing.kind === 'loading' ? (
+            <span className="muted">Listing project files…</span>
+          ) : (
+            <>
+              <span className="pane-error">{listing.message}</span>
+              <button className="btn" onClick={onRetryListing}>
+                {listing.stale ? 'Refresh' : 'Retry'}
+              </button>
+            </>
+          )}
+        </div>
+      )}
       <div className="tree-scroll" ref={scrollRef} role="tree">
         <div style={{ height: virtualizer.getTotalSize(), position: 'relative' }}>
           {virtualizer.getVirtualItems().map((item) => {
@@ -80,14 +152,15 @@ export function FileTree({ rows, files, currentPath, onOpen, onToggle }: Props) 
               const f = row.file
               const { name, renamedFrom } = fileLabel(f)
               const selected = f.path === currentPath
+              const mark = viewed.get(f.path)
               return (
                 <div
                   key={row.key}
-                  className={`tree-row tree-file${selected ? ' is-selected' : ''}`}
+                  className={`tree-row tree-file${selected ? ' is-selected' : ''}${mark === 'VIEWED' ? ' is-viewed' : ''}${mark === 'DISMISSED' ? ' is-dismissed' : ''}`}
                   style={style}
                   role="treeitem"
                   aria-selected={selected}
-                  title={renamedFrom ? `${f.oldPath} → ${f.path}` : f.path}
+                  title={(renamedFrom ? `${f.oldPath} → ${f.path}` : f.path) + (mark === 'DISMISSED' ? '\nChanged since viewed' : '')}
                   data-path={f.path}
                   onClick={() => onOpen(f.path)}
                 >
@@ -102,27 +175,65 @@ export function FileTree({ rows, files, currentPath, onOpen, onToggle }: Props) 
                     {name}
                   </span>
                   <Counts file={f} />
+                  {mark !== undefined && (
+                    <input
+                      type="checkbox"
+                      className="viewed-box"
+                      checked={mark === 'VIEWED'}
+                      title={mark === 'VIEWED' ? 'Viewed' : 'Mark as viewed'}
+                      aria-label={`Viewed ${f.path}`}
+                      onClick={(e) => e.stopPropagation()}
+                      onChange={(e) => onToggleViewed(f.path, e.target.checked)}
+                    />
+                  )}
                 </div>
               )
             }
+            if (row.kind === 'entry') {
+              const selected = row.key === currentPath
+              return (
+                <div
+                  key={row.key}
+                  className={`tree-row tree-file is-unchanged${selected ? ' is-selected' : ''}`}
+                  style={style}
+                  role="treeitem"
+                  aria-selected={selected}
+                  title={`${row.entry.path}\nUnchanged`}
+                  data-path={row.entry.path}
+                  onClick={() => onOpen(row.entry.path)}
+                >
+                  <span className="status-letter" />
+                  <span className="file-name">{baseName(row.entry.path)}</span>
+                </div>
+              )
+            }
+            // The full tree counts changed files per folder; the changed tree counts all of them.
+            const full = scope === 'all'
+            const count = full ? row.changedCount : row.fileCount
             return (
               <div
                 key={row.key}
-                className={`tree-row tree-dir${row.kind === 'group' ? ' tree-group' : ''}`}
+                className={`tree-row tree-dir${row.kind === 'group' ? ' tree-group' : ''}${full && row.changedCount > 0 ? ' has-changes' : ''}`}
                 style={style}
                 role="treeitem"
                 aria-expanded={row.expanded}
+                data-key={row.key}
                 onClick={() => onToggle(row.key)}
               >
                 <Chevron expanded={row.expanded} />
                 {row.kind === 'dir' && <FolderIcon />}
                 <span className="dir-name">{row.name}</span>
-                <span className="dir-count muted">{row.fileCount}</span>
+                {count > 0 && (
+                  <span className="dir-count muted" title={full ? `${count} changed ${count === 1 ? 'file' : 'files'}` : undefined}>
+                    {count}
+                  </span>
+                )}
               </div>
             )
           })}
         </div>
       </div>
+      <ViewedProgress viewed={viewed} />
     </div>
   )
 }

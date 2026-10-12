@@ -24,7 +24,7 @@ use base64::Engine;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
-pub use parse::ChangedFile;
+pub use parse::{ChangedFile, TreeEntry};
 
 /// Failure of a git invocation, with its (trimmed) stderr.
 #[derive(Debug, Clone)]
@@ -416,7 +416,10 @@ impl Repo {
             .await
             .unwrap_or_default();
         for path in removed {
-            eprintln!("gh-tideline: removed stale git lock file {}", path.display());
+            eprintln!(
+                "gh-tideline: removed stale git lock file {}",
+                path.display()
+            );
         }
         if !state.hardened {
             self.harden().await?;
@@ -541,6 +544,26 @@ impl Repo {
         .map(|_| ())
     }
 
+    /// Pins a local commit with `refs/dr/pull/<n>/c/<sha>` so a future gc keeps it.
+    /// `protocol.allow=never`: if the commit were missing, `update-ref` would otherwise
+    /// lazily fetch it with its whole history.
+    pub async fn protect_commit(
+        &self,
+        _guard: &RepoGuard,
+        number: u64,
+        sha: &str,
+    ) -> Result<(), GitFailure> {
+        debug_assert!(is_oid(sha));
+        let name = format!("refs/dr/pull/{number}/c/{sha}");
+        self.git(
+            None,
+            &["-c", "protocol.allow=never", "update-ref", &name, sha],
+            None,
+        )
+        .await
+        .map(|_| ())
+    }
+
     /// Runs `diff-tree -r -z --raw --no-abbrev` (with `extra` flags) and parses it.
     pub async fn diff_tree(
         &self,
@@ -657,6 +680,33 @@ impl Repo {
         Ok(parse::parse_check_attr(&out))
     }
 
+    /// Every file of `commit`'s tree (`ls-tree -r`). Trees are local in the blob-less clone,
+    /// so this needs no lock; `protocol.allow=never` makes it fail rather than fetch if the
+    /// commit were missing.
+    pub async fn ls_tree(&self, commit: &str) -> Result<Vec<TreeEntry>, GitFailure> {
+        debug_assert!(is_oid(commit));
+        let out = self
+            .git(
+                None,
+                &[
+                    "-c",
+                    "protocol.allow=never",
+                    "ls-tree",
+                    "-r",
+                    "-z",
+                    "--full-tree",
+                    "--end-of-options",
+                    commit,
+                ],
+                None,
+            )
+            .await?;
+        parse::parse_ls_tree(&out).map_err(|e| GitFailure {
+            command: "ls-tree".into(),
+            stderr: e,
+        })
+    }
+
     /// Records the OIDs of a pull request's files (blob vs gitlink) for [`Repo::known_oid`].
     pub fn remember_oids<'a>(&self, oids: impl IntoIterator<Item = (&'a str, bool)>) {
         let mut known = self.shared.known.lock().expect("known OIDs poisoned");
@@ -724,8 +774,10 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir =
-            std::env::temp_dir().join(format!("gh-tideline-test-{name}-{}-{nanos}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "gh-tideline-test-{name}-{}-{nanos}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -995,6 +1047,80 @@ mod tests {
             ObjectLookup::Found { .. }
         ));
         drop(guard);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn ls_tree_lists_a_blobless_head_without_fetching() {
+        let dir = temp_dir("lstree");
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        make_repo(&src, &[("a.txt", "a\n"), ("deep/er/b.rs", "b\n")]).await;
+        let sub = "1234567890123456789012345678901234567890";
+        git_in(
+            &src,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{sub},vendor/lib"),
+            ],
+        )
+        .await;
+        git_in(
+            &src,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.com",
+                "commit",
+                "-qm",
+                "submodule",
+            ],
+        )
+        .await;
+        let head = git_in(&src, &["rev-parse", "HEAD"]).await;
+        git_in(&src, &["config", "uploadpack.allowFilter", "true"]).await;
+        git_in(&src, &["config", "uploadpack.allowAnySHA1InWant", "true"]).await;
+        let blob = git_in(&src, &["rev-parse", "HEAD:deep/er/b.rs"]).await;
+
+        let repo = repo_at(
+            dir.join("cache/o/r.git"),
+            format!("file://{}", src.display()),
+        );
+        let guard = repo.lock().await.unwrap();
+        let auth = GitAuth {
+            host: "example.invalid".into(),
+            token: "unused".into(),
+        };
+        repo.fetch_commits(&guard, &auth, 1, &head, &head)
+            .await
+            .unwrap();
+        drop(guard);
+
+        let started = std::time::Instant::now();
+        let entries = repo.ls_tree(&head).await.unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let got: Vec<(&str, &str)> = entries
+            .iter()
+            .map(|e| (e.path.as_str(), e.mode.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("a.txt", "100644"),
+                ("deep/er/b.rs", "100644"),
+                ("vendor/lib", "160000")
+            ]
+        );
+        assert_eq!(entries[1].oid, blob);
+        assert_eq!(entries[2].oid, sub);
+        // Listing did not fetch any blob.
+        assert!(matches!(
+            repo.read_object(None, None, &blob).await.unwrap(),
+            ObjectLookup::Missing
+        ));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

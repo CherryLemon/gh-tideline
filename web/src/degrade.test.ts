@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { ChangedFile } from './api'
-import { LIMITS, PLAIN_REASONS, decideText, fileDisplay, imageType, isSafeBlobMime, measure, shortSha, type SideMeasure } from './degrade'
+import { LIMITS, PLAIN_REASONS, SNIFF_BYTES, decideText, fileDisplay, imageType, isSafeBlobMime, looksBinary, measure, shortSha, type SideMeasure } from './degrade'
 
 const meta = (bytes: number, lines = 10, maxLine = 80): SideMeasure => ({ meta: { bytes, lines, maxLine } })
 
@@ -90,5 +90,19 @@ describe('fileDisplay', () => {
 
   it('shortens shas to 7 characters', () => {
     expect(shortSha('3f8e1c2b7a9d4e6f0a1b2c3d4e5f60718293a4b5')).toBe('3f8e1c2')
+  })
+})
+
+describe('looksBinary', () => {
+  it('flags a NUL byte within the sniffed prefix only', () => {
+    const text = new TextEncoder().encode('fn main() {}\n')
+    expect(looksBinary(text)).toBe(false)
+    expect(looksBinary(new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x00]))).toBe(true)
+    expect(looksBinary(new Uint8Array(0))).toBe(false)
+    const late = new Uint8Array(SNIFF_BYTES + 10).fill(0x61)
+    late[SNIFF_BYTES + 5] = 0
+    expect(looksBinary(late)).toBe(false)
+    late[SNIFF_BYTES - 1] = 0
+    expect(looksBinary(late)).toBe(true)
   })
 })

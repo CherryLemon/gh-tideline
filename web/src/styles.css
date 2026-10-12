@@ -1,4 +1,4 @@
-/* Sandy Beach (Material Theme UI) — docs/m0-skeleton.md */
+/* Sandy Beach (Material Theme UI) */
 :root {
   --bg: #fff8ed;
   --fg: #546e7a;
@@ -212,6 +212,11 @@ kbd {
 .chip-warn {
   background: #f6a43426;
   color: #a86a12;
+}
+
+.chip-dismissed {
+  background: #f76d4726;
+  color: #c4502e;
 }
 
 kbd {
@@ -444,10 +449,28 @@ kbd {
   font-size: 12px;
 }
 
-.tree-title {
-  color: var(--fg);
-  font-weight: 600;
+.tree-scope {
   margin-right: auto;
+}
+
+.tree-scope button {
+  height: 20px;
+  padding: 0 8px;
+  font-size: 12px;
+}
+
+.seg-count {
+  color: var(--text);
+  font-size: 11px;
+}
+
+.tree-listing {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 16px 10px;
+  font-size: 12px;
 }
 
 .tree-scroll {
@@ -532,6 +555,63 @@ kbd {
   flex: none;
   font-family: var(--code-font);
   font-size: 11px;
+}
+
+.tree-file.is-viewed .status-letter,
+.tree-file.is-viewed .file-name,
+.tree-file.is-viewed .counts {
+  opacity: 0.5;
+}
+
+.viewed-box {
+  flex: none;
+  margin: 0 0 0 2px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.tree-file.is-dismissed .file-name {
+  color: var(--syn-numbers);
+}
+
+.tree-file.is-unchanged .file-name {
+  color: var(--text);
+}
+
+.tree-dir.has-changes .dir-name {
+  color: var(--st-m);
+}
+
+.tree-dir.has-changes .dir-count {
+  color: var(--st-m);
+  opacity: 0.8;
+}
+
+.tree-footer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 26px;
+  flex: none;
+  padding: 0 10px;
+  border-top: 1px solid var(--line);
+  color: var(--fg);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.progress {
+  flex: 1;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--second-bg);
+  overflow: hidden;
+}
+
+.progress-bar {
+  height: 100%;
+  background: var(--accent);
+  transition: width 120ms;
 }
 
 /* Diff pane ---------------------------------------------------------------------- */
@@ -638,6 +718,10 @@ kbd {
   display: grid;
   grid-template-columns: 1fr 1fr;
   background: var(--bg);
+}
+
+.image-diff.image-single {
+  grid-template-columns: 1fr;
 }
 
 .image-side {
@@ -861,4 +945,43 @@ kbd {
 .monaco-editor .diff-hidden-lines .center {
   font-family: var(--ui-font);
   font-size: 12px;
+}
+
+/* Toast ---------------------------------------------------------------------------- */
+
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 36px;
+  z-index: 200;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  max-width: min(640px, 90vw);
+  padding: 8px 12px;
+  border-radius: 4px;
+  background: var(--fg);
+  color: #fff;
+  box-shadow: 0 4px 16px rgb(0 0 0 / 18%);
+}
+
+.toast .btn {
+  flex: none;
+}
+
+.toast-close {
+  flex: none;
+  padding: 0 2px;
+  border: 0;
+  background: none;
+  color: inherit;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0.7;
+}
+
+.toast-close:hover {
+  opacity: 1;
 }

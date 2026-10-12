@@ -3,7 +3,8 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use serde::Deserialize;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::error::{AppError, ErrorCode};
@@ -83,6 +84,7 @@ fn rest_base(host: &str) -> String {
 
 const PR_QUERY: &str = r#"
 query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+  viewer { login }
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $number) {
       id
@@ -96,10 +98,28 @@ query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
       headRefOid
       files(first: 100, after: $cursor) {
         pageInfo { hasNextPage endCursor }
-        nodes { path additions deletions changeType }
+        nodes { path additions deletions changeType viewerViewedState }
       }
     }
   }
+}
+"#;
+
+const HEAD_QUERY: &str = r#"
+query($owner: String!, $repo: String!, $number: Int!) {
+  repository(owner: $owner, name: $repo) { pullRequest(number: $number) { headRefOid } }
+}
+"#;
+
+const MARK_VIEWED: &str = r#"
+mutation($id: ID!, $path: String!) {
+  markFileAsViewed(input: { pullRequestId: $id, path: $path }) { clientMutationId }
+}
+"#;
+
+const UNMARK_VIEWED: &str = r#"
+mutation($id: ID!, $path: String!) {
+  unmarkFileAsViewed(input: { pullRequestId: $id, path: $path }) { clientMutationId }
 }
 "#;
 
@@ -114,7 +134,18 @@ pub struct PullRequest {
     pub base_oid: String,
     pub head_ref: String,
     pub head_oid: String,
+    /// Login of the token's user.
+    pub viewer: String,
     pub files: Vec<GhFile>,
+}
+
+/// The viewer's "viewed" mark on a file; DISMISSED means it changed after being viewed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum ViewedState {
+    Viewed,
+    Unviewed,
+    Dismissed,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -123,11 +154,19 @@ pub struct GhFile {
     pub path: String,
     pub additions: u64,
     pub deletions: u64,
+    /// Absent if GitHub returns a value this version does not know.
+    #[serde(default, deserialize_with = "lenient_viewed")]
+    pub viewer_viewed_state: Option<ViewedState>,
+}
+
+fn lenient_viewed<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<ViewedState>, D::Error> {
+    let v = Option::<serde_json::Value>::deserialize(d)?;
+    Ok(v.and_then(|v| serde_json::from_value(v).ok()))
 }
 
 #[derive(Deserialize)]
-struct GqlResponse {
-    data: Option<GqlData>,
+struct GqlResponse<T> {
+    data: Option<T>,
     errors: Option<Vec<GqlError>>,
 }
 
@@ -140,6 +179,7 @@ struct GqlError {
 
 #[derive(Deserialize)]
 struct GqlData {
+    viewer: GqlActor,
     repository: Option<GqlRepository>,
 }
 
@@ -210,48 +250,17 @@ impl Github {
         let mut cursor: Option<String> = None;
         let mut result: Option<PullRequest> = None;
         loop {
-            let body = json!({
-                "query": PR_QUERY,
-                "variables": { "owner": owner, "repo": repo, "number": number, "cursor": cursor },
-            });
-            let resp = self
-                .http
-                .post(graphql_url(host))
-                .bearer_auth(token)
-                .json(&body)
-                .send()
-                .await
-                .map_err(|e| AppError::github(format!("GraphQL request to {host} failed: {e}")))?;
-            let status = resp.status();
-            let text = resp
-                .text()
-                .await
-                .map_err(|e| AppError::github(format!("reading GraphQL response: {e}")))?;
-            if !status.is_success() {
-                return Err(http_error("GraphQL", status, &text));
-            }
-            let parsed: GqlResponse = serde_json::from_str(&text)
-                .map_err(|e| AppError::github(format!("unexpected GraphQL response: {e}")))?;
-            if let Some(errors) = parsed.errors.filter(|e| !e.is_empty()) {
-                let message = errors
-                    .iter()
-                    .map(|e| e.message.as_str())
-                    .collect::<Vec<_>>()
-                    .join("; ");
-                return Err(
-                    if errors
-                        .iter()
-                        .any(|e| e.kind.as_deref() == Some("NOT_FOUND"))
-                    {
-                        AppError::not_found(message)
-                    } else {
-                        AppError::github(message)
-                    },
-                );
-            }
-            let pr = parsed
-                .data
-                .and_then(|d| d.repository)
+            let data: GqlData = self
+                .graphql(
+                    host,
+                    token,
+                    PR_QUERY,
+                    json!({ "owner": owner, "repo": repo, "number": number, "cursor": cursor }),
+                )
+                .await?;
+            let viewer = data.viewer.login;
+            let pr = data
+                .repository
                 .and_then(|r| r.pull_request)
                 .ok_or_else(|| {
                     AppError::not_found(format!("pull request {owner}/{repo}#{number} not found"))
@@ -273,6 +282,7 @@ impl Github {
                 base_oid: pr.base_ref_oid,
                 head_ref: pr.head_ref_name,
                 head_oid: pr.head_ref_oid,
+                viewer,
                 files: Vec::new(),
             });
             entry.files.extend(nodes);
@@ -282,6 +292,118 @@ impl Github {
             }
         }
         Ok(result.expect("loop runs at least once"))
+    }
+
+    /// Posts one GraphQL query and returns its `data`. Any reported error fails the call;
+    /// a `NOT_FOUND` error becomes `not_found`.
+    async fn graphql<T: DeserializeOwned>(
+        &self,
+        host: &str,
+        token: &str,
+        query: &str,
+        variables: serde_json::Value,
+    ) -> Result<T, AppError> {
+        let resp = self
+            .http
+            .post(graphql_url(host))
+            .bearer_auth(token)
+            .json(&json!({ "query": query, "variables": variables }))
+            .send()
+            .await
+            .map_err(|e| AppError::github(format!("GraphQL request to {host} failed: {e}")))?;
+        let status = resp.status();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| AppError::github(format!("reading GraphQL response: {e}")))?;
+        if !status.is_success() {
+            return Err(http_error("GraphQL", status, &text));
+        }
+        let parsed: GqlResponse<T> = serde_json::from_str(&text)
+            .map_err(|e| AppError::github(format!("unexpected GraphQL response: {e}")))?;
+        if let Some(errors) = parsed.errors.filter(|e| !e.is_empty()) {
+            let message = errors
+                .iter()
+                .map(|e| e.message.as_str())
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(
+                if errors
+                    .iter()
+                    .any(|e| e.kind.as_deref() == Some("NOT_FOUND"))
+                {
+                    AppError::not_found(message)
+                } else {
+                    AppError::github(message)
+                },
+            );
+        }
+        parsed
+            .data
+            .ok_or_else(|| AppError::github("GraphQL response has no data"))
+    }
+
+    /// The pull request's current head commit, read fresh (no files).
+    pub async fn head_oid(
+        &self,
+        host: &str,
+        token: &str,
+        owner: &str,
+        repo: &str,
+        number: u64,
+    ) -> Result<String, AppError> {
+        #[derive(Deserialize)]
+        struct Data {
+            repository: Option<Repository>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Repository {
+            pull_request: Option<Pr>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Pr {
+            head_ref_oid: String,
+        }
+        let data: Data = self
+            .graphql(
+                host,
+                token,
+                HEAD_QUERY,
+                json!({ "owner": owner, "repo": repo, "number": number }),
+            )
+            .await?;
+        let oid = data
+            .repository
+            .and_then(|r| r.pull_request)
+            .ok_or_else(|| {
+                AppError::not_found(format!("pull request {owner}/{repo}#{number} not found"))
+            })?
+            .head_ref_oid;
+        check_oid(&oid)?;
+        Ok(oid)
+    }
+
+    /// Marks (`viewed`) or unmarks a file as viewed for the token's user.
+    pub async fn set_viewed(
+        &self,
+        host: &str,
+        token: &str,
+        pull_request_id: &str,
+        path: &str,
+        viewed: bool,
+    ) -> Result<(), AppError> {
+        let query = if viewed { MARK_VIEWED } else { UNMARK_VIEWED };
+        let _: serde_json::Value = self
+            .graphql(
+                host,
+                token,
+                query,
+                json!({ "id": pull_request_id, "path": path }),
+            )
+            .await?;
+        Ok(())
     }
 
     /// Step 2: GitHub's merge base for the three-dot diff.
@@ -378,5 +500,48 @@ mod tests {
                 "{bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn pull_request_response_with_viewer_and_viewed_states() {
+        let body = r#"{"data": {
+            "viewer": {"login": "me"},
+            "repository": {"pullRequest": {
+                "id": "PR_x", "title": "t", "state": "OPEN", "url": "https://github.com/o/r/pull/1",
+                "author": null,
+                "baseRefName": "main", "baseRefOid": "1111111111111111111111111111111111111111",
+                "headRefName": "f", "headRefOid": "2222222222222222222222222222222222222222",
+                "files": {"pageInfo": {"hasNextPage": false, "endCursor": null}, "nodes": [
+                    {"path": "a", "additions": 1, "deletions": 0, "changeType": "MODIFIED", "viewerViewedState": "VIEWED"},
+                    {"path": "b", "additions": 0, "deletions": 2, "changeType": "MODIFIED", "viewerViewedState": "DISMISSED"},
+                    {"path": "c", "additions": 0, "deletions": 0, "changeType": "ADDED", "viewerViewedState": null},
+                    {"path": "d", "additions": 0, "deletions": 0, "changeType": "ADDED", "viewerViewedState": "SOMETHING_NEW"},
+                    {"path": "e", "additions": 0, "deletions": 0, "changeType": "ADDED"}
+                ]}
+            }}
+        }}"#;
+        let resp: GqlResponse<GqlData> = serde_json::from_str(body).unwrap();
+        let data = resp.data.unwrap();
+        assert_eq!(data.viewer.login, "me");
+        let pr = data.repository.unwrap().pull_request.unwrap();
+        assert!(pr.author.is_none());
+        let states: Vec<Option<ViewedState>> = pr
+            .files
+            .unwrap()
+            .nodes
+            .unwrap()
+            .into_iter()
+            .map(|f| f.viewer_viewed_state)
+            .collect();
+        assert_eq!(
+            states,
+            [
+                Some(ViewedState::Viewed),
+                Some(ViewedState::Dismissed),
+                None,
+                None,
+                None
+            ]
+        );
     }
 }

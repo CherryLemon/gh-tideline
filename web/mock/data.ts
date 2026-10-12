@@ -2,6 +2,8 @@
 // compressible directories, generated files, a binary image, a non-image binary,
 // a >1 MB file, a minified file, a >5 MB file, a submodule bump, a binary (UTF-16) SVG
 // carrying a <script>, a text SVG and enough files to exercise the virtualized tree.
+// The head tree adds unchanged files around them (full project tree), including an image,
+// a non-image binary, a submodule and text and binary files over 5 MB.
 import { createHash } from 'node:crypto'
 import { crc32, deflateSync } from 'node:zlib'
 
@@ -18,6 +20,7 @@ export interface MockPr {
   head: { ref: string; sha: string }
   mergeBase: string
   nodeId: string
+  viewer: string
 }
 
 export interface MockChangedFile {
@@ -32,6 +35,7 @@ export interface MockChangedFile {
   deletions?: number
   binary: boolean
   generated: boolean
+  viewed?: 'VIEWED' | 'UNVIEWED' | 'DISMISSED'
 }
 
 interface Spec {
@@ -486,6 +490,80 @@ function buildFiles(): MockChangedFile[] {
 
 export const files: MockChangedFile[] = buildFiles()
 
+export interface MockTreeEntry {
+  path: string
+  mode: string
+  oid: string
+}
+
+function unchangedText(path: string, i: number): string {
+  return `// ${path}\n// Unchanged in this pull request.\n\nexport const id${i} = ${i}\n\nexport function value${i}(): number {\n  return id${i} * 2\n}\n`
+}
+
+function bigSql(): string {
+  const rows: string[] = []
+  for (let i = 0; i < 64_000; i++) rows.push(`INSERT INTO events (id, kind, payload) VALUES (${i}, 'kind-${i % 17}', '{"n": ${i}, "pad": "xxxxxxxxxxxxxxxx"}');`)
+  return rows.join('\n') + '\n'
+}
+
+/** Files the PR doesn't touch: content (blob) or a commit (gitlink). */
+function unchangedSpecs(): Array<{ path: string; content?: string | Buffer; commit?: string; mode?: string }> {
+  const out: Array<{ path: string; content?: string | Buffer; commit?: string; mode?: string }> = []
+  const text = (path: string) => out.push({ path, content: unchangedText(path, out.length) })
+  for (let i = 0; i < 30; i++) text(`src/app/routes/route${i}.ts`)
+  for (const name of ['Card', 'Modal', 'Tooltip', 'Tabs', 'Menu', 'Avatar', 'Badge', 'Spinner']) text(`src/components/${name}.tsx`)
+  text('src/app/util/numbers.ts')
+  for (let i = 0; i < 20; i++) text(`packages/core/src/deep/nested/mod${i}.ts`)
+  for (let i = 0; i < 40; i++) text(`tests/unit/test_${i}.ts`)
+  for (let i = 0; i < 20; i++) text(`docs/api/page${i}.md`)
+  text('docs/guide/faq.md')
+  text('server/handlers.go')
+  text('tools/lint.py')
+  for (const name of ['LICENSE', 'package.json', 'tsconfig.json', '.gitignore', 'Makefile']) text(name)
+  out.push({ path: 'assets/screenshot.png', content: logo('old') })
+  out.push({ path: 'assets/fonts/Mono.ttf', content: fakeBinary(23_456, 3) })
+  out.push({ path: 'third_party/zlib', commit: '51b7f2abdade71cd9bb0e7a373ef2610ec6f9daf', mode: '160000' })
+  out.push({ path: 'data/archive/events.sql', content: bigSql() })
+  out.push({ path: 'data/archive/snapshot.bin', content: fakeBinary(5_400_000, 11) })
+  out.push({ path: 'scripts/deploy.sh', content: '#!/bin/sh\nset -eu\necho deploy\n', mode: '100755' })
+  return out
+}
+
+/** `git ls-tree -r` of the head: the changed files that still exist, plus the unchanged ones. */
+function buildTree(): MockTreeEntry[] {
+  const changed = files.filter((f) => f.newOid !== null).map((f) => ({ path: f.path, mode: f.newMode, oid: f.newOid! }))
+  const unchanged = unchangedSpecs().map((u) => ({
+    path: u.path,
+    mode: u.mode ?? '100644',
+    oid: u.commit ?? put(u.content!),
+  }))
+  return [...changed, ...unchanged].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
+}
+
+export const tree: MockTreeEntry[] = buildTree()
+
+/** Paths whose PUT /viewed fails: a GitHub error, and a head that moved meanwhile (409). */
+export const VIEWED_FAILS = 'data/big.csv'
+export const VIEWED_STALE = 'README.md'
+
+/**
+ * Viewed marks as GitHub would report them. The copied file has none, like a path GitHub's
+ * rename detection does not list, so it gets no checkbox.
+ */
+export const viewed = new Map<string, NonNullable<MockChangedFile['viewed']>>(
+  files.filter((f) => f.status !== 'C').map((f) => [f.path, 'UNVIEWED']),
+)
+viewed.set('src/app/config.json', 'VIEWED')
+viewed.set('Cargo.lock', 'VIEWED')
+viewed.set('src/styles/theme.css', 'DISMISSED')
+
+export function filesWithViewed(): MockChangedFile[] {
+  return files.map((f) => {
+    const v = viewed.get(f.path)
+    return v ? { ...f, viewed: v } : f
+  })
+}
+
 export function prSummary(host: string, owner: string, repo: string, n: number): MockPr {
   return {
     host,
@@ -500,5 +578,6 @@ export function prSummary(host: string, owner: string, repo: string, n: number):
     head: { ref: 'feat/slug-redirects', sha: 'b'.repeat(40) },
     mergeBase: 'c'.repeat(40),
     nodeId: 'PR_kwDOMOCK',
+    viewer: 'mock-reviewer',
   }
 }

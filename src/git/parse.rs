@@ -122,6 +122,40 @@ fn parse_count(s: &[u8]) -> Result<Option<u64>, String> {
         .ok_or_else(|| format!("bad numstat count: {:?}", String::from_utf8_lossy(s)))
 }
 
+/// One file of a commit's tree: a blob, or a gitlink (mode 160000) for a submodule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TreeEntry {
+    pub path: String,
+    pub mode: String,
+    pub oid: String,
+}
+
+/// Parses `git ls-tree -r -z` output: `<mode> SP <type> SP <oid> TAB <path>\0` records.
+/// Blobs and gitlinks are kept (`-r` lists no trees).
+pub fn parse_ls_tree(out: &[u8]) -> Result<Vec<TreeEntry>, String> {
+    let mut entries = Vec::new();
+    for record in out.split(|&b| b == 0).filter(|r| !r.is_empty()) {
+        let bad = || format!("bad ls-tree record: {:?}", String::from_utf8_lossy(record));
+        let tab = record.iter().position(|&b| b == b'\t').ok_or_else(bad)?;
+        let header = std::str::from_utf8(&record[..tab]).map_err(|_| bad())?;
+        let mut fields = header.split(' ');
+        let (Some(mode), Some(kind), Some(oid), None) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            return Err(bad());
+        };
+        if kind != "blob" && kind != "commit" {
+            continue;
+        }
+        entries.push(TreeEntry {
+            path: String::from_utf8_lossy(&record[tab + 1..]).into_owned(),
+            mode: mode.to_string(),
+            oid: oid.to_string(),
+        });
+    }
+    Ok(entries)
+}
+
 /// Parses `git check-attr -z` output (`<path>\0<attr>\0<value>\0` triplets) into
 /// `path -> [(attr, value)]`.
 pub fn parse_check_attr(out: &[u8]) -> HashMap<String, Vec<(String, String)>> {
@@ -438,6 +472,33 @@ mod tests {
         let files = parse_diff_tree(&out).unwrap();
         assert_eq!(files[0].path, "\u{fffd}/new");
         assert_eq!(files[0].additions, Some(3));
+    }
+
+    #[test]
+    fn ls_tree_records() {
+        let out = format!(
+            "100644 blob {A}\tsrc/a b.rs\0160000 commit {B}\tvendor/lib\0120000 blob {C}\tlink\0"
+        );
+        let mut out = out.into_bytes();
+        out.extend_from_slice(format!("100644 blob {A}\ttab\there\0").as_bytes());
+        out.extend_from_slice(format!("040000 tree {B}\tdir\0").as_bytes());
+        let entries = parse_ls_tree(&out).unwrap();
+        let got: Vec<(&str, &str, &str)> = entries
+            .iter()
+            .map(|e| (e.path.as_str(), e.mode.as_str(), e.oid.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("src/a b.rs", "100644", A),
+                ("vendor/lib", "160000", B),
+                ("link", "120000", C),
+                ("tab\there", "100644", A),
+            ]
+        );
+        assert!(parse_ls_tree(b"").unwrap().is_empty());
+        assert!(parse_ls_tree(b"100644 blob\tno-oid\0").is_err());
+        assert!(parse_ls_tree(b"no tab\0").is_err());
     }
 
     #[test]

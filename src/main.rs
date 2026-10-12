@@ -1,9 +1,11 @@
+mod clock;
 mod config;
 mod error;
 mod git;
 mod github;
 mod pr;
 mod server;
+mod state;
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -78,7 +80,7 @@ async fn run(cli: Cli) -> Result<(), String> {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
         .await
         .map_err(|e| format!("cannot listen on 127.0.0.1:{port}: {e}"))?;
-    let started_at = server::unix_now();
+    let started_at = clock::unix_now();
     for dir in [&paths.cache_dir, &paths.config_dir] {
         git::ensure_private_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
@@ -96,7 +98,15 @@ async fn run(cli: Cli) -> Result<(), String> {
     std::fs::write(&server_json, info.to_string())
         .map_err(|e| format!("{}: {e}", server_json.display()))?;
 
-    let pr_service = Arc::new(pr::PrService::new(repos));
+    // Without it only the local baseline of "since your last review" is lost; keep serving.
+    let state_db = match state::StateDb::open(&paths.cache_dir.join("state.sqlite")) {
+        Ok(db) => Some(db),
+        Err(e) => {
+            eprintln!("gh-tideline: local state is disabled: {e}");
+            None
+        }
+    };
+    let pr_service = Arc::new(pr::PrService::new(repos, state_db));
     let state = server::state(
         port,
         secret.clone(),
@@ -166,7 +176,7 @@ async fn server_running(client: &reqwest::Client, port: u16) -> bool {
 /// `/__auth?t=<token>&next=<next>`; the server sets a session cookie and redirects.
 async fn open_browser(port: u16, secret: &str, next: &str, no_open: bool) -> Result<(), String> {
     let rand = hex::encode(rand::random::<[u8; 16]>());
-    let token = server::security::mint_auth_token(secret, port, server::unix_now(), &rand);
+    let token = server::security::mint_auth_token(secret, port, clock::unix_now(), &rand);
     let mut url = reqwest::Url::parse(&format!("http://localhost:{port}/__auth"))
         .map_err(|e| e.to_string())?;
     url.query_pairs_mut()

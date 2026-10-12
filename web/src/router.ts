@@ -29,9 +29,15 @@ export function useLocation(): { pathname: string; search: string } {
   return q < 0 ? { pathname: href, search: '' } : { pathname: href.slice(0, q), search: href.slice(q) }
 }
 
-/** Encode a repository path for `?file=`, keeping slashes readable. */
-export function fileQuery(path: string): string {
-  return `?file=${encodeURIComponent(path).replace(/%2F/g, '/')}`
+/**
+ * `?file=<path>` (slashes kept readable) followed by every other parameter of `search`,
+ * so switching files keeps the commit range (`from`/`to`/`range`).
+ */
+export function fileQuery(path: string, search = ''): string {
+  const rest = new URLSearchParams(search)
+  rest.delete('file')
+  const tail = rest.toString()
+  return `?file=${encodeURIComponent(path).replace(/%2F/g, '/')}${tail ? `&${tail}` : ''}`
 }
 
 export interface PrRoute {

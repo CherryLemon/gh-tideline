@@ -1,13 +1,31 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
-import type { ChangedFile } from '../api'
+import { useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
+import type { FileStatus } from '../api'
 import { fuzzyMatch } from '../fuzzy'
 
 const MAX_RESULTS = 100
 
+/** A changed file carries its status; an unchanged one (full project tree) has none. */
+interface FinderFile {
+  path: string
+  status?: FileStatus
+}
+
 interface Props {
-  files: ChangedFile[]
+  files: readonly FinderFile[]
   onPick(path: string): void
   onClose(): void
+}
+
+type Result = { file: FinderFile; score: number; positions: Set<number>; index: number }
+
+function rank(files: readonly FinderFile[], query: string): Result[] {
+  const scored: Result[] = []
+  files.forEach((file, index) => {
+    const m = fuzzyMatch(file.path, query)
+    if (m) scored.push({ file, score: m.score, positions: new Set(m.positions), index })
+  })
+  if (query.trim()) scored.sort((a, b) => b.score - a.score || a.index - b.index)
+  return scored.slice(0, MAX_RESULTS)
 }
 
 function Highlighted({ text, positions, offset }: { text: string; positions: Set<number>; offset: number }) {
@@ -23,18 +41,14 @@ export function FileFinder({ files, onPick, onClose }: Props) {
   const [query, setQuery] = useState('')
   const [active, setActive] = useState(0)
   const listRef = useRef<HTMLDivElement>(null)
+  // Matching a whole project tree takes a while: keep typing responsive.
+  const deferredQuery = useDeferredValue(query)
 
-  const results = useMemo(() => {
-    const scored: Array<{ file: ChangedFile; score: number; positions: Set<number>; index: number }> = []
-    files.forEach((file, index) => {
-      const m = fuzzyMatch(file.path, query)
-      if (m) scored.push({ file, score: m.score, positions: new Set(m.positions), index })
-    })
-    if (query.trim()) scored.sort((a, b) => b.score - a.score || a.index - b.index)
-    return scored.slice(0, MAX_RESULTS)
-  }, [files, query])
+  const results = useMemo(() => rank(files, deferredQuery), [files, deferredQuery])
+  // The list on screen can lag behind the input; keys act on it only once it caught up.
+  const settled = query === deferredQuery
 
-  useEffect(() => setActive(0), [query])
+  useEffect(() => setActive(0), [deferredQuery])
 
   useEffect(() => {
     listRef.current?.querySelector('.is-active')?.scrollIntoView({ block: 'nearest' })
@@ -43,13 +57,14 @@ export function FileFinder({ files, onPick, onClose }: Props) {
   const onKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'ArrowDown') {
       e.preventDefault()
-      setActive((i) => Math.min(i + 1, results.length - 1))
+      if (settled) setActive((i) => Math.min(i + 1, results.length - 1))
     } else if (e.key === 'ArrowUp') {
       e.preventDefault()
-      setActive((i) => Math.max(i - 1, 0))
+      if (settled) setActive((i) => Math.max(i - 1, 0))
     } else if (e.key === 'Enter') {
       e.preventDefault()
-      const r = results[active]
+      // Typed ahead of the list: the best match for what is in the input, not a stale row.
+      const r = settled ? results[active] : rank(files, query)[0]
       if (r) onPick(r.file.path)
     } else if (e.key === 'Escape') {
       e.preventDefault()
@@ -59,22 +74,22 @@ export function FileFinder({ files, onPick, onClose }: Props) {
 
   return (
     <div className="finder-backdrop" onMouseDown={onClose}>
-      <div className="finder" onMouseDown={(e) => e.stopPropagation()} role="dialog" aria-label="查找文件">
+      <div className="finder" onMouseDown={(e) => e.stopPropagation()} role="dialog" aria-label="Find file">
         <div className="finder-title">
-          <span>查找文件</span>
-          <span className="muted">↑↓ 选择 · Enter 打开 · Esc 关闭</span>
+          <span>Find file</span>
+          <span className="muted">↑↓ select · Enter open · Esc close</span>
         </div>
         <input
           className="finder-input"
           autoFocus
           spellCheck={false}
-          placeholder="输入文件名…"
+          placeholder="Type a file name…"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           onKeyDown={onKeyDown}
         />
         <div className="finder-list" ref={listRef}>
-          {results.length === 0 && <div className="finder-empty muted">没有匹配的文件</div>}
+          {results.length === 0 && <div className="finder-empty muted">No matching files</div>}
           {results.map((r, i) => {
             const p = r.file.path
             const slash = p.lastIndexOf('/') + 1
@@ -85,8 +100,8 @@ export function FileFinder({ files, onPick, onClose }: Props) {
                 onMouseMove={() => setActive(i)}
                 onClick={() => onPick(p)}
               >
-                <span className={`status-letter st-${r.file.status}`}>{r.file.status}</span>
-                <span className={`finder-name st-${r.file.status}`}>
+                <span className={`status-letter${r.file.status ? ` st-${r.file.status}` : ''}`}>{r.file.status}</span>
+                <span className={`finder-name${r.file.status ? ` st-${r.file.status}` : ''}`}>
                   <Highlighted text={p.slice(slash)} positions={r.positions} offset={slash} />
                 </span>
                 <span className="finder-dir muted">

@@ -1,5 +1,5 @@
-// How a changed file is displayed: the degradation rules of docs/m0-skeleton.md ("降级规则",
-// design.md §5.2) and the image-type decisions behind design.md §8. Pure, no DOM or Monaco.
+// How a changed file is displayed: the degradation rules of design.md §5.2 and the
+// image-type decisions behind design.md §8. Pure, no DOM or Monaco.
 import type { ChangedFile } from './api'
 
 export const LIMITS = {
@@ -40,9 +40,9 @@ export function measure(text: string, bytes: number): TextMeta {
 export type SideMeasure = { meta: TextMeta } | { tooLargeBytes: number } | null
 
 export const PLAIN_REASONS = {
-  forced: '文件超过 5 MB 或 5 万行，已关闭语法高亮',
-  bytes: '文件大于 1 MB，已关闭语法高亮',
-  longLine: '存在超过 1 万字符的长行（疑似压缩文件），已关闭语法高亮',
+  forced: 'Over 5 MB or 50,000 lines: syntax highlighting off',
+  bytes: 'Over 1 MB: syntax highlighting off',
+  longLine: 'Line over 10,000 characters (likely minified): syntax highlighting off',
 } as const
 
 /**
@@ -114,6 +114,14 @@ export function fileDisplay(file: Pick<ChangedFile, 'path' | 'binary' | 'oldMode
   if (isGitlink(file.oldMode) || isGitlink(file.newMode)) return 'submodule'
   if (file.binary) return imageType(file.path) ? 'image' : 'binary'
   return 'text'
+}
+
+/** How many leading bytes `looksBinary` inspects (git's own heuristic uses the same window). */
+export const SNIFF_BYTES = 8000
+
+/** Git's binary heuristic for a blob it has no diff verdict for: a NUL byte near the start. */
+export function looksBinary(bytes: Uint8Array): boolean {
+  return bytes.subarray(0, SNIFF_BYTES).includes(0)
 }
 
 export function shortSha(oid: string): string {

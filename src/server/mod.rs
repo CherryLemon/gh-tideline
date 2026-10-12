@@ -6,18 +6,21 @@ pub mod security;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, put};
 use axum::{Json, Router};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::clock::unix_now;
 use crate::error::AppError;
-use crate::git::is_oid;
+use crate::git::{TreeEntry, is_oid};
 use crate::pr::PrService;
 use crate::pr::target::valid_name;
+use crate::state::PrKey;
 use security::{AuthTokens, Policy, Sessions};
 
 /// Lifetime of a browser session (server-side and cookie `Max-Age`).
@@ -31,14 +34,6 @@ pub struct Inner {
 }
 
 pub type AppState = Arc<Inner>;
-
-/// Current Unix time in seconds.
-pub fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
 
 /// `started_at` (Unix seconds) is the server start: older authorization tokens are refused.
 pub fn state(
@@ -68,6 +63,11 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/{host}/{owner}/{repo}/pulls/{n}/files",
             get(pull_files),
+        )
+        .route("/api/{host}/{owner}/{repo}/pulls/{n}/tree", get(pull_tree))
+        .route(
+            "/api/{host}/{owner}/{repo}/pulls/{n}/viewed",
+            put(set_viewed),
         )
         .route("/api/{host}/{owner}/{repo}/blobs/{oid}", get(blob))
         .fallback(fallback)
@@ -102,7 +102,9 @@ async fn auth(
     state
         .tokens
         .redeem(q.t.as_deref().unwrap_or_default(), unix_now())
-        .map_err(|e| AppError::unauthorized(format!("{e}; run `gh-tideline` again for a new one")))?;
+        .map_err(|e| {
+            AppError::unauthorized(format!("{e}; run `gh-tideline` again for a new one"))
+        })?;
     let cookie = format!(
         "{}={}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
         state.policy.cookie_name,
@@ -170,7 +172,99 @@ async fn pull_files(
     Query(q): Query<RefreshQuery>,
 ) -> Result<Response, AppError> {
     let data = load_pr(&state, params, q).await?;
-    Ok(Json(&data.files).into_response())
+    Ok(Json(data.files_with_viewed()).into_response())
+}
+
+#[derive(Serialize)]
+struct TreeResponse<'a> {
+    head: &'a str,
+    entries: &'a [TreeEntry],
+}
+
+#[derive(Deserialize)]
+struct TreeQuery {
+    head: Option<String>,
+}
+
+/// Every file of the head tree, with the head it belongs to (serialized from the cached
+/// listing without copying it: it can hold 100k entries). With `?head=`, a cached snapshot
+/// of that head is used past its TTL, so the listing never reloads the PR from GitHub
+/// just because the page has been open for a while.
+async fn pull_tree(
+    State(state): State<AppState>,
+    Path((host, owner, repo, n)): Path<(String, String, String, String)>,
+    Query(q): Query<TreeQuery>,
+) -> Result<Response, AppError> {
+    check_repo(&state, &host, &owner, &repo)?;
+    let number = parse_pr_number(&n)?;
+    let data = match q.head.as_deref() {
+        Some(head) => {
+            if !is_oid(head) {
+                return Err(AppError::bad_request(
+                    "head must be 40 (or 64) lowercase hex characters",
+                ));
+            }
+            let key = PrKey {
+                host,
+                owner,
+                repo,
+                number,
+            };
+            state.pr.open_at(&key, head).await?
+        }
+        None => state.pr.open(&host, &owner, &repo, number, false).await?,
+    };
+    // The client asked for a head the server has moved on from: it only needs to know that.
+    if q.head
+        .as_deref()
+        .is_some_and(|h| h != data.summary.head.sha)
+    {
+        return Ok(Json(TreeResponse {
+            head: &data.summary.head.sha,
+            entries: &[],
+        })
+        .into_response());
+    }
+    let entries = state.pr.tree(&data).await?;
+    Ok(Json(TreeResponse {
+        head: &data.summary.head.sha,
+        entries: &entries,
+    })
+    .into_response())
+}
+
+#[derive(Deserialize)]
+struct ViewedBody {
+    path: String,
+    viewed: bool,
+    head: String,
+}
+
+async fn set_viewed(
+    State(state): State<AppState>,
+    Path((host, owner, repo, n)): Path<(String, String, String, String)>,
+    body: Bytes,
+) -> Result<Response, AppError> {
+    check_repo(&state, &host, &owner, &repo)?;
+    let number = parse_pr_number(&n)?;
+    let body: ViewedBody = serde_json::from_slice(&body)
+        .map_err(|e| AppError::bad_request(format!("invalid request body: {e}")))?;
+    if !is_oid(&body.head) {
+        return Err(AppError::bad_request(
+            "head must be 40 (or 64) lowercase hex characters",
+        ));
+    }
+    let key = PrKey {
+        host,
+        owner,
+        repo,
+        number,
+    };
+    let viewed = state
+        .pr
+        .set_viewed(&key, &body.path, body.viewed, &body.head)
+        .await?;
+    Ok(Json(json!({ "path": body.path, "viewed": viewed })).into_response())
 }
 
 async fn blob(

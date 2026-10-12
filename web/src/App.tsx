@@ -23,7 +23,7 @@ function Home() {
     e.preventDefault()
     const route = parsePrInput(value)
     if (!route) {
-      setError('无法识别。请粘贴 PR 链接（https://github.com/owner/repo/pull/123）或 owner/repo#123')
+      setError('Not recognized. Paste a pull request link (https://github.com/owner/repo/pull/123) or owner/repo#123.')
       return
     }
     navigate(prPath(route))
@@ -33,12 +33,12 @@ function Home() {
     <div className="home">
       <form className="home-card" onSubmit={submit}>
         <div className="home-title">Tideline</div>
-        <div className="home-sub muted">在 JetBrains 风格的 diff 视图里 review GitHub PR</div>
+        <div className="home-sub muted">Review GitHub pull requests in a JetBrains-style diff view</div>
         <input
           className="home-input"
           autoFocus
           spellCheck={false}
-          placeholder="https://github.com/owner/repo/pull/123 或 owner/repo#123"
+          placeholder="https://github.com/owner/repo/pull/123 or owner/repo#123"
           value={value}
           onChange={(e) => {
             setValue(e.target.value)
@@ -47,10 +47,10 @@ function Home() {
         />
         {error && <div className="home-error">{error}</div>}
         <button className="btn btn-primary" type="submit">
-          打开
+          Open
         </button>
         <div className="home-tip muted">
-          也可以把 GitHub 链接里的 <code>https://</code> 换成 <code>{location.origin}/</code> 直接打开。
+          You can also open a GitHub link directly by replacing <code>https://</code> with <code>{location.origin}/</code>.
         </div>
       </form>
     </div>
