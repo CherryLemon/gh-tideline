@@ -107,7 +107,7 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
 
   // Without a valid ?file=, show the first file (replace, so Back leaves the PR).
   useEffect(() => {
-    if (!current && order.length > 0) navigate(location.pathname + fileQuery(order[0].path), true)
+    if (!current && order.length > 0) navigate(location.pathname + fileQuery(order[0].path, location.search), true)
   }, [current, order])
 
   // Reveal the current file in the tree when it changes; later collapsing its folder sticks.
@@ -127,7 +127,7 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
   const openFile = useCallback(
     (path: string, jump?: PendingJump['where']) => {
       pendingJump.current = jump ? { path, where: jump } : null
-      if (path !== requested) navigate(location.pathname + fileQuery(path))
+      if (path !== requested) navigate(location.pathname + fileQuery(path, location.search))
     },
     [requested],
   )

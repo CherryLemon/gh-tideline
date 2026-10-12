@@ -10,7 +10,7 @@ use serde::Serialize;
 
 use crate::error::AppError;
 use crate::git::parse::GITLINK_MODE;
-use crate::git::{ChangedFile, GitAuth, GitFailure, ObjectLookup, Repos};
+use crate::git::{ChangedFile, GitAuth, GitFailure, ObjectLookup, Repo, RepoGuard, Repos};
 use crate::github::{Github, Tokens};
 
 const CACHE_TTL: Duration = Duration::from_secs(30);
@@ -168,63 +168,9 @@ impl PrService {
                 .map_err(git_err)?;
         }
 
-        // 4–5. Collect changed blob OIDs (+ relevant .gitattributes) and batch-fetch them.
-        let pair = (merge_base.clone(), head.clone());
-        if !guard.state.blobs_fetched.contains(&pair) {
-            let raw = repo
-                .diff_tree(&auth, &["--no-renames"], &merge_base, &head)
-                .await
-                .map_err(git_err)?;
-            let mut oids: Vec<String> = Vec::new();
-            for f in &raw {
-                if f.old_mode != GITLINK_MODE {
-                    oids.extend(f.old_oid.clone());
-                }
-                if f.new_mode != GITLINK_MODE {
-                    oids.extend(f.new_oid.clone());
-                }
-            }
-            // Paths present in head: all their ancestors are trees there.
-            let paths: Vec<&str> = raw
-                .iter()
-                .filter(|f| f.new_oid.is_some())
-                .map(|f| f.path.as_str())
-                .collect();
-            oids.extend(
-                repo.gitattributes_oids(&head, &paths)
-                    .await
-                    .map_err(git_err)?,
-            );
-            oids.sort();
-            oids.dedup();
-            repo.fetch_blobs(&guard, &auth, &oids)
-                .await
-                .map_err(git_err)?;
-            guard.state.blobs_fetched.insert(pair);
-        }
-
-        // 6. Rename detection and line counts, now that blobs are local.
-        let mut files = repo
-            .diff_tree(&auth, &["-M", "--numstat"], &merge_base, &head)
-            .await
-            .map_err(git_err)?;
-
-        // 7. Generated / vendored classification.
-        let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
-        let attrs = repo
-            .check_attr(&auth, &head, &paths)
-            .await
-            .map_err(git_err)?;
+        // 4–7. Changed blobs, renames, line counts and generated classification.
+        let mut files = range_files(&repo, &mut guard, &auth, &merge_base, &head).await?;
         drop(guard);
-
-        repo.remember_oids(files.iter().flat_map(|f| {
-            [
-                (f.old_oid.as_deref(), f.old_mode != GITLINK_MODE),
-                (f.new_oid.as_deref(), f.new_mode != GITLINK_MODE),
-            ]
-            .into_iter()
-            .filter_map(|(oid, is_blob)| oid.map(|o| (o, is_blob)))
-        }));
 
         let gh_counts: HashMap<&str, (u64, u64)> = pr
             .files
@@ -232,7 +178,6 @@ impl PrService {
             .map(|f| (f.path.as_str(), (f.additions, f.deletions)))
             .collect();
         for f in &mut files {
-            f.generated = is_generated(&f.path, attrs.get(&f.path).map(Vec::as_slice));
             // numstat always reports text files; fall back to GitHub's counts if it did not.
             if !f.binary
                 && f.additions.is_none()
@@ -327,6 +272,69 @@ impl PrService {
     pub async fn drain(&self, timeout: Duration) {
         self.repos.drain(timeout).await;
     }
+}
+
+/// Steps 4–7 of opening a PR, for any two local tree-ishes `from` and `to`: batch-fetch
+/// the changed blobs (plus the `.gitattributes` in `to` that can affect them) once per
+/// pair, then detect renames, count lines and classify generated files. The listed OIDs
+/// are registered so the blob endpoint may fetch them lazily.
+async fn range_files(
+    repo: &Repo,
+    guard: &mut RepoGuard,
+    auth: &GitAuth,
+    from: &str,
+    to: &str,
+) -> Result<Vec<ChangedFile>, AppError> {
+    let pair = (from.to_string(), to.to_string());
+    if !guard.state.blobs_fetched.contains(&pair) {
+        let raw = repo
+            .diff_tree(auth, &["--no-renames"], from, to)
+            .await
+            .map_err(git_err)?;
+        let mut oids: Vec<String> = Vec::new();
+        for f in &raw {
+            if f.old_mode != GITLINK_MODE {
+                oids.extend(f.old_oid.clone());
+            }
+            if f.new_mode != GITLINK_MODE {
+                oids.extend(f.new_oid.clone());
+            }
+        }
+        // Paths present in `to`: all their ancestors are trees there.
+        let paths: Vec<&str> = raw
+            .iter()
+            .filter(|f| f.new_oid.is_some())
+            .map(|f| f.path.as_str())
+            .collect();
+        oids.extend(repo.gitattributes_oids(to, &paths).await.map_err(git_err)?);
+        oids.sort();
+        oids.dedup();
+        repo.fetch_blobs(guard, auth, &oids)
+            .await
+            .map_err(git_err)?;
+        guard.state.blobs_fetched.insert(pair);
+    }
+
+    let mut files = repo
+        .diff_tree(auth, &["-M", "--numstat"], from, to)
+        .await
+        .map_err(git_err)?;
+
+    let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+    let attrs = repo.check_attr(auth, to, &paths).await.map_err(git_err)?;
+    for f in &mut files {
+        f.generated = is_generated(&f.path, attrs.get(&f.path).map(Vec::as_slice));
+    }
+
+    repo.remember_oids(files.iter().flat_map(|f| {
+        [
+            (f.old_oid.as_deref(), f.old_mode != GITLINK_MODE),
+            (f.new_oid.as_deref(), f.new_mode != GITLINK_MODE),
+        ]
+        .into_iter()
+        .filter_map(|(oid, is_blob)| oid.map(|o| (o, is_blob)))
+    }));
+    Ok(files)
 }
 
 const BUILTIN_GENERATED: &[&str] = &[
