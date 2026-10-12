@@ -1,0 +1,129 @@
+// HTTP client for the tideline backend. Types mirror docs/m0-skeleton.md.
+
+export interface PrSummary {
+  host: string
+  owner: string
+  repo: string
+  number: number
+  title: string
+  author: string
+  state: 'OPEN' | 'CLOSED' | 'MERGED'
+  url: string
+  base: { ref: string; sha: string }
+  head: { ref: string; sha: string }
+  mergeBase: string
+  nodeId: string
+}
+
+export type FileStatus = 'A' | 'M' | 'D' | 'R' | 'C' | 'T'
+
+export interface ChangedFile {
+  path: string
+  /** Only present for R / C. */
+  oldPath?: string
+  status: FileStatus
+  /** null for added files. */
+  oldOid: string | null
+  /** null for deleted files. */
+  newOid: string | null
+  oldMode: string
+  newMode: string
+  additions?: number
+  deletions?: number
+  binary: boolean
+  generated: boolean
+}
+
+export interface ApiErrorBody {
+  error: { code: string; message: string }
+}
+
+export interface RepoRef {
+  host: string
+  owner: string
+  repo: string
+}
+
+export const UNAUTHORIZED_MESSAGE = '请在终端运行 `gh-tideline` 授权此浏览器'
+
+const CODE_MESSAGES: Record<string, string> = {
+  unauthorized: UNAUTHORIZED_MESSAGE,
+  forbidden_host: '该域名不在允许列表中（github.com 或配置文件里的 ghe_hosts）',
+  not_found: '找不到该 PR 或文件',
+  no_token: '没有可用的 GitHub token：请设置 GH_TOKEN 或运行 `gh auth login`',
+  github_error: 'GitHub 请求失败',
+  git_error: 'git 操作失败',
+  bad_request: '请求参数不正确',
+}
+
+export class ApiError extends Error {
+  readonly status: number
+  readonly code: string
+  readonly detail: string
+
+  constructor(status: number, code: string, detail: string) {
+    const base = CODE_MESSAGES[code] ?? `请求失败（HTTP ${status}）`
+    // 401 always shows the fixed instruction; other codes append the server detail.
+    super(code === 'unauthorized' || !detail || detail === base ? base : `${base}：${detail}`)
+    this.name = 'ApiError'
+    this.status = status
+    this.code = code
+    this.detail = detail
+  }
+}
+
+async function toApiError(res: Response): Promise<ApiError> {
+  let code = res.status === 401 ? 'unauthorized' : `http_${res.status}`
+  let detail = ''
+  try {
+    const body = (await res.json()) as Partial<ApiErrorBody>
+    if (body.error) {
+      code = body.error.code || code
+      detail = body.error.message || ''
+    }
+  } catch {
+    detail = res.statusText
+  }
+  if (res.status === 401) code = 'unauthorized'
+  return new ApiError(res.status, code, detail)
+}
+
+async function request(path: string, init?: RequestInit): Promise<Response> {
+  const headers = new Headers(init?.headers)
+  headers.set('X-DR', '1')
+  let res: Response
+  try {
+    res = await fetch(path, { ...init, headers, credentials: 'same-origin' })
+  } catch (e) {
+    if (e instanceof DOMException && e.name === 'AbortError') throw e
+    throw new ApiError(0, 'network', `无法连接到 tideline 服务（${(e as Error).message}）`)
+  }
+  if (!res.ok) throw await toApiError(res)
+  return res
+}
+
+const seg = encodeURIComponent
+
+function repoBase(r: RepoRef): string {
+  return `/api/${seg(r.host)}/${seg(r.owner)}/${seg(r.repo)}`
+}
+
+export async function getPr(r: RepoRef, n: number, refresh = false): Promise<PrSummary> {
+  const res = await request(`${repoBase(r)}/pulls/${n}${refresh ? '?refresh=1' : ''}`)
+  return (await res.json()) as PrSummary
+}
+
+export async function getPrFiles(r: RepoRef, n: number, refresh = false): Promise<ChangedFile[]> {
+  const res = await request(`${repoBase(r)}/pulls/${n}/files${refresh ? '?refresh=1' : ''}`)
+  return (await res.json()) as ChangedFile[]
+}
+
+/** Raw blob response; the caller decides whether to read the body (see Content-Length checks). */
+export function getBlob(r: RepoRef, oid: string, signal?: AbortSignal): Promise<Response> {
+  return request(`${repoBase(r)}/blobs/${oid}`, { signal })
+}
+
+export function errorMessage(e: unknown): string {
+  if (e instanceof Error) return e.message
+  return String(e)
+}
