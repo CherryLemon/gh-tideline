@@ -116,6 +116,14 @@ export function fileDisplay(file: Pick<ChangedFile, 'path' | 'binary' | 'oldMode
   return 'text'
 }
 
+/** How many leading bytes `looksBinary` inspects (git's own heuristic uses the same window). */
+export const SNIFF_BYTES = 8000
+
+/** Git's binary heuristic for a blob it has no diff verdict for: a NUL byte near the start. */
+export function looksBinary(bytes: Uint8Array): boolean {
+  return bytes.subarray(0, SNIFF_BYTES).includes(0)
+}
+
 export function shortSha(oid: string): string {
   return oid.slice(0, 7)
 }

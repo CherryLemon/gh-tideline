@@ -449,10 +449,28 @@ kbd {
   font-size: 12px;
 }
 
-.tree-title {
-  color: var(--fg);
-  font-weight: 600;
+.tree-scope {
   margin-right: auto;
+}
+
+.tree-scope button {
+  height: 20px;
+  padding: 0 8px;
+  font-size: 12px;
+}
+
+.seg-count {
+  color: var(--text);
+  font-size: 11px;
+}
+
+.tree-listing {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 16px 10px;
+  font-size: 12px;
 }
 
 .tree-scroll {
@@ -554,6 +572,19 @@ kbd {
 
 .tree-file.is-dismissed .file-name {
   color: var(--syn-numbers);
+}
+
+.tree-file.is-unchanged .file-name {
+  color: var(--text);
+}
+
+.tree-dir.has-changes .dir-name {
+  color: var(--st-m);
+}
+
+.tree-dir.has-changes .dir-count {
+  color: var(--st-m);
+  opacity: 0.8;
 }
 
 .tree-footer {
@@ -687,6 +718,10 @@ kbd {
   display: grid;
   grid-template-columns: 1fr 1fr;
   background: var(--bg);
+}
+
+.image-diff.image-single {
+  grid-template-columns: 1fr;
 }
 
 .image-side {

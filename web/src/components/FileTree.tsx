@@ -3,12 +3,28 @@ import { useVirtualizer } from '@tanstack/react-virtual'
 import type { ChangedFile, ViewedState } from '../api'
 import { fileLabel, type TreeRow } from '../tree'
 
+/** Which files the tree lists: the changed ones, or the whole head tree. */
+export type TreeScope = 'changed' | 'all'
+
+/**
+ * Progress of the head tree listing the `all` scope needs; null once it is there. `stale`:
+ * the server has moved on to a newer head, so only a refresh helps.
+ */
+export type ListingState = { kind: 'loading' } | { kind: 'error'; message: string; stale: boolean } | null
+
 const ROW_HEIGHT = 22
 const INDENT = 14
 
 interface Props {
   rows: TreeRow[]
+  /** The changed files (header counts). */
   files: ChangedFile[]
+  scope: TreeScope
+  onScopeChange(scope: TreeScope): void
+  /** Files in the head tree, once listed. */
+  totalFiles: number | null
+  listing: ListingState
+  onRetryListing(): void
   currentPath: string | null
   /** Viewed marks of the paths GitHub lists; other files get no checkbox. */
   viewed: ReadonlyMap<string, ViewedState>
@@ -61,7 +77,24 @@ function ViewedProgress({ viewed }: { viewed: ReadonlyMap<string, ViewedState> }
   )
 }
 
-export function FileTree({ rows, files, currentPath, viewed, onOpen, onToggle, onToggleViewed }: Props) {
+function baseName(path: string): string {
+  return path.slice(path.lastIndexOf('/') + 1)
+}
+
+export function FileTree({
+  rows,
+  files,
+  scope,
+  onScopeChange,
+  totalFiles,
+  listing,
+  onRetryListing,
+  currentPath,
+  viewed,
+  onOpen,
+  onToggle,
+  onToggleViewed,
+}: Props) {
   const scrollRef = useRef<HTMLDivElement>(null)
   const virtualizer = useVirtualizer({
     count: rows.length,
@@ -70,7 +103,7 @@ export function FileTree({ rows, files, currentPath, viewed, onOpen, onToggle, o
     overscan: 16,
   })
 
-  const selectedIndex = rows.findIndex((r) => r.kind === 'file' && r.file.path === currentPath)
+  const selectedIndex = rows.findIndex((r) => (r.kind === 'file' || r.kind === 'entry') && r.key === currentPath)
   useEffect(() => {
     if (selectedIndex >= 0) virtualizer.scrollToIndex(selectedIndex, { align: 'auto' })
   }, [selectedIndex, virtualizer])
@@ -81,11 +114,31 @@ export function FileTree({ rows, files, currentPath, viewed, onOpen, onToggle, o
   return (
     <div className="tree">
       <div className="tree-header">
-        <span className="tree-title">Changes</span>
-        <span className="muted">{files.length} files</span>
+        <div className="segmented tree-scope" role="group" aria-label="文件树范围">
+          <button className={scope === 'changed' ? 'is-on' : ''} aria-pressed={scope === 'changed'} onClick={() => onScopeChange('changed')} title="只列出改动的文件">
+            改动 <span className="seg-count">{files.length}</span>
+          </button>
+          <button className={scope === 'all' ? 'is-on' : ''} aria-pressed={scope === 'all'} onClick={() => onScopeChange('all')} title="列出 head 上的整个项目">
+            全部{totalFiles !== null && <span className="seg-count"> {totalFiles}</span>}
+          </button>
+        </div>
         <span className="add">+{additions}</span>
         <span className="del">-{deletions}</span>
       </div>
+      {listing && (
+        <div className="tree-listing">
+          {listing.kind === 'loading' ? (
+            <span className="muted">正在列出项目文件…</span>
+          ) : (
+            <>
+              <span className="pane-error">{listing.message}</span>
+              <button className="btn" onClick={onRetryListing}>
+                {listing.stale ? '刷新' : '重试'}
+              </button>
+            </>
+          )}
+        </div>
+      )}
       <div className="tree-scroll" ref={scrollRef} role="tree">
         <div style={{ height: virtualizer.getTotalSize(), position: 'relative' }}>
           {virtualizer.getVirtualItems().map((item) => {
@@ -136,19 +189,45 @@ export function FileTree({ rows, files, currentPath, viewed, onOpen, onToggle, o
                 </div>
               )
             }
+            if (row.kind === 'entry') {
+              const selected = row.key === currentPath
+              return (
+                <div
+                  key={row.key}
+                  className={`tree-row tree-file is-unchanged${selected ? ' is-selected' : ''}`}
+                  style={style}
+                  role="treeitem"
+                  aria-selected={selected}
+                  title={`${row.entry.path}\n未改动`}
+                  data-path={row.entry.path}
+                  onClick={() => onOpen(row.entry.path)}
+                >
+                  <span className="status-letter" />
+                  <span className="file-name">{baseName(row.entry.path)}</span>
+                </div>
+              )
+            }
+            // The full tree counts changed files per folder; the changed tree counts all of them.
+            const full = scope === 'all'
+            const count = full ? row.changedCount : row.fileCount
             return (
               <div
                 key={row.key}
-                className={`tree-row tree-dir${row.kind === 'group' ? ' tree-group' : ''}`}
+                className={`tree-row tree-dir${row.kind === 'group' ? ' tree-group' : ''}${full && row.changedCount > 0 ? ' has-changes' : ''}`}
                 style={style}
                 role="treeitem"
                 aria-expanded={row.expanded}
+                data-key={row.key}
                 onClick={() => onToggle(row.key)}
               >
                 <Chevron expanded={row.expanded} />
                 {row.kind === 'dir' && <FolderIcon />}
                 <span className="dir-name">{row.name}</span>
-                <span className="dir-count muted">{row.fileCount}</span>
+                {count > 0 && (
+                  <span className="dir-count muted" title={full ? `${count} 个改动文件` : undefined}>
+                    {count}
+                  </span>
+                )}
               </div>
             )
           })}

@@ -65,6 +65,12 @@ export function mockApi(): Plugin {
             const pr = data.prSummary(host, owner, repo, n)
             if (sub === undefined && req.method === 'GET') return json(res, 200, pr)
             if (sub === 'files' && req.method === 'GET') return json(res, 200, data.filesWithViewed())
+            if (sub === 'tree' && req.method === 'GET') {
+              await delay(300)
+              // Like the server: a head it has moved on from gets the new head and no entries.
+              const asked = url.searchParams.get('head')
+              return json(res, 200, { head: pr.head.sha, entries: asked && asked !== pr.head.sha ? [] : data.tree })
+            }
             if (sub === 'viewed' && req.method === 'PUT') {
               const body = (await readJson(req)) as { path?: unknown; viewed?: unknown; head?: unknown } | null
               if (!body || typeof body.path !== 'string' || typeof body.viewed !== 'boolean' || typeof body.head !== 'string') {

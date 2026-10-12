@@ -1,8 +1,21 @@
 // Loading file contents for the diff view: blob fetching, degradation rules and the
 // model LRU (design.md §5.2, §8).
 import type * as Monaco from 'monaco-editor/editor/editor.api'
-import { getBlob, type ChangedFile, type RepoRef } from '../api'
-import { LIMITS, decideText, fileDisplay, imageType, isSafeBlobMime, measure, type ImageType, type SideMeasure, type TextMeta } from '../degrade'
+import { getBlob, type ChangedFile, type RepoRef, type TreeEntry } from '../api'
+import {
+  LIMITS,
+  SNIFF_BYTES,
+  decideText,
+  fileDisplay,
+  imageType,
+  isGitlink,
+  isSafeBlobMime,
+  looksBinary,
+  measure,
+  type ImageType,
+  type SideMeasure,
+  type TextMeta,
+} from '../degrade'
 import { PinnedLru } from '../lru'
 import { monaco } from './setup'
 import { languageForPath } from './language'
@@ -95,6 +108,15 @@ export type LoadedFile =
        * Unpin the models. Call exactly once: after attaching them (and marking them in use),
        * or when the result is abandoned.
        */
+      release(): void
+    }
+  | {
+      /** An unchanged file: its head content alone, no diff. */
+      kind: 'single'
+      model: Monaco.editor.ITextModel
+      plainReason: string | null
+      forced: boolean
+      /** As for `text`. */
       release(): void
     }
   | { kind: 'deferred'; base: SideInfo; head: SideInfo }
@@ -255,6 +277,87 @@ export async function loadFile(repo: RepoRef, file: ChangedFile, force: boolean)
     case 'text':
       return loadText(repo, file, force)
   }
+}
+
+/** The first `n` bytes of a response body (fewer if it is shorter); the rest is not downloaded. */
+async function readPrefix(res: Response, n: number): Promise<Uint8Array> {
+  const reader = res.body?.getReader()
+  if (!reader) return new Uint8Array(await res.arrayBuffer()).subarray(0, n)
+  const out = new Uint8Array(n)
+  let got = 0
+  try {
+    while (got < n) {
+      const { done, value } = await reader.read()
+      if (done) break
+      const take = Math.min(value.length, n - got)
+      out.set(value.subarray(0, take), got)
+      got += take
+    }
+  } finally {
+    await reader.cancel().catch(() => undefined)
+  }
+  return out.subarray(0, got)
+}
+
+/**
+ * An unchanged file of the head tree, read-only. Git gives no binary verdict for these, so
+ * the bytes are sniffed like git does; a large file is sniffed from its first bytes only and
+ * then deferred (text) or shown by size (binary). Image extensions are read in full.
+ */
+export async function loadUnchanged(repo: RepoRef, entry: TreeEntry, force: boolean): Promise<LoadedFile> {
+  if (isGitlink(entry.mode)) return { kind: 'submodule' }
+  const none: SideInfo = { bytes: null }
+  const uri = modelUri('head', entry.oid, entry.path)
+  const key = uri.toString()
+
+  let model = models.get(key)
+  let meta: TextMeta
+  let text = ''
+  if (model) {
+    meta = modelMeta(model)
+  } else {
+    const type = imageType(entry.path)
+    const res = await getBlob(repo, entry.oid)
+    const len = contentLength(res)
+    if (!type && !force && len !== null && len > LIMITS.deferBytes) {
+      const prefix = await readPrefix(res, SNIFF_BYTES)
+      return { kind: looksBinary(prefix) ? 'binary' : 'deferred', base: none, head: { bytes: len } }
+    }
+    const buf = await res.arrayBuffer()
+    if (looksBinary(new Uint8Array(buf))) {
+      if (!type) return { kind: 'binary', base: none, head: { bytes: buf.byteLength } }
+      // Bytes go through a blob: URL, never the API URL directly (design.md §8).
+      const headUrl = await imageUrl(buf, type)
+      return { kind: 'image', baseUrl: null, headUrl, base: none, head: { bytes: buf.byteLength } }
+    }
+    // Without a Content-Length the size is only known now: defer before decoding it all.
+    if (!force && buf.byteLength > LIMITS.deferBytes) return { kind: 'deferred', base: none, head: { bytes: buf.byteLength } }
+    text = decoder.decode(buf)
+    meta = measure(text, buf.byteLength)
+  }
+
+  const decision = decideText([{ meta }], force)
+  if (decision.kind === 'deferred') return { kind: 'deferred', base: none, head: { bytes: meta.bytes, lines: meta.lines } }
+  const { plainReason } = decision
+  const language = plainReason ? 'plaintext' : languageForPath(entry.path)
+  if (model) {
+    if (model.getLanguageId() !== language) monaco.editor.setModelLanguage(model, language)
+  } else {
+    // A model with this URI can already exist if a concurrent load of the same file created it.
+    model = monaco.editor.getModel(uri) ?? monaco.editor.createModel(text, language, uri)
+    metaOf.set(model, meta)
+  }
+  // Pinned before `put`, which may evict.
+  models.pin(model)
+  models.put(key, model)
+  const held = model
+  let released = false
+  const release = () => {
+    if (released) return
+    released = true
+    models.unpin(held)
+  }
+  return { kind: 'single', model, plainReason, forced: force, release }
 }
 
 /** Warm the model cache for a file the user is likely to open next. */

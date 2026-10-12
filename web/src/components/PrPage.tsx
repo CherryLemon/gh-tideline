@@ -3,19 +3,31 @@ import {
   ApiError,
   getPr,
   getPrFiles,
+  getPrTree,
   errorMessage,
   setViewed,
   type ChangedFile,
   type PrSummary,
   type RepoRef,
+  type TreeEntry,
   type ViewedState,
 } from '../api'
 import { fileQuery, navigate, type PrRoute } from '../router'
-import { GENERATED_KEY, ancestorKeys, buildTree } from '../tree'
+import {
+  GENERATED_KEY,
+  adjacentChanged,
+  ancestorKeys,
+  defaultExpanded,
+  isChanged,
+  prepareFullTree,
+  prepareTree,
+  treeRows,
+  type TreeRow,
+} from '../tree'
 import { usePersistentState } from '../storage'
 import { ViewedSync, isTypingTarget, nextUnviewed, viewedMap } from '../viewed'
 import { DiffPane, type ChangeInfo, type DiffPaneHandle, type PendingJump } from './DiffPane'
-import { FileTree } from './FileTree'
+import { FileTree, type ListingState, type TreeScope } from './FileTree'
 import { FileFinder } from './FileFinder'
 import { Toast, type ToastMessage } from './Toast'
 
@@ -28,6 +40,11 @@ interface Props {
 type Data = { pr: PrSummary; files: ChangedFile[]; requestedAt: number }
 
 const DOUBLE_SHIFT_MS = 350
+
+/** The head tree of one head: its entries, or why listing it failed. */
+type Listing = { head: string; entries: TreeEntry[]; error: null } | { head: string; entries: null; error: string; stale: boolean }
+
+const STALE_LISTING = 'PR 已经更新，请先刷新'
 
 /**
  * `v`, also with Caps Lock on or a non-Latin layout (then by physical key). Not while an
@@ -119,9 +136,76 @@ interface ViewProps {
 
 function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
   const { pr, files, requestedAt } = data
+  const head = pr.head.sha
+  const [storedScope, setScope] = usePersistentState<TreeScope>('dr.treeScope', 'changed')
+  const scope: TreeScope = storedScope === 'all' ? 'all' : 'changed'
+
+  // The head tree is listed only when needed: for the full tree, or to open a file the PR
+  // didn't change (a reloaded ?file=). One listing per head; while a new head's listing
+  // loads, the previous one stands in, so the tree and an open unchanged file stay put.
+  const [listing, setListing] = useState<Listing | null>(null)
+  const haveListing = listing?.head === head
+  const requested = new URLSearchParams(search).get('file')
+  const changedByPath = useMemo(() => new Map(files.map((f) => [f.path, f])), [files])
+  const changedCurrent = requested === null ? null : (changedByPath.get(requested) ?? null)
+  const needListing = scope === 'all' || (requested !== null && !changedCurrent)
+  const entries = haveListing || needListing ? (listing?.entries ?? null) : null
+  const headNow = useRef(head)
+  headNow.current = head
+  const listingFor = useRef<string | null>(null)
+  useEffect(() => {
+    if (!needListing || haveListing || listingFor.current === head) return
+    listingFor.current = head
+    const done = (l: Listing) => {
+      if (listingFor.current === head) listingFor.current = null
+      // A refresh moved on to another head meanwhile: that one gets its own listing.
+      if (headNow.current === head) setListing(l)
+    }
+    getPrTree(repo, pr.number, head).then(
+      (t) =>
+        // The server already serves a newer head than this page shows.
+        done(t.head === head ? { head, entries: t.entries, error: null } : { head, entries: null, error: STALE_LISTING, stale: true }),
+      (e: unknown) => done({ head, entries: null, error: errorMessage(e), stale: false }),
+    )
+  }, [needListing, haveListing, head, repo, pr.number])
+  const retryListing = useCallback(() => setListing(null), [])
+  // A refresh (even to the same head) also retries a listing that failed.
+  const listedAt = useRef(requestedAt)
+  useEffect(() => {
+    if (listedAt.current === requestedAt) return
+    listedAt.current = requestedAt
+    setListing((l) => (l && l.error !== null && l.head === head ? null : l))
+  }, [requestedAt, head])
+
+  const changedTree = useMemo(() => prepareTree(files), [files])
+  const fullTree = useMemo(() => (entries ? prepareFullTree(files, entries) : null), [files, entries])
+  const entryByPath = useMemo(() => (entries ? new Map(entries.map((e) => [e.path, e])) : null), [entries])
+  const shownTree = scope === 'all' ? fullTree : changedTree
+  /** Changed files in the order of the tree shown (the full tree has no Generated group). */
+  const order = useMemo(() => (shownTree ?? changedTree).all.filter(isChanged), [shownTree, changedTree])
+  const totalFiles = entries ? entries.length : null
+
+  // Folder state per scope: the changed tree starts expanded (but Generated), the full tree
+  // starts with only the folders leading to changes open.
   const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(() => new Set([GENERATED_KEY]))
-  const tree = useMemo(() => buildTree(files, collapsed as Set<string>), [files, collapsed])
-  const order = tree.order
+  const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => defaultExpanded(files))
+  const seededHead = useRef(head)
+  useEffect(() => {
+    if (seededHead.current === head) return
+    seededHead.current = head
+    // A new head can change files elsewhere: open their folders too, keep the rest as is.
+    setExpanded((prev) => new Set([...prev, ...defaultExpanded(files)]))
+  }, [head, files])
+  const rows = useMemo<TreeRow[]>(() => {
+    if (scope === 'changed') return treeRows(changedTree, (k) => !collapsed.has(k))
+    return fullTree ? treeRows(fullTree, (k) => expanded.has(k)) : []
+  }, [scope, changedTree, fullTree, collapsed, expanded])
+  const listingState: ListingState =
+    scope !== 'all' || fullTree
+      ? null
+      : haveListing && listing.error !== null
+        ? { kind: 'error', message: listing.error, stale: listing.stale }
+        : { kind: 'loading' }
 
   const [sideBySide, setSideBySide] = usePersistentState('dr.sideBySide', true)
   const [ignoreWs, setIgnoreWs] = usePersistentState('dr.ignoreTrimWhitespace', false)
@@ -143,7 +227,6 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
   // head starts over (pending intents were made against the old one).
   const [marks, setMarks] = useState<ReadonlyMap<string, ViewedState>>(() => viewedMap(files))
   const sync = useRef<ViewedSync | null>(null)
-  const head = pr.head.sha
   useEffect(() => {
     const s = new ViewedSync(
       viewedMap(files),
@@ -169,18 +252,23 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
   }, [files, requestedAt])
   const toggleViewed = useCallback((path: string, viewed: boolean) => sync.current?.set(path, viewed), [])
 
-  const requested = new URLSearchParams(search).get('file')
-  const currentIndex = order.findIndex((f) => f.path === requested)
-  const current = currentIndex >= 0 ? order[currentIndex] : null
+  const currentIndex = changedCurrent ? order.indexOf(changedCurrent) : -1
+  /** A changed file, or an unchanged file of the head tree. */
+  const current: ChangedFile | TreeEntry | null =
+    changedCurrent ?? (requested !== null ? (entryByPath?.get(requested) ?? null) : null)
+  // Still listing the head tree to find out whether ?file= is an unchanged file.
+  const resolving = requested !== null && !current && needListing && !haveListing
+  // Listing it failed: say so (with a way out) rather than replace ?file= with another file.
+  const unresolved = requested !== null && !current && haveListing && listing.error !== null ? listing : null
 
   // Without a valid ?file=, show the first file (replace, so Back leaves the PR).
   useEffect(() => {
-    if (!current && order.length > 0) navigate(location.pathname + fileQuery(order[0].path, location.search), true)
-  }, [current, order])
+    if (!current && !resolving && !unresolved && order.length > 0) navigate(location.pathname + fileQuery(order[0].path, location.search), true)
+  }, [current, resolving, unresolved, order])
 
   // Reveal the current file in the tree when it changes; later collapsing its folder sticks.
   const currentPath = current?.path ?? null
-  const currentGenerated = current?.generated ?? false
+  const currentGenerated = changedCurrent?.generated ?? false
   useEffect(() => {
     if (currentPath === null) return
     const keys = ancestorKeys({ path: currentPath, generated: currentGenerated })
@@ -190,7 +278,20 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
       keys.forEach((k) => next.delete(k))
       return next
     })
+    // The full tree has no Generated group.
+    const fullKeys = ancestorKeys({ path: currentPath })
+    setExpanded((prev) => (fullKeys.every((k) => prev.has(k)) ? prev : new Set([...prev, ...fullKeys])))
   }, [currentPath, currentGenerated])
+
+  /** The changed file after (1) or before (-1) the current one, also from an unchanged file. */
+  const neighbor = useCallback(
+    (dir: 1 | -1): ChangedFile | null => {
+      if (changedCurrent) return order[currentIndex + dir] ?? null
+      if (current && fullTree) return adjacentChanged(fullTree.all, current.path, dir)
+      return null
+    },
+    [changedCurrent, order, currentIndex, current, fullTree],
+  )
 
   const openFile = useCallback(
     (path: string, jump?: PendingJump['where']) => {
@@ -200,40 +301,46 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
     [requested],
   )
 
-  const toggle = useCallback((key: string) => {
-    setCollapsed((prev) => {
-      const next = new Set(prev)
-      if (next.has(key)) next.delete(key)
-      else next.add(key)
-      return next
-    })
-  }, [])
+  const toggle = useCallback(
+    (key: string) => {
+      const flip = (prev: ReadonlySet<string>) => {
+        const next = new Set(prev)
+        if (next.has(key)) next.delete(key)
+        else next.add(key)
+        return next
+      }
+      if (scope === 'all') setExpanded(flip)
+      else setCollapsed(flip)
+    },
+    [scope],
+  )
 
   /** `v`: toggles the current file; marking it viewed moves on to the next unviewed file. */
   const toggleCurrentViewed = () => {
     const s = sync.current
-    if (!current || !s) return
-    if (!s.has(current.path)) {
+    // Unchanged files have no viewed mark.
+    if (!changedCurrent || !s) return
+    if (!s.has(changedCurrent.path)) {
       showToast('GitHub 的文件列表里没有这个路径，无法标记已看')
       return
     }
-    const viewed = !s.isViewed(current.path)
-    s.set(current.path, viewed)
+    const viewed = !s.isViewed(changedCurrent.path)
+    s.set(changedCurrent.path, viewed)
     if (!viewed) return
     const next = nextUnviewed(order, currentIndex, s.snapshot())
     if (next !== null) openFile(order[next].path)
   }
 
   // Keep the latest navigation state for the window-level key handler.
-  const nav = useRef({ order, currentIndex, openFile, finderOpen, toggleCurrentViewed })
+  const nav = useRef({ neighbor, openFile, finderOpen, toggleCurrentViewed })
   useLayoutEffect(() => {
-    nav.current = { order, currentIndex, openFile, finderOpen, toggleCurrentViewed }
+    nav.current = { neighbor, openFile, finderOpen, toggleCurrentViewed }
   })
 
   useEffect(() => {
     let lastShift = 0
     const onKeyDown = (e: KeyboardEvent) => {
-      const { order, currentIndex, openFile, finderOpen, toggleCurrentViewed } = nav.current
+      const { neighbor, openFile, finderOpen, toggleCurrentViewed } = nav.current
       if (e.key === 'Shift') {
         if (e.repeat) return
         const now = performance.now()
@@ -255,19 +362,16 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
         // Captured on window before Monaco sees it: overrides its accessible-diff-viewer binding.
         consume()
         // 'notReady' (file or diff still loading) must not advance: the pane queues the jump instead.
-        if (e.shiftKey) {
-          const r = pane.current?.prevChange() ?? 'none'
-          if (r === 'none' && currentIndex > 0) openFile(order[currentIndex - 1].path, 'last')
-        } else {
-          const r = pane.current?.nextChange() ?? 'none'
-          if (r === 'none' && currentIndex >= 0 && currentIndex < order.length - 1) openFile(order[currentIndex + 1].path, 'first')
-        }
+        const dir = e.shiftKey ? -1 : 1
+        const r = (dir === 1 ? pane.current?.nextChange() : pane.current?.prevChange()) ?? 'none'
+        const target = r === 'none' ? neighbor(dir) : null
+        if (target) openFile(target.path, dir === 1 ? 'first' : 'last')
         return
       }
       if (e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) {
         consume()
-        const target = currentIndex + (e.key === 'ArrowDown' ? 1 : -1)
-        if (target >= 0 && target < order.length) openFile(order[target].path)
+        const target = neighbor(e.key === 'ArrowDown' ? 1 : -1)
+        if (target) openFile(target.path)
         return
       }
       if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'p') {
@@ -299,7 +403,8 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
     window.addEventListener('mouseup', up)
   }
 
-  const nextFile = currentIndex >= 0 && currentIndex < order.length - 1 ? order[currentIndex + 1] : null
+  // Memoized: from an unchanged file this scans the whole tree.
+  const nextFile = useMemo(() => neighbor(1), [neighbor])
 
   return (
     <div className="app" style={{ '--tree-width': `${treeWidth}px` } as React.CSSProperties}>
@@ -344,8 +449,13 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
       <div className="main">
         <aside className="sidebar">
           <FileTree
-            rows={tree.rows}
+            rows={rows}
             files={files}
+            scope={scope}
+            onScopeChange={setScope}
+            totalFiles={totalFiles}
+            listing={listingState}
+            onRetryListing={listingState?.kind === 'error' && listingState.stale ? onRefresh : retryListing}
             currentPath={current?.path ?? null}
             viewed={marks}
             onOpen={openFile}
@@ -364,11 +474,18 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
               sideBySide={sideBySide}
               ignoreTrimWhitespace={ignoreWs}
               pendingJump={pendingJump}
-              headerActions={<ViewedCheck path={current.path} mark={marks.get(current.path)} onToggle={toggleViewed} />}
+              headerActions={changedCurrent && <ViewedCheck path={changedCurrent.path} mark={marks.get(changedCurrent.path)} onToggle={toggleViewed} />}
               onChangeInfo={setChangeInfo}
             />
+          ) : unresolved ? (
+            <div className="pane-msg">
+              <div className="pane-error">{unresolved.error}</div>
+              <button className="btn" onClick={unresolved.stale ? onRefresh : retryListing}>
+                {unresolved.stale ? '刷新' : '重试'}
+              </button>
+            </div>
           ) : (
-            <div className="pane-msg muted">{files.length === 0 ? '这个 PR 没有改动文件' : ''}</div>
+            <div className="pane-msg muted">{resolving ? '加载中…' : files.length === 0 ? '这个 PR 没有改动文件' : ''}</div>
           )}
         </section>
       </div>
@@ -394,7 +511,7 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
 
       {finderOpen && (
         <FileFinder
-          files={order}
+          files={scope === 'all' && fullTree ? fullTree.all : order}
           onClose={() => setFinderOpen(false)}
           onPick={(path) => {
             setFinderOpen(false)

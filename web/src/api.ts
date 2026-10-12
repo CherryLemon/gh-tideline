@@ -41,6 +41,20 @@ export interface ChangedFile {
   viewed?: ViewedState
 }
 
+/** A file of the head tree (`git ls-tree -r`); gitlinks (mode 160000) carry a commit oid. */
+export interface TreeEntry {
+  path: string
+  mode: string
+  oid: string
+}
+
+export interface PrTree {
+  /** The head commit the listing belongs to. */
+  head: string
+  /** Empty when `head` is not the head that was asked for (the PR has moved on). */
+  entries: TreeEntry[]
+}
+
 export interface ApiErrorBody {
   error: { code: string; message: string }
 }
@@ -125,6 +139,15 @@ export async function getPr(r: RepoRef, n: number, refresh = false): Promise<PrS
 export async function getPrFiles(r: RepoRef, n: number, refresh = false): Promise<ChangedFile[]> {
   const res = await request(`${repoBase(r)}/pulls/${n}/files${refresh ? '?refresh=1' : ''}`)
   return (await res.json()) as ChangedFile[]
+}
+
+/**
+ * Every file of the head tree, for the full project tree. The server lists `head` if it
+ * still has that snapshot, else its current head (compare `PrTree.head`).
+ */
+export async function getPrTree(r: RepoRef, n: number, head: string): Promise<PrTree> {
+  const res = await request(`${repoBase(r)}/pulls/${n}/tree?head=${encodeURIComponent(head)}`)
+  return (await res.json()) as PrTree
 }
 
 /** Marks (`viewed`) or unmarks a file as viewed; `head` is the head the page shows. */

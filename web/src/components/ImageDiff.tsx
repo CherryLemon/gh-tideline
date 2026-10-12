@@ -37,3 +37,12 @@ export function ImageDiff({ file, state }: { file: ChangedFile; state: ImageStat
     </div>
   )
 }
+
+/** The head image of an unchanged file. */
+export function ImageView({ state }: { state: ImageState }) {
+  return (
+    <div className="image-diff image-single" data-testid="image-view">
+      <Side label="head" url={state.headUrl} info={state.head} />
+    </div>
+  )
+}

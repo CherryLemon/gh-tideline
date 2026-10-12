@@ -83,6 +83,8 @@ gh tideline                                          # opens the home page: rece
 - Each file shows its added/deleted line counts, a viewed checkbox and its comment count.
 - Files whose viewed state is DISMISSED (viewed, then changed again) are marked in a prominent color.
 - Generated and vendored files go in their own group, collapsed by default.
+- A toggle at the top switches to the full project tree: every file at the head, with the changed files (and deleted ones, at their old path) in place and marked by status.
+  Only folders leading to changes start open. Clicking an unchanged file shows its head content read-only.
 
 **Only one file is shown at a time.** This matches JetBrains and differs from GitHub, which puts all files into one long page.
 The benefit: the editor needs only one instance, which mostly removes the performance problems of big PRs.
@@ -367,6 +369,7 @@ All endpoints start with `/api/{host}/{owner}/{repo}`. The table below omits thi
 | GET | `/pulls/{n}/threads` | Review threads | M1 |
 | PUT | `/pulls/{n}/viewed` | Request body `{path, viewed, head}`. Returns 409 `stale_head` when `head` is not the current head | M1 |
 | GET | `/pulls/{n}/since-review` | Returns `{from, to, mode: direct \| rebased \| fallback, baseline}` | M1 |
+| GET | `/pulls/{n}/tree?head=` | Every file at the head, `{head, entries: [{path, mode, oid}]}`, for the full project tree. Listed locally with `git ls-tree` (trees are in the blob:none clone) and cached per snapshot; its OIDs become fetchable through `/blobs`. With `head`, a cached snapshot of that head is used however old; if the server has moved on, the response carries the newer `head` and no entries | M1 |
 | GET | `/revs/{sha}/symbols?path=` | Symbols of one file | M2 |
 | GET | `/revs/{sha}/definitions?name=&lang=` | Find definitions | M2 |
 | GET | `/revs/{sha}/references?name=&lang=` | Find usages | M2 |

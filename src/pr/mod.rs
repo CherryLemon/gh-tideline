@@ -10,7 +10,9 @@ use serde::Serialize;
 
 use crate::error::AppError;
 use crate::git::parse::GITLINK_MODE;
-use crate::git::{ChangedFile, GitAuth, GitFailure, ObjectLookup, Repo, RepoGuard, Repos};
+use crate::git::{
+    ChangedFile, GitAuth, GitFailure, ObjectLookup, Repo, RepoGuard, Repos, TreeEntry,
+};
 use crate::github::{Github, Tokens, ViewedState};
 use crate::state::{PrKey, StateDb};
 
@@ -51,6 +53,8 @@ pub struct PrData {
     /// The viewer's viewed marks, keyed by GitHub's own file paths (its rename detection
     /// may differ from ours). Updated in place after a successful `set_viewed`.
     viewed: Mutex<HashMap<String, ViewedState>>,
+    /// Every file of the head tree, listed on first request (see [`PrService::tree`]).
+    tree: tokio::sync::OnceCell<Arc<Vec<TreeEntry>>>,
 }
 
 /// A [`ChangedFile`] plus the viewer's viewed mark (only for paths GitHub lists).
@@ -310,6 +314,7 @@ impl PrService {
             },
             files,
             viewed: Mutex::new(viewed),
+            tree: Default::default(),
         })
     }
 
@@ -431,8 +436,44 @@ impl PrService {
         db.set_seen_head(key, head, crate::clock::unix_now()).await
     }
 
+    /// The snapshot of `head`: a cached one however old (the listing of a head never
+    /// changes), else a regular [`PrService::open`], which may return another head.
+    pub async fn open_at(
+        self: &Arc<Self>,
+        key: &PrKey,
+        head: &str,
+    ) -> Result<Arc<PrData>, AppError> {
+        match self.cached(key).await {
+            Some(data) if data.summary.head.sha == head => Ok(data),
+            _ => {
+                self.open(&key.host, &key.owner, &key.repo, key.number, false)
+                    .await
+            }
+        }
+    }
+
+    /// Every file of the head tree of `data` (the full project view), listed once per
+    /// snapshot. Its OIDs become fetchable through [`PrService::blob`] like the changed files'.
+    pub async fn tree(&self, data: &PrData) -> Result<Arc<Vec<TreeEntry>>, AppError> {
+        let s = &data.summary;
+        data.tree
+            .get_or_try_init(|| async {
+                let repo = self.repos.repo(&s.host, &s.owner, &s.repo);
+                let entries = repo.ls_tree(&s.head.sha).await.map_err(git_err)?;
+                repo.remember_oids(
+                    entries
+                        .iter()
+                        .map(|e| (e.oid.as_str(), e.mode != GITLINK_MODE)),
+                );
+                Ok(Arc::new(entries))
+            })
+            .await
+            .cloned()
+    }
+
     /// Raw bytes of a blob from the cache repo. A local read comes first and takes no lock.
-    /// Only a blob listed in a PR opened by this process is lazily fetched on a local miss,
+    /// Only a blob listed in a PR opened by this process (a changed file, or any file of its
+    /// head tree once that was listed) is lazily fetched on a local miss,
     /// under the repo lock in a detached task (so a client disconnect neither kills git nor
     /// releases the lock early). Gitlinks, unknown OIDs and non-blob objects are 404.
     pub async fn blob(
@@ -723,6 +764,7 @@ mod tests {
             },
             files,
             viewed: Mutex::new(viewed),
+            tree: Default::default(),
         }
     }
 
@@ -783,5 +825,29 @@ mod tests {
             code(check_viewed_request(&d, "../a", HEAD, HEAD)),
             Err(ErrorCode::BadRequest)
         );
+    }
+
+    #[tokio::test]
+    async fn open_at_serves_a_snapshot_of_that_head_past_its_ttl() {
+        // Never touched: a cache hit reads neither the repo nor GitHub.
+        let root = std::env::temp_dir().join("tideline-open-at-unused");
+        let service = Arc::new(PrService::new(Repos::new(root), None));
+        let key = PrKey {
+            host: "github.com".to_string(),
+            owner: "o".to_string(),
+            repo: "r".to_string(),
+            number: 1,
+        };
+        let old = Instant::now()
+            .checked_sub(CACHE_TTL * 2)
+            .expect("monotonic clock older than a minute");
+        let snapshot = Arc::new(data(vec![file("a", false)], HashMap::new()));
+        *service.slot(&key).lock().await = Some(Cached {
+            started: old,
+            finished: old,
+            data: snapshot.clone(),
+        });
+        let got = service.open_at(&key, HEAD).await.expect("cached snapshot");
+        assert!(Arc::ptr_eq(&got, &snapshot));
     }
 }

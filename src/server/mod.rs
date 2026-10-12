@@ -12,12 +12,12 @@ use axum::http::{StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
 use axum::{Json, Router};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::clock::unix_now;
 use crate::error::AppError;
-use crate::git::is_oid;
+use crate::git::{TreeEntry, is_oid};
 use crate::pr::PrService;
 use crate::pr::target::valid_name;
 use crate::state::PrKey;
@@ -64,6 +64,7 @@ pub fn router(state: AppState) -> Router {
             "/api/{host}/{owner}/{repo}/pulls/{n}/files",
             get(pull_files),
         )
+        .route("/api/{host}/{owner}/{repo}/pulls/{n}/tree", get(pull_tree))
         .route(
             "/api/{host}/{owner}/{repo}/pulls/{n}/viewed",
             put(set_viewed),
@@ -172,6 +173,64 @@ async fn pull_files(
 ) -> Result<Response, AppError> {
     let data = load_pr(&state, params, q).await?;
     Ok(Json(data.files_with_viewed()).into_response())
+}
+
+#[derive(Serialize)]
+struct TreeResponse<'a> {
+    head: &'a str,
+    entries: &'a [TreeEntry],
+}
+
+#[derive(Deserialize)]
+struct TreeQuery {
+    head: Option<String>,
+}
+
+/// Every file of the head tree, with the head it belongs to (serialized from the cached
+/// listing without copying it: it can hold 100k entries). With `?head=`, a cached snapshot
+/// of that head is used past its TTL, so the listing never reloads the PR from GitHub
+/// just because the page has been open for a while.
+async fn pull_tree(
+    State(state): State<AppState>,
+    Path((host, owner, repo, n)): Path<(String, String, String, String)>,
+    Query(q): Query<TreeQuery>,
+) -> Result<Response, AppError> {
+    check_repo(&state, &host, &owner, &repo)?;
+    let number = parse_pr_number(&n)?;
+    let data = match q.head.as_deref() {
+        Some(head) => {
+            if !is_oid(head) {
+                return Err(AppError::bad_request(
+                    "head must be 40 (or 64) lowercase hex characters",
+                ));
+            }
+            let key = PrKey {
+                host,
+                owner,
+                repo,
+                number,
+            };
+            state.pr.open_at(&key, head).await?
+        }
+        None => state.pr.open(&host, &owner, &repo, number, false).await?,
+    };
+    // The client asked for a head the server has moved on from: it only needs to know that.
+    if q.head
+        .as_deref()
+        .is_some_and(|h| h != data.summary.head.sha)
+    {
+        return Ok(Json(TreeResponse {
+            head: &data.summary.head.sha,
+            entries: &[],
+        })
+        .into_response());
+    }
+    let entries = state.pr.tree(&data).await?;
+    Ok(Json(TreeResponse {
+        head: &data.summary.head.sha,
+        entries: &entries,
+    })
+    .into_response())
 }
 
 #[derive(Deserialize)]
