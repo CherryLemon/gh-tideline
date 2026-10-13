@@ -15,7 +15,8 @@ struct Assets;
 /// GitHub's https hosts.
 pub const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
     img-src 'self' data: blob: https:; font-src 'self' data:; worker-src 'self' blob:; \
-    connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'";
+    connect-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; \
+    form-action 'none'";
 
 const NOT_BUILT: &str = "<!doctype html>\n<html><head><meta charset=\"utf-8\"><title>tideline</title></head>\n<body style=\"font-family:system-ui;background:#FFF8ED;color:#546E7A;padding:2rem\">\n<h1>frontend not built</h1>\n<p>The web UI was not embedded in this binary. Run <code>make web</code> (or <code>make build</code>) and rebuild.</p>\n</body></html>\n";
 
@@ -102,6 +103,7 @@ mod tests {
         let directives: Vec<&str> = CSP.split(';').map(str::trim).collect();
         assert!(directives.contains(&"script-src 'self'"));
         assert!(directives.contains(&"form-action 'none'"));
+        assert!(directives.contains(&"object-src 'none'"));
         assert!(directives.contains(&"frame-ancestors 'none'"));
         assert!(!CSP.contains("unsafe-eval"));
         assert!(
