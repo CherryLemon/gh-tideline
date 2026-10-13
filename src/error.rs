@@ -3,7 +3,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
 
-/// Error codes from the M0/M1 contracts; each maps to a fixed HTTP status.
+/// Error codes from the M0–M2 contracts; each maps to a fixed HTTP status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorCode {
     Unauthorized,
@@ -14,6 +14,7 @@ pub enum ErrorCode {
     GitError,
     BadRequest,
     StaleHead,
+    Rejected,
 }
 
 impl ErrorCode {
@@ -27,6 +28,7 @@ impl ErrorCode {
             ErrorCode::GitError => "git_error",
             ErrorCode::BadRequest => "bad_request",
             ErrorCode::StaleHead => "stale_head",
+            ErrorCode::Rejected => "rejected",
         }
     }
 
@@ -40,6 +42,7 @@ impl ErrorCode {
             ErrorCode::GitError => StatusCode::BAD_GATEWAY,
             ErrorCode::BadRequest => StatusCode::BAD_REQUEST,
             ErrorCode::StaleHead => StatusCode::CONFLICT,
+            ErrorCode::Rejected => StatusCode::UNPROCESSABLE_ENTITY,
         }
     }
 }
@@ -80,6 +83,10 @@ impl AppError {
     }
     pub fn stale_head(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::StaleHead, message)
+    }
+    /// GitHub refused a write; the message is GitHub's.
+    pub fn rejected(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::Rejected, message)
     }
 }
 

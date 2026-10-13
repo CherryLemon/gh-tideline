@@ -151,6 +151,7 @@ const CODE_MESSAGES: Record<string, string> = {
   git_error: 'Git operation failed',
   bad_request: 'Invalid request',
   stale_head: STALE_HEAD_MESSAGE,
+  rejected: 'GitHub refused the change',
   network: "Can't reach the Tideline server",
 }
 

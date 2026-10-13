@@ -307,6 +307,32 @@ impl Github {
         query: &str,
         variables: serde_json::Value,
     ) -> Result<T, AppError> {
+        self.post_graphql(host, token, query, variables, Op::Read)
+            .await
+    }
+
+    /// Like `graphql`, for mutations: GitHub refusing the write becomes `rejected` (422) with
+    /// GitHub's message, so the UI can say why. Callers must not retry: the write may have
+    /// landed.
+    async fn mutate<T: DeserializeOwned>(
+        &self,
+        host: &str,
+        token: &str,
+        query: &str,
+        variables: serde_json::Value,
+    ) -> Result<T, AppError> {
+        self.post_graphql(host, token, query, variables, Op::Write)
+            .await
+    }
+
+    async fn post_graphql<T: DeserializeOwned>(
+        &self,
+        host: &str,
+        token: &str,
+        query: &str,
+        variables: serde_json::Value,
+        op: Op,
+    ) -> Result<T, AppError> {
         let resp = self
             .http
             .post(graphql_url(host))
@@ -326,21 +352,7 @@ impl Github {
         let parsed: GqlResponse<T> = serde_json::from_str(&text)
             .map_err(|e| AppError::github(format!("unexpected GraphQL response: {e}")))?;
         if let Some(errors) = parsed.errors.filter(|e| !e.is_empty()) {
-            let message = errors
-                .iter()
-                .map(|e| e.message.as_str())
-                .collect::<Vec<_>>()
-                .join("; ");
-            return Err(
-                if errors
-                    .iter()
-                    .any(|e| e.kind.as_deref() == Some("NOT_FOUND"))
-                {
-                    AppError::not_found(message)
-                } else {
-                    AppError::github(message)
-                },
-            );
+            return Err(classify_gql_errors(&errors, op));
         }
         parsed
             .data
@@ -400,7 +412,7 @@ impl Github {
     ) -> Result<(), AppError> {
         let query = if viewed { MARK_VIEWED } else { UNMARK_VIEWED };
         let _: serde_json::Value = self
-            .graphql(
+            .mutate(
                 host,
                 token,
                 query,
@@ -456,6 +468,31 @@ impl Github {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Op {
+    Read,
+    Write,
+}
+
+/// The error for a GraphQL response's `errors`. GitHub refusing a write (`UNPROCESSABLE`:
+/// the comment's line isn't in the diff, approving your own PR, ...; `FORBIDDEN`: no
+/// permission) is `rejected`; the same on a read is a `github_error` like any other.
+fn classify_gql_errors(errors: &[GqlError], op: Op) -> AppError {
+    let message = errors
+        .iter()
+        .map(|e| e.message.as_str())
+        .collect::<Vec<_>>()
+        .join("; ");
+    let has = |kind: &str| errors.iter().any(|e| e.kind.as_deref() == Some(kind));
+    if has("NOT_FOUND") {
+        AppError::not_found(message)
+    } else if op == Op::Write && (has("UNPROCESSABLE") || has("FORBIDDEN")) {
+        AppError::rejected(message)
+    } else {
+        AppError::github(message)
+    }
+}
+
 /// Commit ids from GitHub end up in git arguments and refspecs; reject anything else.
 fn check_oid(oid: &str) -> Result<(), AppError> {
     if crate::git::is_oid(oid) {
@@ -502,6 +539,51 @@ mod tests {
                 check_oid(bad).map_err(|e| e.code),
                 Err(ErrorCode::GithubError),
                 "{bad:?}"
+            );
+        }
+    }
+
+    fn errors(json: &str) -> Vec<GqlError> {
+        serde_json::from_str::<GqlResponse<serde_json::Value>>(json)
+            .unwrap()
+            .errors
+            .unwrap()
+    }
+
+    #[test]
+    fn graphql_errors_are_classified_by_type_and_operation() {
+        // As GitHub sends it for a comment on a line outside the diff (spike S12).
+        let unprocessable = errors(
+            r#"{"data": {"addPullRequestReviewThread": null}, "errors": [{"type": "UNPROCESSABLE",
+                "path": ["addPullRequestReviewThread"], "locations": [{"line": 2, "column": 3}],
+                "message": "Line could not be resolved"}]}"#,
+        );
+        let forbidden = errors(
+            r#"{"errors": [{"type": "FORBIDDEN", "message": "Resource not accessible by integration"}]}"#,
+        );
+        let not_found = errors(
+            r#"{"errors": [{"type": "NOT_FOUND", "message": "Could not resolve to a node"},
+                {"type": "UNPROCESSABLE", "message": "x"}]}"#,
+        );
+        let untyped =
+            errors(r#"{"errors": [{"message": "Something went wrong"}, {"message": "again"}]}"#);
+
+        let classify = |e: &[GqlError], op| {
+            let err = classify_gql_errors(e, op);
+            (err.code, err.message)
+        };
+        assert_eq!(
+            classify(&unprocessable, Op::Write),
+            (ErrorCode::Rejected, "Line could not be resolved".into())
+        );
+        assert_eq!(classify(&forbidden, Op::Write).0, ErrorCode::Rejected);
+        assert_eq!(classify(&unprocessable, Op::Read).0, ErrorCode::GithubError);
+        assert_eq!(classify(&forbidden, Op::Read).0, ErrorCode::GithubError);
+        for op in [Op::Read, Op::Write] {
+            assert_eq!(classify(&not_found, op).0, ErrorCode::NotFound);
+            assert_eq!(
+                classify(&untyped, op),
+                (ErrorCode::GithubError, "Something went wrong; again".into())
             );
         }
     }
