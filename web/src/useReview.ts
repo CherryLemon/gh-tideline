@@ -2,7 +2,7 @@
 // of the page: reads that come with each page load or refresh go through `rebase`.
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import type { ReviewThreads } from './api'
-import { errorMessage } from './api'
+import { ApiError, errorMessage, mayHaveLanded } from './api'
 import { ReviewStore, type ReviewSnapshot, type SendResolved } from './review'
 
 export interface ReviewRead {
@@ -17,9 +17,12 @@ export interface Review {
   snapshot: ReviewSnapshot | null
   /** Whether a read is in flight, or the page's latest one not taken yet. */
   reading: boolean
-  /** Why the latest read failed (a new object per failure); null once one succeeds. */
-  error: { message: string } | null
-  /** Reads again with `read`. */
+  /**
+   * Why the latest read failed (a new object per failure); null once one succeeds. `quiet`: a
+   * read after a failed resolve, whose failure was reported already.
+   */
+  error: { message: string; quiet: boolean } | null
+  /** Reads again with `read` (not once the page is gone). */
   retry(): void
 }
 
@@ -38,7 +41,7 @@ export function useReview(
 ): Review {
   const [store, setStore] = useState<ReviewStore | null>(null)
   const [inflight, setInflight] = useState(0)
-  const [error, setError] = useState<{ message: string } | null>(null)
+  const [error, setError] = useState<{ message: string; quiet: boolean } | null>(null)
   const [taken, setTaken] = useState<ReviewRead | null>(null)
   const storeRef = useRef<ReviewStore | null>(null)
   const live = useRef(true)
@@ -56,9 +59,9 @@ export function useReview(
     }
   }, [])
 
-  const take = useCallback(({ promise, requestedAt }: ReviewRead) => {
+  const take = useCallback(({ promise, requestedAt }: ReviewRead, quiet = false) => {
     setInflight((n) => n + 1)
-    const settle = (err: { message: string } | null) => {
+    const settle = (err: { message: string; quiet: boolean } | null) => {
       if (requestedAt < settledAt.current) return false
       settledAt.current = requestedAt
       setError(err)
@@ -74,7 +77,14 @@ export function useReview(
             s = new ReviewStore(
               threads,
               (id, resolved) => callbacks.current.sendResolved(id, resolved),
-              (id, e) => callbacks.current.onResolveError(id, e),
+              (id, e) => {
+                callbacks.current.onResolveError(id, e)
+                // GitHub may have made the change before the answer was lost, or the thread is
+                // gone: show what it has.
+                if (mayHaveLanded(e) || (e instanceof ApiError && e.code === 'not_found')) {
+                  take({ promise: callbacks.current.read(), requestedAt: performance.now() }, true)
+                }
+              },
             )
             storeRef.current = s
             setStore(s)
@@ -82,7 +92,7 @@ export function useReview(
           s.rebase(threads, requestedAt)
         },
         (e: unknown) => {
-          if (live.current) settle({ message: errorMessage(e) })
+          if (live.current) settle({ message: errorMessage(e), quiet })
         },
       )
       .finally(() => {
@@ -95,7 +105,9 @@ export function useReview(
     setTaken(latest)
   }, [latest, take])
 
-  const retry = useCallback(() => take({ promise: callbacks.current.read(), requestedAt: performance.now() }), [take])
+  const retry = useCallback(() => {
+    if (live.current) take({ promise: callbacks.current.read(), requestedAt: performance.now() })
+  }, [take])
 
   const snapshot = useSyncExternalStore(store?.subscribe ?? noSubscribe, store?.getSnapshot ?? noSnapshot)
   return { store, snapshot, reading: inflight > 0 || taken !== latest, error, retry }

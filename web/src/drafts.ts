@@ -1,15 +1,18 @@
 // Open comment boxes and what is typed in them, per pull request. Kept in sessionStorage, so a
 // reload or a file switch doesn't lose a draft (and they go with the tab). Whether a box is
 // sending, and why its last send failed, live here too: a box shown again shows them.
-import type { DiffSide } from './api'
+import type { DiffSide, ReviewThread } from './api'
 import { errorMessage } from './api'
 
-/** What a box writes: a new thread on a file or on lines, a reply, an edit, the review summary. */
+/**
+ * What a box writes: a new thread on a file or on lines, a reply, an edit, the review summary.
+ * A reply or an edit keeps its thread's path: should the thread go, the box shows there.
+ */
 export type DraftTarget =
   | { kind: 'file'; path: string }
   | { kind: 'lines'; path: string; side: DiffSide; startLine: number | null; line: number }
-  | { kind: 'reply'; threadId: string }
-  | { kind: 'edit'; threadId: string; commentId: string }
+  | { kind: 'reply'; threadId: string; path: string }
+  | { kind: 'edit'; threadId: string; commentId: string; path: string }
   | { kind: 'review' }
 
 /** One box per target; the path comes last, so it may hold any character. */
@@ -20,12 +23,27 @@ export function draftKey(t: DraftTarget): string {
     case 'lines':
       return `lines:${t.side}:${t.startLine ?? ''}-${t.line}:${t.path}`
     case 'reply':
-      return `reply:${t.threadId}`
+      return replyKey(t.threadId)
     case 'edit':
-      return `edit:${t.commentId}`
+      return editKey(t.commentId)
     case 'review':
       return 'review'
   }
+}
+
+/** A comment's text as a box holds it: comments written on github.com keep CRLF, a textarea gives LF. */
+export function boxText(body: string): string {
+  return body.replace(/\r\n?/g, '\n')
+}
+
+/** The key of the box that replies to the thread. */
+export function replyKey(threadId: string): string {
+  return `reply:${threadId}`
+}
+
+/** The key of the box that edits the comment. */
+export function editKey(commentId: string): string {
+  return `edit:${commentId}`
 }
 
 export interface DraftView {
@@ -94,9 +112,9 @@ function isTarget(t: unknown): t is DraftTarget {
         (o.startLine === null || typeof o.startLine === 'number')
       )
     case 'reply':
-      return typeof o.threadId === 'string'
+      return typeof o.threadId === 'string' && typeof o.path === 'string'
     case 'edit':
-      return typeof o.threadId === 'string' && typeof o.commentId === 'string'
+      return typeof o.threadId === 'string' && typeof o.commentId === 'string' && typeof o.path === 'string'
     case 'review':
       return true
     default:
@@ -143,11 +161,14 @@ export class DraftStore {
     return this.snap
   }
 
-  /** Opens a box for `target` (or keeps the open one, with its text) and asks it to take focus. */
-  open(target: DraftTarget, head: string, now = Date.now()): string {
+  /**
+   * Opens a box for `target` starting with `text` (or keeps the open one, with its text) and
+   * asks it to take focus.
+   */
+  open(target: DraftTarget, head: string, text = '', now = Date.now()): string {
     const key = draftKey(target)
     if (!this.drafts.has(key)) {
-      this.drafts.set(key, { target, text: '', head, updatedAt: now })
+      this.drafts.set(key, { target, text, head, updatedAt: now })
       this.save()
     }
     this.focusKey = key
@@ -271,4 +292,20 @@ export class DraftStore {
       // Full or unavailable: the drafts still live as long as the page.
     }
   }
+}
+
+/**
+ * Keys of the reply and edit boxes whose thread (or comment) `threads` no longer has: deleted
+ * on GitHub, or a discarded pending review took it. A box being sent isn't listed (its answer
+ * says what happened).
+ */
+export function lostDrafts(views: DraftsSnapshot, threads: readonly ReviewThread[]): string[] {
+  const out: string[] = []
+  for (const [key, d] of views) {
+    const t = d.target
+    if (d.sending || (t.kind !== 'reply' && t.kind !== 'edit')) continue
+    const thread = threads.find((th) => th.id === t.threadId)
+    if (!thread || (t.kind === 'edit' && !thread.comments.some((c) => c.id === t.commentId))) out.push(key)
+  }
+  return out
 }

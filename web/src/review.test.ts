@@ -79,6 +79,20 @@ describe('ReviewStore resolve', () => {
 })
 
 describe('ReviewStore rebase and writes', () => {
+  it('says whether it has the thread of a comment', () => {
+    const a = mkThread()
+    const { store } = setup([a])
+    expect(store.applyComment(a.id, { ...a.comments[0], body: 'edited' })).toBe(true)
+    expect(store.getSnapshot().threads[0].comments.map((c) => c.body)).toEqual(['edited'])
+    expect(store.applyComment('gone', { ...a.comments[0], id: 'x' })).toBe(false)
+    expect(store.getSnapshot().threads[0].comments).toHaveLength(1)
+    // An edit of a comment that is gone (deleted meanwhile) doesn't bring it back; a reply is added.
+    expect(store.applyComment(a.id, { ...a.comments[0], id: 'x' }, true)).toBe(false)
+    expect(store.getSnapshot().threads[0].comments).toHaveLength(1)
+    expect(store.applyComment(a.id, { ...a.comments[0], id: 'x' })).toBe(true)
+    expect(store.getSnapshot().threads[0].comments).toHaveLength(2)
+  })
+
   it('takes a newer read', () => {
     const a = mkThread()
     const { store } = setup([a])
@@ -148,6 +162,22 @@ describe('ReviewStore rebase and writes', () => {
     await settle()
     store.rebase({ head: 'h2', locked: false, pendingReview: null, threads: [{ ...t, line: 20 }] }, sentAt)
     expect(thread(t.id)).toMatchObject({ line: 20, isResolved: false })
+  })
+
+  it('drops a deleted comment from the stored thread, a resolve on its way kept apart', async () => {
+    const t = mkThread()
+    const two = { ...t, comments: [t.comments[0], { ...t.comments[0], id: 'C2' }] }
+    const { store, calls, thread, settle } = setup([two])
+    store.setResolved(t.id, true)
+    expect(store.dropComment(t.id, 'C2', false)).toBe(true)
+    expect(store.dropComment(t.id, 'C2', false)).toBe(false)
+    expect(thread(t.id)).toMatchObject({ isResolved: true, comments: [t.comments[0]] })
+    // GitHub refuses the resolve: the thread is as it was, less the comment.
+    calls[0].reject(new Error('refused'))
+    await settle()
+    expect(thread(t.id)).toMatchObject({ isResolved: false, isCollapsed: false, comments: [t.comments[0]] })
+    expect(store.dropComment(t.id, t.comments[0].id, true)).toBe(true)
+    expect(store.getSnapshot().threads).toEqual([])
   })
 
   it('replaces an edited comment in place and counts pending comments', () => {

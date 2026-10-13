@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { DraftStore, INTERRUPTED, draftKey, draftStoreFor, type DraftStorage, type DraftTarget } from './drafts'
+import { DraftStore, INTERRUPTED, draftKey, draftStoreFor, lostDrafts, type DraftStorage, type DraftTarget } from './drafts'
+import { mkThread } from './test-fixtures'
 
 class FakeStorage implements DraftStorage {
   readonly items = new Map<string, string>()
@@ -35,8 +36,8 @@ describe('draftKey', () => {
     expect(draftKey(FILE)).toBe('file:src/a:b.ts')
     expect(draftKey(LINES)).toBe('lines:RIGHT:3-5:src/a.ts')
     expect(draftKey({ ...LINES, startLine: null })).toBe('lines:RIGHT:-5:src/a.ts')
-    expect(draftKey({ kind: 'reply', threadId: 'T1' })).toBe('reply:T1')
-    expect(draftKey({ kind: 'edit', threadId: 'T1', commentId: 'C1' })).toBe('edit:C1')
+    expect(draftKey({ kind: 'reply', threadId: 'T1', path: 'src/a.ts' })).toBe('reply:T1')
+    expect(draftKey({ kind: 'edit', threadId: 'T1', commentId: 'C1', path: 'src/a.ts' })).toBe('edit:C1')
     expect(draftKey({ kind: 'review' })).toBe('review')
   })
 })
@@ -70,6 +71,16 @@ describe('DraftStore', () => {
     again.close(key)
     expect(again.getSnapshot().size).toBe(0)
     expect(storage.items.size).toBe(0)
+  })
+
+  it('opens an edit with the text of the comment, and keeps what was typed since', () => {
+    const store = new DraftStore('s', new FakeStorage())
+    const edit = { kind: 'edit', threadId: 'T1', commentId: 'C1', path: 'src/a.ts' } as const
+    const key = store.open(edit, HEAD, 'As it was')
+    expect(store.text(key)).toBe('As it was')
+    store.setText(key, 'As it is')
+    store.open(edit, HEAD, 'As it was')
+    expect(store.text(key)).toBe('As it is')
   })
 
   it('asks a box to take focus once per open', () => {
@@ -172,6 +183,7 @@ describe('DraftStore', () => {
           'file:old': { ...ok, target: { kind: 'file', path: 'old' }, updatedAt: now - 30 * day },
           'file:other': ok,
           'lines:RIGHT:-1:x': { ...ok, target: { kind: 'lines', path: 'x', side: 'UP', startLine: null, line: 1 } },
+          'reply:T1': { ...ok, target: { kind: 'reply', threadId: 'T1' } },
           review: { target: { kind: 'review' }, text: 5, head: HEAD, updatedAt: now },
         },
       }),
@@ -193,5 +205,23 @@ describe('DraftStore', () => {
       store.setText(key, 'x')
       expect(store.text(key)).toBe('x')
     }
+  })
+})
+
+describe('lostDrafts', () => {
+  it('lists replies and edits whose thread or comment is gone, not while they are sent', async () => {
+    const store = new DraftStore('s', null)
+    const kept = mkThread({ id: 'T1' })
+    const reply = (threadId: string) => store.open({ kind: 'reply', threadId, path: 'src/a.ts' }, HEAD)
+    const edit = (commentId: string) => store.open({ kind: 'edit', threadId: 'T1', commentId, path: 'src/a.ts' }, HEAD, 'x')
+    store.open(FILE, HEAD)
+    reply('T1')
+    edit(kept.comments[0].id)
+    const goneReply = reply('T9')
+    const goneEdit = edit('C9')
+    expect(lostDrafts(store.getSnapshot(), [kept])).toEqual([goneReply, goneEdit])
+    const sending = store.send(goneReply, () => new Promise(() => {}))
+    expect(lostDrafts(store.getSnapshot(), [kept])).toEqual([goneEdit])
+    void sending
   })
 })

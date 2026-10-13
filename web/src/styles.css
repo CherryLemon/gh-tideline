@@ -133,7 +133,8 @@ kbd {
   text-decoration: none;
 }
 
-.btn:disabled {
+.btn:disabled,
+.btn[aria-disabled='true'] {
   color: var(--disabled);
   cursor: default;
 }
@@ -1144,6 +1145,47 @@ kbd {
 
 .link-btn:hover {
   text-decoration: underline;
+}
+
+.link-btn:disabled {
+  color: var(--disabled);
+  cursor: default;
+  text-decoration: none;
+}
+
+/* Edit and Delete on the viewer's own comments. */
+.comment-action {
+  font-size: 12px;
+}
+
+/* Asking before a comment is deleted. */
+.comment-confirm {
+  margin-top: 6px;
+  padding-left: 26px;
+  font-size: 12px;
+}
+
+/* Reply and resolve, under a thread's comments. */
+.thread-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 0 8px;
+  border-top: 1px solid var(--border);
+}
+
+/* A box inside a card (a reply, an edit) is part of it. */
+.thread-card .composer {
+  max-width: none;
+  box-shadow: none;
+}
+
+.comment .composer {
+  margin: 4px 0 0 26px;
+}
+
+.thread-body > .composer {
+  margin-bottom: 8px;
 }
 
 /* Lines a multi-line thread is about. */

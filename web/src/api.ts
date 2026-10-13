@@ -153,6 +153,26 @@ export interface CreatedThread {
   submitError?: string
 }
 
+export interface ReplyRequest {
+  /** The head the page shows: a reply that starts a review starts it there. */
+  head: string
+  body: string
+  mode: CommentMode
+}
+
+export interface Replied {
+  /** null when the reply was posted but GitHub didn't return it: read again. */
+  comment: ReviewComment | null
+  pendingReview: PendingReview | null
+}
+
+export interface DeletedComment {
+  /** null once the thread has no comments left (GitHub drops it). */
+  thread: ReviewThread | null
+  /** GitHub drops a pending review with its last comment. */
+  pendingReview: PendingReview | null
+}
+
 export interface ApiErrorBody {
   error: { code: string; message: string }
 }
@@ -278,7 +298,16 @@ export async function setThreadResolved(r: RepoRef, n: number, threadId: string,
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ resolved }),
   })
-  return ((await res.json()) as { thread: ReviewThread }).thread
+  return (await written<{ thread: ReviewThread }>(res)).thread
+}
+
+/** The answer to a write; one cut short (after the server did the write) is like a lost connection. */
+async function written<T>(res: Response): Promise<T> {
+  try {
+    return (await res.json()) as T
+  } catch (e) {
+    throw new ApiError(0, 'network', errorMessage(e))
+  }
 }
 
 /** Starts a review thread (see `CommentMode`). Never retried: see `findCreated`. */
@@ -288,12 +317,33 @@ export async function createThread(r: RepoRef, n: number, req: NewThreadRequest)
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(req),
   })
-  try {
-    return (await res.json()) as CreatedThread
-  } catch (e) {
-    // The answer was cut short after the server did the write: like a lost connection.
-    throw new ApiError(0, 'network', errorMessage(e))
-  }
+  return written<CreatedThread>(res)
+}
+
+/** Replies to a thread (see `CommentMode`). Never retried, like `createThread`. */
+export async function replyToThread(r: RepoRef, n: number, threadId: string, req: ReplyRequest): Promise<Replied> {
+  const res = await request(`${repoBase(r)}/pulls/${n}/threads/${seg(threadId)}/replies`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(req),
+  })
+  return written<Replied>(res)
+}
+
+/** Replaces the text of one of the viewer's comments; returns the comment as GitHub has it now. */
+export async function editComment(r: RepoRef, n: number, threadId: string, commentId: string, body: string): Promise<ReviewComment> {
+  const res = await request(`${repoBase(r)}/pulls/${n}/threads/${seg(threadId)}/comments/${seg(commentId)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ body }),
+  })
+  return (await written<{ comment: ReviewComment }>(res)).comment
+}
+
+/** Deletes one of the viewer's comments (one already gone counts as deleted). */
+export async function deleteComment(r: RepoRef, n: number, threadId: string, commentId: string): Promise<DeletedComment> {
+  const res = await request(`${repoBase(r)}/pulls/${n}/threads/${seg(threadId)}/comments/${seg(commentId)}`, { method: 'DELETE' })
+  return written<DeletedComment>(res)
 }
 
 /** Deletes the pending review `reviewId` (the one shown) with all its comments. */

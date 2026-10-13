@@ -116,13 +116,30 @@ export class ReviewStore {
     this.changed()
   }
 
-  /** A comment a write returned (a reply, or an edit) in a thread we have. */
-  applyComment(threadId: string, comment: ReviewComment): void {
+  /**
+   * A comment deleted: out of its thread, or with it (`threadGone`, it was the last one). The
+   * stored thread, not the snapshot: a resolve still on its way stays one. Whether it was there.
+   */
+  dropComment(threadId: string, commentId: string, threadGone: boolean): boolean {
     const t = this.data.threads.find((t) => t.id === threadId)
-    if (!t) return
+    if (this.disposed || !t?.comments.some((c) => c.id === commentId)) return false
+    this.applyThread(threadId, threadGone ? null : { ...t, comments: t.comments.filter((c) => c.id !== commentId) })
+    return true
+  }
+
+  /**
+   * A comment a write returned: a reply (added) or an edit (replaced; an edit of a comment
+   * deleted meanwhile doesn't bring it back). Whether the store has its thread (and, for an
+   * edit, the comment).
+   */
+  applyComment(threadId: string, comment: ReviewComment, edit = false): boolean {
+    const t = this.data.threads.find((t) => t.id === threadId)
+    if (this.disposed || !t) return false
     const at = t.comments.findIndex((c) => c.id === comment.id)
+    if (at < 0 && edit) return false
     const comments = at < 0 ? [...t.comments, comment] : t.comments.map((c, i) => (i === at ? comment : c))
     this.applyThread(threadId, { ...t, comments })
+    return true
   }
 
   /** The viewer's pending review after a write (null: none any more). */
@@ -175,7 +192,8 @@ export class ReviewStore {
         this.pump(id)
       },
       (error: unknown) => {
-        // Nothing changed on GitHub: a read sent meanwhile is still the newer version.
+        // GitHub refused (or the answer was lost, then the page reads the thread again): a read
+        // sent meanwhile is still the newer version.
         this.inflight.delete(id)
         this.intent.delete(id)
         if (this.disposed) return
@@ -193,11 +211,6 @@ export function ownCommentIds(threads: readonly ReviewThread[]): Set<string> {
   return ids
 }
 
-/**
- * After a create whose outcome is unknown (a timeout or a 502 after the request went out):
- * the viewer's comment with the same body that wasn't there before, from a fresh read.
- * Creates are never retried blindly, so this is how a duplicate is avoided.
- */
 /** Where a comment was posted: in a thread, or as a new thread on a file or on lines. */
 export type CreatedWhere =
   | { threadId: string }
@@ -210,6 +223,11 @@ function isWhere(t: ReviewThread, where: CreatedWhere): boolean {
   return where.subjectType === 'FILE' || (t.side === where.side && t.line === where.line)
 }
 
+/**
+ * After a create whose outcome is unknown (a timeout or a 502 after the request went out):
+ * the viewer's comment with the same body that wasn't there before, from a fresh read.
+ * Creates are never retried blindly, so this is how a duplicate is avoided.
+ */
 export function findCreated(
   threads: readonly ReviewThread[],
   before: ReadonlySet<string>,

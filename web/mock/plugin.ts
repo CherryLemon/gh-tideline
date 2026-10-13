@@ -55,6 +55,17 @@ export function mockApi(): Plugin {
           })
           return
         }
+        if (url.pathname === '/api/__mock/fail-next' && req.method === 'POST') {
+          void readJson(req).then((body) => {
+            const { status = 502, after = false } = (body ?? {}) as { status?: unknown; after?: unknown }
+            if (typeof status !== 'number' || !Number.isInteger(status) || typeof after !== 'boolean') {
+              return error(res, 400, 'bad_request', 'expected {status, after?}')
+            }
+            review.failNextWrite(status, after)
+            json(res, 200, { ok: true })
+          })
+          return
+        }
         if (req.headers['x-dr'] !== '1' && req.headers['sec-fetch-site'] !== 'same-origin') {
           return error(res, 401, 'unauthorized', 'missing X-DR header')
         }
@@ -89,6 +100,29 @@ export function mockApi(): Plugin {
               await delay(500)
               const r = review.createThread(pr.head.sha, (p) => data.viewed.has(p), body)
               return json(res, r.status, r.body)
+            }
+            if (sub === 'threads' && parts.length >= 7) {
+              const [threadId, part, commentId] = parts.slice(6)
+              const ok = (v: string | undefined) => v !== undefined && /^[A-Za-z0-9_=+/-]{1,128}$/.test(v)
+              if (!ok(threadId) || (part === 'comments' && !ok(commentId))) return error(res, 400, 'bad_request', 'invalid id')
+              let r: { status: number; body: unknown } | null = null
+              if (part === 'replies' && parts.length === 8 && req.method === 'POST') {
+                const body = await readJson(req)
+                await delay(500)
+                r = review.reply(pr.head.sha, threadId, body)
+              } else if (part === 'resolved' && parts.length === 8 && req.method === 'PUT') {
+                const body = await readJson(req)
+                await delay(400)
+                r = review.setResolved(pr.head.sha, threadId, body)
+              } else if (part === 'comments' && parts.length === 9 && req.method === 'PATCH') {
+                const body = await readJson(req)
+                await delay(400)
+                r = review.editComment(pr.head.sha, commentId, body)
+              } else if (part === 'comments' && parts.length === 9 && req.method === 'DELETE') {
+                await delay(400)
+                r = review.deleteComment(pr.head.sha, threadId, commentId)
+              }
+              if (r) return json(res, r.status, r.body)
             }
             if (sub === 'review' && parts.length === 6 && req.method === 'DELETE') {
               const body = await readJson(req)

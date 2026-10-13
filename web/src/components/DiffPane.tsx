@@ -64,6 +64,8 @@ export interface DiffPaneHandle {
   prevChange(): StepResult
   /** Opens a box for a comment on the lines at the caret or the selection, on the side focused last. */
   commentAtCursor(): CommentAtCursor
+  /** Focuses the editor shown (in a diff, the side focused last), or the threads panel when there is none. */
+  focus(): void
 }
 
 /** The review threads of the file shown, and how to draw them. */
@@ -326,7 +328,11 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
     [activeSide, changed, file.path, jumpTo, pendingJump, state.kind],
   )
 
-  useImperativeHandle(ref, () => ({ nextChange: () => step(1), prevChange: () => step(-1), commentAtCursor: () => commentRef.current() }), [step])
+  useImperativeHandle(
+    ref,
+    () => ({ nextChange: () => step(1), prevChange: () => step(-1), commentAtCursor: () => commentRef.current(), focus: () => focusRef.current() }),
+    [step],
+  )
 
   const handleMount = useCallback(
     (ed: DiffEditorT) => {
@@ -628,6 +634,8 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
   }
   const commentRef = useRef(commentAtCursor)
   commentRef.current = commentAtCursor
+  const focusRef = useRef(() => {})
+  const root = useRef<HTMLDivElement>(null)
 
   // Multi-line threads mark their lines.
   const ranges = useRef<{ original: Monaco.editor.IEditorDecorationsCollection; modified: Monaco.editor.IEditorDecorationsCollection } | null>(null)
@@ -682,13 +690,24 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
   // The attached content may be stale at the new head of a provisional file: show neither editor.
   const showEditor = !provisional && (state.kind === 'text' || (state.kind === 'loading' && attached === 'diff'))
   const showSingle = !provisional && (state.kind === 'single' || (state.kind === 'loading' && attached === 'single'))
+  focusRef.current = () => {
+    const ed = editorRef.current
+    if (showSingle) singleRef.current?.focus()
+    else if (showEditor && ed) (sideBySide && lastSide.current === 'original' ? ed.getOriginalEditor() : ed.getModifiedEditor()).focus()
+    // No editor (an image, a binary file): the threads panel, else the file header.
+    else {
+      const find = (selector: string) => root.current?.querySelector<HTMLElement>(selector)
+      const el = find('.pane-threads-head') ?? find('.file-header :is(button, input, a[href])')
+      el?.focus({ preventScroll: true })
+    }
+  }
   const overlay = renderOverlay(state, file, {
     load: () => setForced((s) => new Set(s).add(file.path)),
     retry: () => setRetry((n) => n + 1),
   })
 
   return (
-    <div className="diff-pane">
+    <div ref={root} className="diff-pane">
       <FileHeader
         file={file}
         plainReason={state.kind === 'text' || state.kind === 'single' ? state.plainReason : null}

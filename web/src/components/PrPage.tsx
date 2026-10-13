@@ -1,19 +1,24 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import {
   ApiError,
   STALE_HEAD_MESSAGE,
   createThread,
+  deleteComment,
+  editComment,
   getPr,
   getPrFiles,
   getPrTree,
   getThreads,
   errorMessage,
+  replyToThread,
   setThreadResolved,
   setViewed,
   type ChangedFile,
   type CommentMode,
   type PrSummary,
   type RepoRef,
+  type ReplyRequest,
+  type ReviewComment,
   type ReviewThread,
   type TreeEntry,
   type ViewedState,
@@ -34,13 +39,14 @@ import { usePersistentState } from '../storage'
 import { ViewedSync, isTypingTarget, nextUnviewed, viewedMap } from '../viewed'
 import { fileCounts, threadsForFile, type DraftPanelReason, type LineAnchor, type LineDraft, type PanelReason } from '../threads'
 import { useReview, type ReviewRead } from '../useReview'
-import { draftKey, draftStoreFor, type DraftTarget } from '../drafts'
-import { postThread, threadRequest } from '../compose'
+import { boxText, draftKey, draftStoreFor, editKey, lostDrafts, replyKey, type DraftTarget, type DraftView } from '../drafts'
+import { postDelete, postReply, postThread, threadRequest, type ReadDeps } from '../compose'
+import type { ReviewStore } from '../review'
 import { DiffPane, type ChangeInfo, type DiffPaneHandle, type PaneReview, type PendingJump } from './DiffPane'
 import { FileTree, type ListingState, type TreeScope } from './FileTree'
 import { FileFinder } from './FileFinder'
 import { Toast, type ToastMessage } from './Toast'
-import { ThreadCard, anchorLines } from './ThreadCard'
+import { ThreadActionsContext, ThreadCard, anchorLines, type ThreadActions } from './ThreadCard'
 import { Composer } from './Composer'
 
 interface Props {
@@ -287,7 +293,7 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
   )
   const retryReview = review.retry
   useEffect(() => {
-    if (review.error) showToast(`Couldn't load the review comments: ${review.error.message}`, { label: 'Retry', run: retryReview })
+    if (review.error && !review.error.quiet) showToast(`Couldn't load the review comments: ${review.error.message}`, { label: 'Retry', run: retryReview })
   }, [review.error, retryReview, showToast])
 
   // Open comment boxes, per pull request; a box's text survives file switches and reloads.
@@ -297,38 +303,89 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
   useLayoutEffect(() => {
     writing.current = { store: review.store, retry: retryReview, head }
   })
-  /** Sends the draft `key` of a new thread. */
-  const sendThread = useCallback(
-    (key: string, mode: CommentMode) => {
+  /** What a write needs to read the threads again, for the review store `store`. */
+  const readDeps = useCallback(
+    (store: ReviewStore, retry: () => void): ReadDeps => ({
+      store,
+      read: () => getThreads(repo, pr.number),
+      reread: retry,
+      settle: (attempt) => new Promise((r) => setTimeout(r, attempt === 0 ? 1000 : 3000)),
+    }),
+    [repo, pr.number],
+  )
+  /**
+   * Sends the draft `key` with `post` (given the page's head), keeping the box with the error
+   * when it fails; a refusal that says the page is out of date says how to catch up.
+   */
+  const sendDraft = useCallback(
+    (key: string, post: (body: string, draft: DraftView, deps: ReadDeps, head: string) => Promise<void>) => {
       void drafts.send(key, async (body, draft) => {
         const { store, retry, head } = writing.current
         if (!store) throw new Error("The review comments haven't loaded yet")
-        const req = threadRequest(draft, head, body, mode)
-        if (!req) throw new Error('This box does not start a thread')
         try {
-          const posted = await postThread(
-            {
-              store,
-              create: (r) => createThread(repo, pr.number, r),
-              read: () => getThreads(repo, pr.number),
-              reread: retry,
-              settle: (attempt) => new Promise((r) => setTimeout(r, attempt === 0 ? 1000 : 3000)),
-            },
-            req,
-          )
-          if (posted.submitError) {
-            showToast(`Your comment was added to a pending review, but posting the review failed: ${posted.submitError}`)
-          }
+          await post(body, draft, readDeps(store, retry), head)
         } catch (e) {
           if (e instanceof ApiError && e.code === 'stale_head') showToast(e.message, { label: 'Refresh', run: onRefresh })
-          // The page's idea of the pending review is out of date: read it again, so the box
-          // offers what GitHub takes.
-          if (e instanceof ApiError && (e.code === 'pending_review_exists' || e.code === 'review_changed')) retry()
+          // The page's idea of the pending review is out of date, or the thread is gone: read
+          // again, so the box offers what GitHub takes (or shows as lost).
+          if (e instanceof ApiError && (e.code === 'pending_review_exists' || e.code === 'review_changed' || e.code === 'not_found')) retry()
           throw e
         }
       })
     },
-    [drafts, repo, pr.number, showToast, onRefresh],
+    [drafts, readDeps, showToast, onRefresh],
+  )
+  /** Sends the draft `key` of a new thread. */
+  const sendThread = useCallback(
+    (key: string, mode: CommentMode) =>
+      sendDraft(key, async (body, draft, deps, head) => {
+        const req = threadRequest(draft, head, body, mode)
+        if (!req) throw new Error('This box does not start a thread')
+        const posted = await postThread({ ...deps, create: (r) => createThread(repo, pr.number, r) }, req)
+        if (posted.submitError) {
+          showToast(`Your comment was added to a pending review, but posting the review failed: ${posted.submitError}`)
+        }
+      }),
+    [sendDraft, repo, pr.number, showToast],
+  )
+  const sendReply = useCallback(
+    (key: string, mode: CommentMode) =>
+      sendDraft(key, async (body, draft, deps, head) => {
+        if (draft.target.kind !== 'reply') throw new Error('This box does not reply to a thread')
+        const reply = (threadId: string, req: ReplyRequest) => replyToThread(repo, pr.number, threadId, req)
+        await postReply({ ...deps, reply }, draft.target.threadId, { head, body, mode })
+      }),
+    [sendDraft, repo, pr.number],
+  )
+  const saveEdit = useCallback(
+    (key: string) =>
+      sendDraft(key, async (body, draft, deps) => {
+        const t = draft.target
+        if (t.kind !== 'edit') throw new Error('This box does not edit a comment')
+        const comment = await editComment(repo, pr.number, t.threadId, t.commentId, body)
+        if (!deps.store.applyComment(t.threadId, comment, true)) deps.reread()
+      }),
+    [sendDraft, repo, pr.number],
+  )
+  const removeComment = useCallback(
+    async (threadId: string, commentId: string) => {
+      const { store, retry } = writing.current
+      if (!store) return null
+      const gone = (threadGone: boolean) => {
+        drafts.close(editKey(commentId))
+        // GitHub dropped the thread with its last comment: an empty reply box goes with it, one
+        // with text (or on its way) stays, lost, so the text isn't.
+        const reply = replyKey(threadId)
+        if (threadGone && !drafts.getSnapshot().get(reply)?.sending && drafts.text(reply).trim() === '') drafts.close(reply)
+      }
+      try {
+        return await postDelete({ ...readDeps(store, retry), remove: (t, c) => deleteComment(repo, pr.number, t, c), gone }, threadId, commentId)
+      } catch (e) {
+        showToast(`Couldn't delete the comment: ${errorMessage(e)}`)
+        return null
+      }
+    },
+    [drafts, readDeps, repo, pr.number, showToast],
   )
   // Leaving while a comment is sent would hide whether it was posted.
   const sendingAny = [...draftViews.values()].some((d) => d.sending)
@@ -405,7 +462,7 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
           drafts={drafts}
           draftKey={key}
           view={view}
-          pendingReview={pendingReview}
+          action={{ kind: 'comment', pendingReview, onSend: (mode) => sendThread(key, mode) }}
           locked={locked}
           label={`Comment on ${lines.toLowerCase()} of ${commentPath}`}
           heading={
@@ -424,7 +481,6 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
             ) : undefined
           }
           onKeepLines={view.head !== head ? () => drafts.setHead(key, head) : undefined}
-          onSend={(mode) => sendThread(key, mode)}
         />
       )
     },
@@ -438,15 +494,49 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
           drafts={drafts}
           draftKey={fileKey}
           view={fileDraft}
-          pendingReview={pendingReview}
+          action={{ kind: 'comment', pendingReview, onSend: (mode) => sendThread(fileKey, mode) }}
           locked={locked}
           label={`Comment on ${commentPath}`}
-          onSend={(mode) => sendThread(fileKey, mode)}
         />
       ) : undefined,
     [drafts, fileKey, fileDraft, commentPath, pendingReview, locked, sendThread],
   )
 
+  const reviewStore = review.store
+  const threadActions = useMemo<ThreadActions | null>(
+    () =>
+      reviewStore && {
+        drafts,
+        views: draftViews,
+        pendingReview,
+        locked,
+        reply: (thread) => drafts.open({ kind: 'reply', threadId: thread.id, path: thread.path }, head),
+        sendReply,
+        edit: (thread: ReviewThread, comment: ReviewComment) =>
+          drafts.open({ kind: 'edit', threadId: thread.id, commentId: comment.id, path: thread.path }, head, boxText(comment.body)),
+        saveEdit,
+        remove: removeComment,
+        setResolved: (threadId, resolved) => reviewStore.setResolved(threadId, resolved),
+        focusDiff: () => pane.current?.focus(),
+      },
+    [reviewStore, drafts, draftViews, pendingReview, locked, head, sendReply, saveEdit, removeComment],
+  )
+
+  // Reply and edit boxes whose thread or comment is gone from GitHub: their text shows above
+  // the diff of the thread's file, to copy (or discard).
+  const lost = useMemo(() => (snapshot ? lostDrafts(draftViews, snapshot.threads) : []), [snapshot, draftViews])
+  const isHere = useCallback((path: string) => current !== null && (path === current.path || changedCurrent?.oldPath === path), [current, changedCurrent])
+  const lostBoxes = useMemo(
+    () =>
+      lost.map((key) => {
+        const view = draftViews.get(key)
+        const t = view?.target
+        if (!view || (t?.kind !== 'reply' && t?.kind !== 'edit') || !isHere(t.path)) return null
+        const what = t.kind === 'reply' ? 'Your reply: the thread is no longer on GitHub' : 'Your edit: the comment is no longer on GitHub'
+        return <Composer key={key} drafts={drafts} draftKey={key} view={view} action={{ kind: 'lost' }} label={what} heading={what} />
+      }),
+    [lost, draftViews, drafts, isHere],
+  )
   const paneReview = useMemo<PaneReview | undefined>(() => {
     if (!fileThreads) return undefined
     const stale = !headOk && !settling && fileThreads.some((t) => t.subjectType === 'LINE')
@@ -454,7 +544,13 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
       threads: fileThreads,
       headOk,
       renderThread,
-      composer: fileComposer,
+      // Keyed: the pane lists it with the boxes away from their lines.
+      composer: lostBoxes.some(Boolean) || fileComposer ? (
+        <Fragment key="file-boxes">
+          {lostBoxes}
+          {fileComposer}
+        </Fragment>
+      ) : undefined,
       drafts: lineDrafts,
       renderDraft,
       onComment: commentPath === null ? undefined : onComment,
@@ -467,7 +563,7 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
         </div>
       ) : undefined,
     }
-  }, [fileThreads, headOk, settling, renderThread, fileComposer, lineDrafts, renderDraft, commentPath, onComment, onRefresh])
+  }, [fileThreads, headOk, settling, renderThread, lostBoxes, fileComposer, lineDrafts, renderDraft, commentPath, onComment, onRefresh])
 
   // Without a valid ?file=, show the first file (replace, so Back leaves the PR).
   useEffect(() => {
@@ -508,6 +604,29 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
     },
     [requested],
   )
+
+  // Says once that a box lost its thread (again if it comes back and goes again).
+  const announced = useRef(new Set<string>())
+  useEffect(() => {
+    for (const k of announced.current) if (!lost.includes(k)) announced.current.delete(k)
+    const paths: string[] = []
+    let what = ''
+    for (const k of lost) {
+      const t = draftViews.get(k)?.target
+      if (announced.current.has(k) || (t?.kind !== 'reply' && t?.kind !== 'edit')) continue
+      announced.current.add(k)
+      paths.push(t.path)
+      what = t.kind === 'reply' ? 'The thread you were replying to is' : 'The comment you were editing is'
+    }
+    if (paths.length === 0) return
+    const elsewhere = paths.find((p) => !isHere(p))
+    showToast(
+      paths.length > 1
+        ? 'Some comments you were writing are no longer on GitHub. Your text is kept above the diffs of their files.'
+        : `${what} no longer on GitHub. Your text is kept above the diff of ${paths[0]}.`,
+      elsewhere === undefined ? undefined : { label: 'Show', run: () => openFile(elsewhere) },
+    )
+  }, [lost, draftViews, isHere, openFile, showToast])
 
   const toggle = useCallback(
     (key: string) => {
@@ -712,30 +831,32 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
         <div className="splitter" onMouseDown={startResize} />
         <section className="content">
           {current ? (
-            <DiffPane
-              ref={pane}
-              repo={repo}
-              file={current}
-              provisional={provisional}
-              nextFile={nextFile}
-              sideBySide={sideBySide}
-              ignoreTrimWhitespace={ignoreWs}
-              pendingJump={pendingJump}
-              headerActions={
-                changedCurrent && (
-                  <>
-                    {fileTarget && (
-                      <button className="btn" onClick={commentOnFile} title="Comment on the whole file">
-                        Comment on file
-                      </button>
-                    )}
-                    <ViewedCheck path={changedCurrent.path} mark={marks.get(changedCurrent.path)} onToggle={toggleViewed} />
-                  </>
-                )
-              }
-              review={paneReview}
-              onChangeInfo={setChangeInfo}
-            />
+            <ThreadActionsContext.Provider value={threadActions}>
+              <DiffPane
+                ref={pane}
+                repo={repo}
+                file={current}
+                provisional={provisional}
+                nextFile={nextFile}
+                sideBySide={sideBySide}
+                ignoreTrimWhitespace={ignoreWs}
+                pendingJump={pendingJump}
+                headerActions={
+                  changedCurrent && (
+                    <>
+                      {fileTarget && (
+                        <button className="btn" onClick={commentOnFile} title="Comment on the whole file">
+                          Comment on file
+                        </button>
+                      )}
+                      <ViewedCheck path={changedCurrent.path} mark={marks.get(changedCurrent.path)} onToggle={toggleViewed} />
+                    </>
+                  )
+                }
+                review={paneReview}
+                onChangeInfo={setChangeInfo}
+              />
+            </ThreadActionsContext.Provider>
           ) : unresolved ? (
             <div className="pane-msg">
               <div className="pane-error">{unresolved.error}</div>

@@ -290,6 +290,8 @@ function dropPending(st: MockState): void {
 
 let state: MockState | null = null
 let startPending = true
+/** Test hook: the next resolve, edit or delete fails with this status (`after`: once it is done). */
+let failNext: { status: number; after: boolean } | null = null
 
 /** The review state, built on first use (the pending review starts on `head`). */
 export function reviewState(head: string): MockState {
@@ -301,6 +303,31 @@ export function reviewState(head: string): MockState {
 export function resetReview(opts: { pending?: boolean } = {}): void {
   state = null
   startPending = opts.pending ?? true
+  failNext = null
+}
+
+/**
+ * `POST /api/__mock/fail-next {status, after?}`: the next resolve, edit or delete fails that
+ * way (422 rejected, 404 not_found, others GitHub failing: 502), with `after` once it is done.
+ */
+export function failNextWrite(status: number, after = false): void {
+  failNext = { status, after }
+}
+
+const TIMED_OUT = 'GraphQL request to github.com failed: operation timed out'
+
+/** The failure `failNextWrite` asked for, once: `before` fails at once, `after` once the write is done. */
+function takeFailNext(): { before: MockResult | null; after: MockResult | null } {
+  const f = failNext
+  failNext = null
+  if (f === null) return { before: null, after: null }
+  const result =
+    f.status === 422
+      ? fail(422, 'rejected', 'GitHub refused the change')
+      : f.status === 404
+        ? fail(404, 'not_found', 'not found')
+        : fail(502, 'github_error', TIMED_OUT)
+  return f.after ? { before: null, after: result } : { before: result, after: null }
 }
 
 export function threadsResponse(head: string): {
@@ -396,7 +423,7 @@ export function createThread(head: string, listed: (path: string) => boolean, ra
     return fail(409, 'stale_head', 'the pull request has new commits; refresh before commenting')
   }
   if (how === '422') return fail(422, 'rejected', subjectType === 'FILE' ? 'GitHub did not take a comment on this file' : LINE_REJECTED)
-  if (how === '502') return fail(502, 'github_error', 'GraphQL request to github.com failed: operation timed out')
+  if (how === '502') return fail(502, 'github_error', TIMED_OUT)
 
   // A single comment on a file is added to a review and then submitted (comments on lines go in
   // one call): `/fail submit` leaves that review pending.
@@ -426,7 +453,7 @@ export function createThread(head: string, listed: (path: string) => boolean, ra
     comments: [comment],
   }
   st.threads.push(thread)
-  if (how === '502-after') return fail(502, 'github_error', 'GraphQL request to github.com failed: operation timed out')
+  if (how === '502-after') return fail(502, 'github_error', TIMED_OUT)
   return {
     status: 200,
     body: {
@@ -448,4 +475,116 @@ export function discardReview(head: string, raw: unknown): MockResult {
   st.pendingReview = null
   dropPending(st)
   return { status: 200, body: { pendingReview: null } }
+}
+
+const REPLY_FIELDS = new Set(['head', 'body', 'mode'])
+const goneThread = () => fail(404, 'not_found', 'this thread is no longer on GitHub; refresh to see the rest')
+const goneComment = () => fail(404, 'not_found', 'this comment is no longer on GitHub; refresh to see the rest')
+
+function checkBody(body: unknown): MockResult | null {
+  if (typeof body !== 'string') return fail(400, 'bad_request', 'invalid request body')
+  if (body.trim() === '') return fail(400, 'bad_request', 'the comment is empty')
+  if ([...body].length > 65536) return fail(400, 'bad_request', 'the comment is longer than 65536 characters')
+  return null
+}
+
+/** `POST /threads/{t}/replies`, checked like the server does (a reply has no lines). */
+export function reply(head: string, threadId: string, raw: unknown): MockResult {
+  if (!raw || typeof raw !== 'object') return fail(400, 'bad_request', 'invalid request body')
+  const req = raw as Record<string, unknown>
+  const unknown = Object.keys(req).find((k) => !REPLY_FIELDS.has(k))
+  if (unknown) return fail(400, 'bad_request', `invalid request body: unknown field \`${unknown}\``)
+  const { body, mode } = req
+  if (typeof req.head !== 'string' || !/^[0-9a-f]{40}$/.test(req.head)) return fail(400, 'bad_request', 'head must be 40 lowercase hex characters')
+  if (mode !== 'single' && mode !== 'review') return fail(400, 'bad_request', 'invalid request body')
+  const bad = checkBody(body)
+  if (bad) return bad
+  const text = body as string
+
+  const st = reviewState(head)
+  if (mode === 'single' && st.pendingReview) {
+    return fail(409, 'pending_review_exists', 'you have a pending review: add the comment to it, or submit or discard it first')
+  }
+  const how = injected(text)
+  if (how === '409' || (!st.pendingReview && req.head !== head)) {
+    return fail(409, 'stale_head', 'the pull request has new commits; refresh before commenting')
+  }
+  const thread = st.threads.find((t) => t.id === threadId)
+  if (!thread) return goneThread()
+  if (how === '422') return fail(422, 'rejected', 'GitHub refused the reply')
+  if (how === '502') return fail(502, 'github_error', TIMED_OUT)
+
+  const pending = mode === 'review'
+  const review = pending ? (st.pendingReview ?? startReview(st, head)) : null
+  const comment = { ...newComment(st, text, review?.id ?? `PRR_mock_new${st.nextId++}`, pending), replyTo: thread.comments[0]?.id ?? null }
+  thread.comments.push(comment)
+  if (how === '502-after') return fail(502, 'github_error', TIMED_OUT)
+  return { status: 200, body: { comment, pendingReview: st.pendingReview } }
+}
+
+/** `PUT /threads/{t}/resolved {resolved}`. */
+export function setResolved(head: string, threadId: string, raw: unknown): MockResult {
+  const resolved = (raw as { resolved?: unknown } | null)?.resolved
+  if (typeof resolved !== 'boolean' || Object.keys(raw as object).length !== 1) return fail(400, 'bad_request', 'expected {resolved}')
+  const failed = takeFailNext()
+  if (failed.before) return failed.before
+  const thread = reviewState(head).threads.find((t) => t.id === threadId)
+  if (!thread) return goneThread()
+  Object.assign(thread, {
+    isResolved: resolved,
+    isCollapsed: resolved,
+    resolvedBy: resolved ? VIEWER : null,
+    viewerCanResolve: !resolved,
+    viewerCanUnresolve: resolved,
+  })
+  return failed.after ?? { status: 200, body: { thread } }
+}
+
+/**
+ * `PATCH /threads/{t}/comments/{c} {body}`; GitHub marks only submitted comments edited. The
+ * comment is found by its id alone, as on GitHub.
+ */
+export function editComment(head: string, commentId: string, raw: unknown): MockResult {
+  const body = (raw as { body?: unknown } | null)?.body
+  if (Object.keys((raw as object | null) ?? {}).some((k) => k !== 'body')) return fail(400, 'bad_request', 'expected {body}')
+  const bad = checkBody(body)
+  if (bad) return bad
+  const text = body as string
+  const failed = takeFailNext()
+  if (failed.before) return failed.before
+  const how = injected(text)
+  if (how === '422') return fail(422, 'rejected', 'GitHub refused the change')
+  if (how === '502') return fail(502, 'github_error', TIMED_OUT)
+  const comment = reviewState(head)
+    .threads.flatMap((t) => t.comments)
+    .find((c) => c.id === commentId)
+  if (!comment) return goneComment()
+  Object.assign(comment, {
+    body: text,
+    bodyHtml: renderBody(text),
+    lastEditedAt: comment.state === 'SUBMITTED' ? new Date().toISOString().replace(/\.\d+Z$/, 'Z') : comment.lastEditedAt,
+  })
+  if (how === '502-after') return fail(502, 'github_error', TIMED_OUT)
+  return failed.after ?? { status: 200, body: { comment } }
+}
+
+/**
+ * `DELETE /threads/{t}/comments/{c}`: one gone already counts as deleted. A thread goes with
+ * its last comment, and the pending review with its last pending comment.
+ */
+export function deleteComment(head: string, threadId: string, commentId: string): MockResult {
+  const failed = takeFailNext()
+  if (failed.before) return failed.before
+  const st = reviewState(head)
+  const thread = st.threads.find((t) => t.id === threadId)
+  const comment = thread?.comments.find((c) => c.id === commentId)
+  if (thread && comment) {
+    thread.comments = thread.comments.filter((c) => c !== comment)
+    if (thread.comments.length === 0) st.threads = st.threads.filter((t) => t !== thread)
+    if (comment.state === 'PENDING' && !st.threads.some((t) => t.comments.some((c) => c.state === 'PENDING'))) st.pendingReview = null
+  }
+  // As the server says when reading the thread back fails.
+  if (failed.after) return fail(502, 'github_error', `the comment was deleted, but reading its thread back failed: ${TIMED_OUT}`)
+  const left = st.threads.find((t) => t.id === threadId) ?? null
+  return { status: 200, body: { thread: left, pendingReview: st.pendingReview } }
 }
