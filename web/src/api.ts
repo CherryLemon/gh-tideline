@@ -242,6 +242,16 @@ export async function getThreads(r: RepoRef, n: number, signal?: AbortSignal): P
   return (await res.json()) as ReviewThreads
 }
 
+/** Resolves (`resolved`) or unresolves a thread; returns it as GitHub has it afterwards. */
+export async function setThreadResolved(r: RepoRef, n: number, threadId: string, resolved: boolean): Promise<ReviewThread> {
+  const res = await request(`${repoBase(r)}/pulls/${n}/threads/${seg(threadId)}/resolved`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ resolved }),
+  })
+  return ((await res.json()) as { thread: ReviewThread }).thread
+}
+
 /** Raw blob response; the caller decides whether to read the body (see Content-Length checks). */
 export function getBlob(r: RepoRef, oid: string, signal?: AbortSignal): Promise<Response> {
   return request(`${repoBase(r)}/blobs/${oid}`, { signal })

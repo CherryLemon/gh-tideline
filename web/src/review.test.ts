@@ -131,6 +131,25 @@ describe('ReviewStore rebase and writes', () => {
     expect(thread(t.id)!.isResolved).toBe(true)
   })
 
+  it('takes the lines of a new head under a resolve in flight', () => {
+    const t = mkThread({ line: 12 })
+    const { store, thread } = setup([t])
+    store.setResolved(t.id, true)
+    store.rebase({ head: 'h2', locked: false, pendingReview: null, threads: [{ ...t, line: 20 }] }, performance.now())
+    expect(thread(t.id)).toMatchObject({ line: 20, isResolved: true })
+  })
+
+  it('takes a read sent before a resolve failed', async () => {
+    const t = mkThread({ line: 12 })
+    const { store, calls, thread, settle } = setup([t])
+    store.setResolved(t.id, true)
+    const sentAt = performance.now()
+    calls[0].reject(new Error('nope'))
+    await settle()
+    store.rebase({ head: 'h2', locked: false, pendingReview: null, threads: [{ ...t, line: 20 }] }, sentAt)
+    expect(thread(t.id)).toMatchObject({ line: 20, isResolved: false })
+  })
+
   it('replaces an edited comment in place and counts pending comments', () => {
     const t = mkThread()
     const { store } = setup([t])

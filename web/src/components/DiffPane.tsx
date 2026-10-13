@@ -1,13 +1,17 @@
-import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react'
+import { forwardRef, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { DiffEditor, Editor } from '@monaco-editor/react'
 import type * as Monaco from 'monaco-editor/editor/editor.api'
-import type { ChangedFile, RepoRef, TreeEntry } from '../api'
+import type { ChangedFile, RepoRef, ReviewThread, TreeEntry } from '../api'
 import { errorMessage } from '../api'
 import { SANDY_BEACH_THEME } from '../monaco/theme'
+import { ZoneHost } from '../monaco/zones'
 import { LIMITS, isGitlink, shortSha } from '../degrade'
 import { formatBytes, loadFile, loadUnchanged, models, prefetchFile, type LoadedFile, type SideInfo } from '../monaco/files'
+import { placeThreads, type PanelReason, type Placement } from '../threads'
 import { isChanged } from '../tree'
 import { ImageDiff, ImageView } from './ImageDiff'
+import { PaneThreads } from './PaneThreads'
 
 export interface ChangeInfo {
   /** 0-based index of the change at the caret, or null when the caret is between changes. */
@@ -32,6 +36,18 @@ export interface DiffPaneHandle {
   prevChange(): StepResult
 }
 
+/** The review threads of the file shown, and how to draw them. */
+export interface PaneReview {
+  /** The file's threads (`threadsForFile`). */
+  threads: readonly ReviewThread[]
+  /** Whether the threads were read at the head the page shows; if not, none go under lines. */
+  headOk: boolean
+  /** A thread's card; `reason` is set when it is listed above the diff instead of under its line. */
+  renderThread(thread: ReviewThread, reason?: PanelReason): React.ReactNode
+  /** Shown above the listed threads. */
+  notice?: React.ReactNode
+}
+
 interface Props {
   repo: RepoRef
   /** A changed file (diffed), or an unchanged file of the head tree (shown read-only). */
@@ -48,6 +64,8 @@ interface Props {
   pendingJump: React.MutableRefObject<PendingJump | null>
   /** Controls shown at the right end of the file header. */
   headerActions?: React.ReactNode
+  /** Absent while the threads haven't been read. */
+  review?: PaneReview
   onChangeInfo(info: ChangeInfo | null): void
 }
 
@@ -101,11 +119,12 @@ function endLine(c: Monaco.editor.ILineChange, side: 'original' | 'modified'): n
 }
 
 export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
-  { repo, file, provisional = false, nextFile, sideBySide, ignoreTrimWhitespace, pendingJump, headerActions, onChangeInfo },
+  { repo, file, provisional = false, nextFile, sideBySide, ignoreTrimWhitespace, pendingJump, headerActions, review, onChangeInfo },
   ref,
 ) {
   const editorRef = useRef<DiffEditorT | null>(null)
-  const [editorReady, setEditorReady] = useState(false)
+  const [diffEditor, setDiffEditor] = useState<DiffEditorT | null>(null)
+  const editorReady = diffEditor !== null
   const changed = isChanged(file) ? file : null
   // The plain editor is mounted on the first unchanged file and kept afterwards.
   const singleRef = useRef<EditorT | null>(null)
@@ -127,7 +146,8 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
 
   /** Path whose models are currently attached to the editor. */
   const shownPath = useRef<string | null>(null)
-  const viewStates = useRef(new Map<string, Monaco.editor.IDiffEditorViewState>())
+  /** Per path: its view state, and whether the user had moved the caret in it (see `fresh`). */
+  const viewStates = useRef(new Map<string, { view: Monaco.editor.IDiffEditorViewState; fresh: boolean }>())
   /** As above, for the plain editor. */
   const singlePath = useRef<string | null>(null)
   const singleViewStates = useRef(new Map<string, Monaco.editor.ICodeEditorViewState>())
@@ -137,6 +157,10 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
   const fresh = useRef(true)
   const onChangeInfoRef = useRef(onChangeInfo)
   onChangeInfoRef.current = onChangeInfo
+  /** The thread cards in the diff editor. */
+  const [host, setHost] = useState<ZoneHost | null>(null)
+  /** Bumped when the diff editor has a new diff, so the cards are placed against it. */
+  const [diffTick, setDiffTick] = useState(0)
 
   const options = useMemo<Monaco.editor.IDiffEditorConstructionOptions>(
     () => ({
@@ -251,6 +275,7 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
       ed.onDidUpdateDiff(() => {
         if (!ed.getLineChanges()) return
         if (!consumeRef.current()) reportRef.current()
+        setDiffTick((t) => t + 1)
       })
       const onCursor = (e: Monaco.editor.ICursorPositionChangedEvent) => {
         if (e.source === 'mouse' || e.source === 'keyboard') {
@@ -261,7 +286,7 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
       }
       ed.getModifiedEditor().onDidChangeCursorPosition(onCursor)
       ed.getOriginalEditor().onDidChangeCursorPosition(onCursor)
-      setEditorReady(true)
+      setDiffEditor(ed)
     },
     [],
   )
@@ -270,6 +295,16 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
   consumeRef.current = consumePendingJump
   const reportRef = useRef(reportChangeInfo)
   reportRef.current = reportChangeInfo
+
+  useEffect(() => {
+    if (!diffEditor) return
+    const h = new ZoneHost(diffEditor)
+    setHost(h)
+    return () => {
+      h.dispose()
+      setHost(null)
+    }
+  }, [diffEditor])
 
   const handleSingleMount = useCallback((ed: EditorT) => {
     singleRef.current = ed
@@ -284,7 +319,7 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
     if (!ed) return
     if (shownPath.current !== null && ed.getModel()) {
       const vs = ed.saveViewState()
-      if (vs) viewStates.current.set(shownPath.current, vs)
+      if (vs) viewStates.current.set(shownPath.current, { view: vs, fresh: fresh.current })
     }
     shownPath.current = null
     ed.setModel(null)
@@ -363,7 +398,7 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
           // Includes the same path (refresh, retry): its scroll position is the one to keep.
           if (prevPath !== null && current) {
             const vs = ed.saveViewState()
-            if (vs) viewStates.current.set(prevPath, vs)
+            if (vs) viewStates.current.set(prevPath, { view: vs, fresh: fresh.current })
           }
           // Set before setModel so a synchronously delivered diff update already sees the new path.
           shownPath.current = file.path
@@ -377,9 +412,10 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
           res.release()
           if (!(unchanged && prevPath === file.path)) {
             navIndex.current = null
-            const vs = viewStates.current.get(file.path)
-            fresh.current = !vs
-            if (vs) ed.restoreViewState(vs)
+            const saved = viewStates.current.get(file.path)
+            // The cards put the caret on the first change; F7 still goes there first.
+            fresh.current = !saved || saved.fresh
+            if (saved) ed.restoreViewState(saved.view)
             else ed.getModifiedEditor().setScrollTop(0)
           }
           setAttachedForced(res.forced)
@@ -401,6 +437,75 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
     // `nextFile` is read only for prefetching after a load; changing it must not reload.
   }, [ready, repo, file, provisional, isForced, retry])
 
+  // Threads go under their lines when the file is shown as a text diff, else above it. While
+  // another file loads there are none; while this one reloads (Refresh, retry) they stay put.
+  const oldPath = changed?.oldPath !== undefined && changed.oldPath !== changed.path ? changed.oldPath : undefined
+  const threads = review?.threads
+  const headOk = review?.headOk ?? true
+  const lastPlaced = useRef<{ path: string; placement: Placement } | null>(null)
+  const placed = useMemo<{ path: string; placement: Placement } | null>(() => {
+    if (!threads) return null
+    if (state.kind === 'loading') return lastPlaced.current?.path === file.path ? lastPlaced.current : null
+    const ed = editorRef.current
+    const model = state.kind === 'text' && attached === 'diff' ? ed?.getModel() : null
+    const lineChanges = model ? (ed?.getLineChanges() ?? null) : null
+    // The new content of a reloaded file is shown before its diff is computed.
+    if (model && !lineChanges && lastPlaced.current?.path === file.path) return lastPlaced.current
+    const placement = placeThreads({
+      threads,
+      oldPath,
+      view: model ? (sideBySide ? 'split' : 'unified') : null,
+      lineChanges,
+      lineCounts: { original: model?.original.getLineCount() ?? 0, modified: model?.modified.getLineCount() ?? 0 },
+      headOk,
+    })
+    return { path: file.path, placement }
+    // `diffTick` stands for the editor's diff, read above.
+  }, [threads, file.path, oldPath, state.kind, attached, sideBySide, headOk, diffTick])
+  const placement = placed?.placement ?? null
+
+  useLayoutEffect(() => {
+    lastPlaced.current = placed
+    if (!host) return
+    const specs = (placement?.zones ?? []).map((z) => ({
+      key: z.thread.id,
+      editor: z.editor,
+      afterLine: z.afterLine,
+      ordinal: z.ordinal,
+      reveal: z.reveal,
+    }))
+    // Unfolding moves the caret; in a file the user hasn't moved in, leave it on the first change.
+    const first = editorRef.current?.getLineChanges()?.[0]
+    host.sync(specs, fresh.current ? (first ? anchor(first, 'modified') : 1) : 'keep')
+  }, [placed, placement, host])
+
+  // Multi-line threads mark their lines.
+  const ranges = useRef<{ original: Monaco.editor.IEditorDecorationsCollection; modified: Monaco.editor.IEditorDecorationsCollection } | null>(null)
+  useEffect(() => {
+    const ed = editorRef.current
+    if (!ed) return
+    ranges.current ??= {
+      original: ed.getOriginalEditor().createDecorationsCollection(),
+      modified: ed.getModifiedEditor().createDecorationsCollection(),
+    }
+    for (const side of ['original', 'modified'] as const) {
+      const marks: Monaco.editor.IModelDeltaDecoration[] = []
+      for (const z of placement?.zones ?? []) {
+        if (z.editor !== side || !z.highlight || z.thread.isResolved) continue
+        marks.push({
+          range: { startLineNumber: z.highlight.from, startColumn: 1, endLineNumber: z.highlight.to, endColumn: 1 },
+          options: { isWholeLine: true, className: 'tl-thread-range' },
+        })
+      }
+      ranges.current[side].set(marks)
+    }
+  }, [placement])
+
+  const cards =
+    review && host && placement
+      ? placement.zones.map((z) => createPortal(review.renderThread(z.thread), host.node(z.thread.id), z.thread.id))
+      : null
+
   // The attached content may be stale at the new head of a provisional file: show neither editor.
   const showEditor = !provisional && (state.kind === 'text' || (state.kind === 'loading' && attached === 'diff'))
   const showSingle = !provisional && (state.kind === 'single' || (state.kind === 'loading' && attached === 'single'))
@@ -416,6 +521,7 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
         plainReason={state.kind === 'text' || state.kind === 'single' ? state.plainReason : null}
         actions={headerActions}
       />
+      {review && placement && <PaneThreads items={placement.panel} renderThread={review.renderThread} notice={review.notice} />}
       <div className="diff-body">
         {singleWanted && (
           <div className={`diff-editor single-editor${showSingle ? '' : ' is-hidden'}`} data-testid="single-editor">
@@ -440,6 +546,7 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
         </div>
         {overlay}
       </div>
+      {cards}
     </div>
   )
 })

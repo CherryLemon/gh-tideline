@@ -21,10 +21,11 @@ export interface ReviewSnapshot {
 const PENDING_KEY = ' pending'
 
 /**
- * One instance lives as long as the page shows one head. Writes report what GitHub returned
- * through the `apply*` methods; full reads go through `rebase`, which keeps anything a write
- * changed after that read was requested. Resolve is optimistic with at most one request in
- * flight per thread (the latest intent wins; a failure rolls back), like `ViewedSync`.
+ * One instance lives as long as the page; reads of every head go through `rebase`. Writes
+ * report what GitHub returned through the `apply*` methods; `rebase` keeps anything a write
+ * changed after that read was requested (GitHub's answer to the write is the newer one, at
+ * whatever head). Resolve is optimistic with at most one request in flight per thread (the
+ * latest intent wins; a failure rolls back), like `ViewedSync`: an overlay on the threads.
  */
 export class ReviewStore {
   private data: ReviewThreads
@@ -75,26 +76,25 @@ export class ReviewStore {
 
   /**
    * Takes a full read requested at `requestedAt` (`performance.now()`). Threads (and the
-   * pending review) that a write changed after the read was sent, or that have a resolve
-   * queued or in flight, keep their local version: the read may predate the write. A read
-   * requested before one already taken is ignored.
+   * pending review) that a write changed after the read was sent keep their local version:
+   * the read may predate the write. Resolve intents stay on top of the read's version (its
+   * lines may be for a new head). A read requested before one already taken is ignored.
    */
   rebase(next: ReviewThreads, requestedAt: number): void {
     if (this.disposed || requestedAt < this.rebasedAt) return
     this.rebasedAt = requestedAt
     const newer = (id: string) => (this.settled.get(id) ?? -Infinity) >= requestedAt
-    const keep = (id: string) => newer(id) || this.inflight.has(id) || this.intent.has(id)
     const local = new Map(this.data.threads.map((t) => [t.id, t]))
     const threads: ReviewThread[] = []
     const seen = new Set<string>()
     for (const t of next.threads) {
       seen.add(t.id)
-      if (!keep(t.id)) threads.push(t)
+      if (!newer(t.id)) threads.push(t)
       else if (local.has(t.id)) threads.push(local.get(t.id)!)
       // Deleted by a write after the read was sent.
     }
     // Created by a write after the read was sent.
-    for (const t of this.data.threads) if (!seen.has(t.id) && keep(t.id)) threads.push(t)
+    for (const t of this.data.threads) if (!seen.has(t.id) && newer(t.id)) threads.push(t)
     for (const id of this.intent.keys()) if (!threads.some((t) => t.id === id)) this.intent.delete(id)
     this.data = {
       head: next.head,
@@ -175,8 +175,8 @@ export class ReviewStore {
         this.pump(id)
       },
       (error: unknown) => {
+        // Nothing changed on GitHub: a read sent meanwhile is still the newer version.
         this.inflight.delete(id)
-        this.settled.set(id, performance.now())
         this.intent.delete(id)
         if (this.disposed) return
         this.changed()

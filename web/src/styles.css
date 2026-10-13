@@ -940,6 +940,398 @@ kbd {
   font-weight: 600;
 }
 
+/* Review threads -------------------------------------------------------------------------- */
+
+/* A card's overlay widget in the diff editor (`monaco/zones.ts`); its view zone keeps the room. */
+.tl-zone {
+  position: absolute;
+  padding: 4px 16px 6px 6px;
+  font: 13px/1.45 var(--ui-font);
+  color: var(--fg);
+  white-space: normal;
+  user-select: text;
+  -webkit-user-select: text;
+  cursor: auto;
+}
+
+.tl-card {
+  max-width: 880px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: #fffdf8;
+  box-shadow: 0 1px 3px rgb(93 74 47 / 8%);
+  font: 13px/1.45 var(--ui-font);
+  color: var(--fg);
+  overflow: hidden;
+}
+
+.thread-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  min-height: 28px;
+  padding: 3px 8px;
+  border: 0;
+  background: none;
+  color: var(--fg);
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.thread-head:hover {
+  background: var(--highlight);
+}
+
+.thread-card:not(.is-collapsed) .thread-head {
+  border-bottom: 1px solid var(--border);
+}
+
+.thread-card.is-resolved .thread-head {
+  color: var(--text);
+}
+
+.thread-caret {
+  width: 10px;
+  flex: none;
+  color: var(--text);
+}
+
+.thread-lines,
+.thread-path {
+  flex: none;
+  font-family: var(--code-font);
+  font-size: 12px;
+}
+
+.thread-path {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: 0 1 auto;
+}
+
+.thread-preview {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+}
+
+.thread-count {
+  flex: none;
+  font-size: 12px;
+}
+
+.thread-body {
+  padding: 0 10px;
+}
+
+.thread-hunk {
+  margin: 8px 0 0;
+  padding: 4px 0;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  background: var(--contrast);
+  font: 12px/1.5 var(--code-font);
+  color: var(--syn-variables);
+  overflow-x: auto;
+}
+
+.thread-hunk > div {
+  padding: 0 8px;
+  white-space: pre;
+}
+
+.thread-hunk .hunk-add {
+  background: #91b85926;
+}
+
+.thread-hunk .hunk-del {
+  background: #e5393520;
+}
+
+.comment {
+  padding: 8px 0;
+}
+
+.comment + .comment {
+  border-top: 1px solid var(--border);
+}
+
+.comment-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+}
+
+.comment-author {
+  font-weight: 600;
+  color: var(--syn-variables);
+}
+
+.comment-time {
+  color: var(--text);
+}
+
+.comment-body,
+.comment-hidden {
+  margin-top: 4px;
+  padding-left: 26px;
+}
+
+.comment-hidden {
+  font-size: 12px;
+}
+
+.avatar {
+  width: 20px;
+  height: 20px;
+  flex: none;
+  border-radius: 50%;
+}
+
+.avatar-letter {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--buttons);
+  color: #5d4a2f;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.chip-pending {
+  background: #53c7f026;
+  color: #1f7fa3;
+}
+
+.link-btn {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--syn-links);
+  font: inherit;
+  cursor: pointer;
+}
+
+.link-btn:hover {
+  text-decoration: underline;
+}
+
+/* Lines a multi-line thread is about. */
+.monaco-editor .tl-thread-range {
+  background: #53c7f01a;
+}
+
+/* Comments without a line in the diff, above it. */
+.pane-threads {
+  display: flex;
+  flex-direction: column;
+  flex: none;
+  max-height: 45%;
+  border-bottom: 1px solid var(--line);
+  background: var(--second-bg);
+}
+
+.pane-threads-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+  width: 100%;
+  height: 26px;
+  padding: 0 10px;
+  border: 0;
+  background: none;
+  color: var(--fg);
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.pane-threads-head:hover {
+  background: var(--highlight);
+}
+
+.pane-threads-notice {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: none;
+  padding: 4px 10px;
+  background: #f6a4341f;
+  color: #a86a12;
+  font-size: 12px;
+}
+
+.pane-threads-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+  padding: 0 10px 8px;
+  overflow: auto;
+}
+
+/* GitHub-rendered markdown (`SafeHtml`). */
+.tl-md {
+  overflow-wrap: anywhere;
+  color: var(--fg);
+}
+
+.tl-md > :first-child {
+  margin-top: 0;
+}
+
+.tl-md > :last-child {
+  margin-bottom: 0;
+}
+
+.tl-md p,
+.tl-md ul,
+.tl-md ol,
+.tl-md pre,
+.tl-md blockquote,
+.tl-md table,
+.tl-md details,
+.tl-md .markdown-alert {
+  margin: 0 0 8px;
+}
+
+.tl-md h1,
+.tl-md h2,
+.tl-md h3,
+.tl-md h4,
+.tl-md h5,
+.tl-md h6 {
+  margin: 10px 0 6px;
+  color: var(--syn-variables);
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.tl-md h1 {
+  font-size: 16px;
+}
+
+.tl-md ul,
+.tl-md ol {
+  padding-left: 22px;
+}
+
+.tl-md code {
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: var(--second-bg);
+  font-size: 12px;
+}
+
+.tl-md pre {
+  padding: 8px 10px;
+  border-radius: 4px;
+  background: var(--second-bg);
+  overflow-x: auto;
+}
+
+.tl-md pre code {
+  padding: 0;
+  background: none;
+}
+
+.tl-md blockquote {
+  padding: 0 10px;
+  border-left: 3px solid var(--line);
+  color: var(--text);
+}
+
+.tl-md img {
+  max-width: 100%;
+}
+
+.tl-md table {
+  border-collapse: collapse;
+}
+
+.tl-md th,
+.tl-md td {
+  padding: 3px 8px;
+  border: 1px solid var(--line);
+}
+
+.tl-md hr {
+  border: 0;
+  border-top: 1px solid var(--line);
+}
+
+.tl-md .contains-task-list {
+  padding-left: 4px;
+  list-style: none;
+}
+
+.tl-md .user-mention,
+.tl-md .team-mention {
+  font-weight: 600;
+  color: var(--syn-variables);
+}
+
+.tl-md .markdown-alert {
+  padding: 4px 10px;
+  border-left: 3px solid var(--accent);
+}
+
+.tl-md .markdown-alert-title {
+  font-weight: 600;
+}
+
+/* GitHub's syntax highlighting classes in code blocks, in the theme's colors. */
+.tl-md .pl-c {
+  color: var(--text);
+  font-style: italic;
+}
+
+.tl-md .pl-k,
+.tl-md .pl-s1 .pl-k {
+  color: var(--syn-keywords);
+}
+
+.tl-md .pl-s,
+.tl-md .pl-pds,
+.tl-md .pl-sr {
+  color: var(--syn-strings);
+}
+
+.tl-md .pl-en,
+.tl-md .pl-smi {
+  color: var(--syn-functions);
+}
+
+.tl-md .pl-c1,
+.tl-md .pl-v {
+  color: var(--syn-numbers);
+}
+
+.tl-md .pl-ent {
+  color: var(--syn-tags);
+}
+
+.tl-md .pl-e {
+  color: var(--syn-attributes);
+}
+
+.tl-md .pl-md {
+  color: var(--del);
+}
+
+.tl-md .pl-mi1 {
+  color: var(--add);
+}
+
 /* Monaco tweaks ---------------------------------------------------------------------------- */
 
 .monaco-editor .diff-hidden-lines .center {

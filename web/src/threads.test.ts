@@ -23,28 +23,28 @@ function place(threads: ReviewThread[], over: Partial<PlaceInput> = {}) {
 
 describe('origToMod', () => {
   it('shifts unchanged lines by the changes before them', () => {
-    expect(origToMod(CHANGES, 1)).toEqual({ line: 1, deleted: false })
-    expect(origToMod(CHANGES, 4)).toEqual({ line: 4, deleted: false })
-    expect(origToMod(CHANGES, 7)).toEqual({ line: 9, deleted: false })
+    expect(origToMod(CHANGES, 1)).toEqual({ line: 1, deleted: false, lastAdded: null })
+    expect(origToMod(CHANGES, 4)).toEqual({ line: 4, deleted: false, lastAdded: null })
+    expect(origToMod(CHANGES, 7)).toEqual({ line: 9, deleted: false, lastAdded: null })
     // The line an insertion follows stays put; the next one moves past the insertion.
-    expect(origToMod(CHANGES, 10)).toEqual({ line: 12, deleted: false })
-    expect(origToMod(CHANGES, 11)).toEqual({ line: 14, deleted: false })
-    expect(origToMod(CHANGES, 19)).toEqual({ line: 22, deleted: false })
-    expect(origToMod(CHANGES, 23)).toEqual({ line: 23, deleted: false })
+    expect(origToMod(CHANGES, 10)).toEqual({ line: 12, deleted: false, lastAdded: null })
+    expect(origToMod(CHANGES, 11)).toEqual({ line: 14, deleted: false, lastAdded: null })
+    expect(origToMod(CHANGES, 19)).toEqual({ line: 22, deleted: false, lastAdded: null })
+    expect(origToMod(CHANGES, 23)).toEqual({ line: 23, deleted: false, lastAdded: null })
   })
 
   it('puts deleted lines where Monaco draws them: above the change on the modified side', () => {
-    expect(origToMod(CHANGES, 5)).toEqual({ line: 4, deleted: true })
-    expect(origToMod(CHANGES, 6)).toEqual({ line: 4, deleted: true })
+    expect(origToMod(CHANGES, 5)).toEqual({ line: 4, deleted: true, lastAdded: 8 })
+    expect(origToMod(CHANGES, 6)).toEqual({ line: 4, deleted: true, lastAdded: 8 })
     // A pure deletion follows modified line `modifiedStartLineNumber`.
-    expect(origToMod(CHANGES, 21)).toEqual({ line: 22, deleted: true })
+    expect(origToMod(CHANGES, 21)).toEqual({ line: 22, deleted: true, lastAdded: null })
   })
 
   it('handles changes at the start of the file', () => {
-    expect(origToMod([change(1, 2, 0, 0)], 1)).toEqual({ line: 0, deleted: true })
-    expect(origToMod([change(1, 2, 0, 0)], 3)).toEqual({ line: 1, deleted: false })
-    expect(origToMod([change(0, 0, 1, 3)], 1)).toEqual({ line: 4, deleted: false })
-    expect(origToMod([], 7)).toEqual({ line: 7, deleted: false })
+    expect(origToMod([change(1, 2, 0, 0)], 1)).toEqual({ line: 0, deleted: true, lastAdded: null })
+    expect(origToMod([change(1, 2, 0, 0)], 3)).toEqual({ line: 1, deleted: false, lastAdded: null })
+    expect(origToMod([change(0, 0, 1, 3)], 1)).toEqual({ line: 4, deleted: false, lastAdded: null })
+    expect(origToMod([], 7)).toEqual({ line: 7, deleted: false, lastAdded: null })
   })
 })
 
@@ -98,16 +98,16 @@ describe('placeThreads', () => {
 
   it('maps LEFT threads into the modified editor in unified view', () => {
     const context = mkThread({ side: 'LEFT', line: 7 })
-    const deleted = mkThread({ side: 'LEFT', line: 6, startSide: 'LEFT', startLine: 5 })
-    const right = mkThread({ side: 'RIGHT', line: 4 })
-    const p = place([context, deleted, right], { view: 'unified' })
+    const replaced = mkThread({ side: 'LEFT', line: 6, startSide: 'LEFT', startLine: 5 })
+    const removed = mkThread({ side: 'LEFT', line: 21 })
+    const p = place([context, replaced, removed], { view: 'unified' })
     const z = new Map(p.zones.map((z) => [z.thread.id, z]))
-    expect(z.get(context.id)).toMatchObject({ editor: 'modified', afterLine: 9, highlight: null })
-    expect(z.get(deleted.id)).toMatchObject({ editor: 'modified', afterLine: 4, highlight: null })
-    // On line 4 the RIGHT card comes first, then Monaco's deleted block, then the LEFT card.
-    expect(z.get(right.id)!.ordinal).toBeLessThan(10000)
-    expect(z.get(deleted.id)!.ordinal).toBeGreaterThan(10000)
-    expect(z.get(context.id)!.ordinal).toBeLessThan(10000)
+    expect(z.get(context.id)).toMatchObject({ editor: 'modified', afterLine: 9, highlight: null, reveal: 9 })
+    // After the lines that replaced it (5-8), so the old line numbers stay in line.
+    expect(z.get(replaced.id)).toMatchObject({ editor: 'modified', afterLine: 8, highlight: null, reveal: 8 })
+    // Nothing replaced 20-22: above Monaco's block of removed lines (default ordinal 10000) after line 22.
+    expect(z.get(removed.id)).toMatchObject({ editor: 'modified', afterLine: 22, reveal: 22 })
+    for (const zone of p.zones) expect(zone.ordinal).toBeLessThan(10000)
   })
 
   it('leaves line threads out until the diff is known', () => {

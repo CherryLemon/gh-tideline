@@ -15,9 +15,12 @@ export interface LineChange {
 
 export type EditorSide = 'original' | 'modified'
 
-/** Ordinals order zones that share a line; Monaco's own diff zones use the default, 10000. */
+/**
+ * Ordinals order zones that share a line. Monaco's own diff zones use the default, 10000, so
+ * cards come first: right under their line, and above the removed lines Monaco draws in the
+ * modified editor (unified view).
+ */
 const ORDINAL_UNDER_LINE = 5000
-const ORDINAL_AFTER_DELETED = 20000
 
 export interface ThreadZone {
   thread: ReviewThread
@@ -66,15 +69,23 @@ export interface PlaceInput {
   headOk: boolean
 }
 
+export interface ModLine {
+  /** The modified line it shows up at; for a removed line, the one Monaco draws it after (0: the top). */
+  line: number
+  deleted: boolean
+  /** For a removed line: the last line its change adds, if it adds any. */
+  lastAdded: number | null
+}
+
 /** Where an original line shows up in the modified editor (unified view). */
-export function origToMod(changes: readonly LineChange[], line: number): { line: number; deleted: boolean } {
+export function origToMod(changes: readonly LineChange[], line: number): ModLine {
   let delta = 0
   for (const c of changes) {
     const removed = c.originalEndLineNumber !== 0
     if (removed && line >= c.originalStartLineNumber && line <= c.originalEndLineNumber) {
-      // Monaco draws deleted lines in a zone above the change's first modified line.
-      const after = c.modifiedEndLineNumber === 0 ? c.modifiedStartLineNumber : c.modifiedStartLineNumber - 1
-      return { line: after, deleted: true }
+      // Monaco draws removed lines in a zone above the change's first modified line.
+      const added = c.modifiedEndLineNumber !== 0
+      return { line: added ? c.modifiedStartLineNumber - 1 : c.modifiedStartLineNumber, deleted: true, lastAdded: added ? c.modifiedEndLineNumber : null }
     }
     // Last original line the change covers, or the line an insertion follows.
     const origEnd = removed ? c.originalEndLineNumber : c.originalStartLineNumber
@@ -82,7 +93,7 @@ export function origToMod(changes: readonly LineChange[], line: number): { line:
     if (line <= origEnd) break
     delta = modEnd - origEnd
   }
-  return { line: line + delta, deleted: false }
+  return { line: line + delta, deleted: false, lastAdded: null }
 }
 
 function firstCommentAt(t: ReviewThread): string {
@@ -125,14 +136,19 @@ export function placeThreads(input: PlaceInput): Placement {
       zones.push({ thread, editor: 'original', afterLine: line, ordinal: ORDINAL_UNDER_LINE + i, highlight, reveal })
       return
     }
-    // Unified view: the original side lives inside the modified editor.
+    // Unified view: the original side lives inside the modified editor. Monaco lines up the
+    // original editor (the old line numbers there) by the line each zone follows, so a card
+    // between the removed lines and the added ones would push the old numbers out of line: a
+    // removed line's card goes after the lines its change adds, or above the removed lines
+    // when it adds none.
+    const after = at.lastAdded ?? at.line
     zones.push({
       thread,
       editor: 'modified',
-      afterLine: at.line,
-      ordinal: (at.deleted ? ORDINAL_AFTER_DELETED : ORDINAL_UNDER_LINE) + i,
+      afterLine: after,
+      ordinal: ORDINAL_UNDER_LINE + i,
       highlight: null,
-      reveal,
+      reveal: after > 0 ? after : null,
     })
   })
   return { zones, panel }

@@ -5,11 +5,14 @@ import {
   getPr,
   getPrFiles,
   getPrTree,
+  getThreads,
   errorMessage,
+  setThreadResolved,
   setViewed,
   type ChangedFile,
   type PrSummary,
   type RepoRef,
+  type ReviewThread,
   type TreeEntry,
   type ViewedState,
 } from '../api'
@@ -27,18 +30,24 @@ import {
 } from '../tree'
 import { usePersistentState } from '../storage'
 import { ViewedSync, isTypingTarget, nextUnviewed, viewedMap } from '../viewed'
-import { DiffPane, type ChangeInfo, type DiffPaneHandle, type PendingJump } from './DiffPane'
+import { threadsForFile, type PanelReason } from '../threads'
+import { useReview, type ReviewRead } from '../useReview'
+import { DiffPane, type ChangeInfo, type DiffPaneHandle, type PaneReview, type PendingJump } from './DiffPane'
 import { FileTree, type ListingState, type TreeScope } from './FileTree'
 import { FileFinder } from './FileFinder'
 import { Toast, type ToastMessage } from './Toast'
+import { ThreadCard } from './ThreadCard'
 
 interface Props {
   route: PrRoute
   search: string
 }
 
-/** `requestedAt`: `performance.now()` when the requests were sent (see `ViewedSync.rebase`). */
-type Data = { pr: PrSummary; files: ChangedFile[]; requestedAt: number }
+/**
+ * `requestedAt`: `performance.now()` when the requests were sent (see `ViewedSync.rebase`).
+ * `threads`: read alongside, but the page doesn't wait for it (nor fail with it).
+ */
+type Data = { pr: PrSummary; files: ChangedFile[]; requestedAt: number; threads: ReviewRead }
 
 const DOUBLE_SHIFT_MS = 350
 
@@ -74,8 +83,11 @@ export function PrPage({ route, search }: Props) {
   const load = useCallback(
     async (refresh: boolean): Promise<Data> => {
       const requestedAt = performance.now()
+      const threads = getThreads(repo, route.number)
+      // Handled by the page once it shows; not if loading the pull request fails.
+      threads.catch(() => {})
       const [pr, files] = await Promise.all([getPr(repo, route.number, refresh), getPrFiles(repo, route.number, refresh)])
-      return { pr, files, requestedAt }
+      return { pr, files, requestedAt, threads: { promise: threads, requestedAt } }
     },
     [repo, route.number],
   )
@@ -262,6 +274,17 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
   }, [files, requestedAt])
   const toggleViewed = useCallback((path: string, viewed: boolean) => sync.current?.set(path, viewed), [])
 
+  const review = useReview(
+    data.threads,
+    useCallback(() => getThreads(repo, pr.number), [repo, pr.number]),
+    useCallback((id: string, resolved: boolean) => setThreadResolved(repo, pr.number, id, resolved), [repo, pr.number]),
+    useCallback((_id: string, e: unknown) => showToast(`Couldn't update the thread: ${errorMessage(e)}`), [showToast]),
+  )
+  const retryReview = review.retry
+  useEffect(() => {
+    if (review.error) showToast(`Couldn't load the review comments: ${review.error.message}`, { label: 'Retry', run: retryReview })
+  }, [review.error, retryReview, showToast])
+
   const currentIndex = changedCurrent ? order.indexOf(changedCurrent) : -1
   /** A changed file, or an unchanged file of the head tree. */
   const current: ChangedFile | TreeEntry | null =
@@ -273,6 +296,36 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
   const provisional = current !== null && !changedCurrent && !haveListing
   // Listing it failed: say so (with a way out) rather than replace ?file= with another file.
   const unresolved = requested !== null && !current && haveListing && listing.error !== null ? listing : null
+
+  const snapshot = review.snapshot
+  const threadsHead = snapshot?.head ?? null
+  const headOk = threadsHead === head
+  // Read at another head while the shown head's read is on its way: line threads would land on
+  // the wrong lines for a moment, so only file threads show until it arrives.
+  const settling = !headOk && review.reading
+  const fileThreads = useMemo<ReviewThread[] | null>(() => {
+    if (!snapshot || !current) return null
+    const all = isChanged(current) ? threadsForFile(snapshot.threads, current) : snapshot.threads.filter((t) => t.path === current.path)
+    return settling ? all.filter((t) => t.subjectType === 'FILE') : all
+  }, [snapshot, current, settling])
+  const renderThread = useCallback((thread: ReviewThread, reason?: PanelReason) => <ThreadCard thread={thread} reason={reason} />, [])
+  const paneReview = useMemo<PaneReview | undefined>(() => {
+    if (!fileThreads) return undefined
+    const stale = !headOk && !settling && fileThreads.some((t) => t.subjectType === 'LINE')
+    return {
+      threads: fileThreads,
+      headOk,
+      renderThread,
+      notice: stale ? (
+        <div className="pane-threads-notice">
+          <span>These comments are from another version of the pull request, so they're listed here.</span>
+          <button className="btn" onClick={onRefresh}>
+            Refresh
+          </button>
+        </div>
+      ) : undefined,
+    }
+  }, [fileThreads, headOk, settling, renderThread, onRefresh])
 
   // Without a valid ?file=, show the first file (replace, so Back leaves the PR).
   useEffect(() => {
@@ -489,6 +542,7 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
               ignoreTrimWhitespace={ignoreWs}
               pendingJump={pendingJump}
               headerActions={changedCurrent && <ViewedCheck path={changedCurrent.path} mark={marks.get(changedCurrent.path)} onToggle={toggleViewed} />}
+              review={paneReview}
               onChangeInfo={setChangeInfo}
             />
           ) : unresolved ? (
