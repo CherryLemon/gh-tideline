@@ -1,0 +1,215 @@
+// Review threads as the page shows them: the last read from GitHub, plus what our own writes
+// returned since, plus optimistic resolve/unresolve. Read with `useSyncExternalStore`.
+import type { PendingReview, ReviewComment, ReviewThread, ReviewThreads } from './api'
+
+export type SendResolved = (threadId: string, resolved: boolean) => Promise<ReviewThread>
+
+export interface ReviewSnapshot {
+  /** The head the threads' line numbers refer to. */
+  head: string
+  locked: boolean
+  pendingReview: PendingReview | null
+  /** Resolve intents applied. */
+  threads: readonly ReviewThread[]
+  /** Comments in the viewer's pending review. */
+  pendingCount: number
+  /** Threads with a resolve request queued or in flight. */
+  busy: ReadonlySet<string>
+}
+
+/** Pending review ids are kept apart from thread ids in `settled`. */
+const PENDING_KEY = ' pending'
+
+/**
+ * One instance lives as long as the page shows one head. Writes report what GitHub returned
+ * through the `apply*` methods; full reads go through `rebase`, which keeps anything a write
+ * changed after that read was requested. Resolve is optimistic with at most one request in
+ * flight per thread (the latest intent wins; a failure rolls back), like `ViewedSync`.
+ */
+export class ReviewStore {
+  private data: ReviewThreads
+  private readonly intent = new Map<string, boolean>()
+  private readonly inflight = new Set<string>()
+  /** When a write last settled for a thread id (or the pending review), `performance.now()`. */
+  private readonly settled = new Map<string, number>()
+  private rebasedAt = -Infinity
+  private readonly listeners = new Set<() => void>()
+  private snap: ReviewSnapshot | null = null
+  private disposed = false
+
+  constructor(
+    initial: ReviewThreads,
+    private readonly sendResolved: SendResolved,
+    private readonly onError: (threadId: string, error: unknown) => void,
+  ) {
+    this.data = initial
+  }
+
+  subscribe = (listener: () => void): (() => void) => {
+    this.listeners.add(listener)
+    return () => this.listeners.delete(listener)
+  }
+
+  getSnapshot = (): ReviewSnapshot => {
+    if (!this.snap) {
+      const threads = this.data.threads.map((t) => {
+        const want = this.intent.get(t.id)
+        if (want === undefined || want === t.isResolved) return t
+        // The confirmed permissions are for the other state; whoever may do one may undo it.
+        const can = t.viewerCanResolve || t.viewerCanUnresolve
+        return { ...t, isResolved: want, isCollapsed: want, viewerCanResolve: can, viewerCanUnresolve: can }
+      })
+      let pendingCount = 0
+      for (const t of threads) for (const c of t.comments) if (c.state === 'PENDING') pendingCount++
+      this.snap = {
+        head: this.data.head,
+        locked: this.data.locked,
+        pendingReview: this.data.pendingReview,
+        threads,
+        pendingCount,
+        busy: new Set([...this.inflight, ...this.intent.keys()]),
+      }
+    }
+    return this.snap
+  }
+
+  /**
+   * Takes a full read requested at `requestedAt` (`performance.now()`). Threads (and the
+   * pending review) that a write changed after the read was sent, or that have a resolve
+   * queued or in flight, keep their local version: the read may predate the write. A read
+   * requested before one already taken is ignored.
+   */
+  rebase(next: ReviewThreads, requestedAt: number): void {
+    if (this.disposed || requestedAt < this.rebasedAt) return
+    this.rebasedAt = requestedAt
+    const newer = (id: string) => (this.settled.get(id) ?? -Infinity) >= requestedAt
+    const keep = (id: string) => newer(id) || this.inflight.has(id) || this.intent.has(id)
+    const local = new Map(this.data.threads.map((t) => [t.id, t]))
+    const threads: ReviewThread[] = []
+    const seen = new Set<string>()
+    for (const t of next.threads) {
+      seen.add(t.id)
+      if (!keep(t.id)) threads.push(t)
+      else if (local.has(t.id)) threads.push(local.get(t.id)!)
+      // Deleted by a write after the read was sent.
+    }
+    // Created by a write after the read was sent.
+    for (const t of this.data.threads) if (!seen.has(t.id) && keep(t.id)) threads.push(t)
+    for (const id of this.intent.keys()) if (!threads.some((t) => t.id === id)) this.intent.delete(id)
+    this.data = {
+      head: next.head,
+      locked: next.locked,
+      pendingReview: newer(PENDING_KEY) ? this.data.pendingReview : next.pendingReview,
+      threads,
+    }
+    this.changed()
+  }
+
+  /** A thread as a write returned it (created, or changed); null removes it (deleted). */
+  applyThread(id: string, thread: ReviewThread | null): void {
+    if (this.disposed) return
+    this.settled.set(id, performance.now())
+    const threads = this.data.threads.filter((t) => t.id !== id)
+    const at = this.data.threads.findIndex((t) => t.id === id)
+    if (thread) threads.splice(at < 0 ? threads.length : at, 0, thread)
+    this.data = { ...this.data, threads }
+    this.changed()
+  }
+
+  /** A comment a write returned (a reply, or an edit) in a thread we have. */
+  applyComment(threadId: string, comment: ReviewComment): void {
+    const t = this.data.threads.find((t) => t.id === threadId)
+    if (!t) return
+    const at = t.comments.findIndex((c) => c.id === comment.id)
+    const comments = at < 0 ? [...t.comments, comment] : t.comments.map((c, i) => (i === at ? comment : c))
+    this.applyThread(threadId, { ...t, comments })
+  }
+
+  /** The viewer's pending review after a write (null: none any more). */
+  applyPendingReview(review: PendingReview | null): void {
+    if (this.disposed) return
+    this.settled.set(PENDING_KEY, performance.now())
+    this.data = { ...this.data, pendingReview: review }
+    this.changed()
+  }
+
+  setResolved(threadId: string, resolved: boolean): void {
+    if (this.disposed || !this.data.threads.some((t) => t.id === threadId)) return
+    this.intent.set(threadId, resolved)
+    this.changed()
+    if (!this.inflight.has(threadId)) this.pump(threadId)
+  }
+
+  /** Stops notifying and sending; a request in flight completes, nothing follows it. */
+  dispose(): void {
+    this.disposed = true
+    this.listeners.clear()
+  }
+
+  private changed(): void {
+    this.snap = null
+    for (const l of [...this.listeners]) l()
+  }
+
+  private pump(id: string): void {
+    if (this.disposed) return
+    const want = this.intent.get(id)
+    if (want === undefined) return
+    const current = this.data.threads.find((t) => t.id === id)
+    if (!current || current.isResolved === want) {
+      this.intent.delete(id)
+      this.changed()
+      return
+    }
+    this.inflight.add(id)
+    this.changed()
+    this.sendResolved(id, want).then(
+      (thread) => {
+        this.inflight.delete(id)
+        this.settled.set(id, performance.now())
+        // Unless a refresh dropped the thread meanwhile.
+        if (this.data.threads.some((t) => t.id === id)) {
+          this.data = { ...this.data, threads: this.data.threads.map((t) => (t.id === id ? thread : t)) }
+        }
+        this.changed()
+        this.pump(id)
+      },
+      (error: unknown) => {
+        this.inflight.delete(id)
+        this.settled.set(id, performance.now())
+        this.intent.delete(id)
+        if (this.disposed) return
+        this.changed()
+        this.onError(id, error)
+      },
+    )
+  }
+}
+
+/** Ids of the viewer's own comments, taken before a create so its result can be told apart. */
+export function ownCommentIds(threads: readonly ReviewThread[]): Set<string> {
+  const ids = new Set<string>()
+  for (const t of threads) for (const c of t.comments) if (c.viewerDidAuthor) ids.add(c.id)
+  return ids
+}
+
+/**
+ * After a create whose outcome is unknown (a timeout or a 502 after the request went out):
+ * the viewer's comment with the same body that wasn't there before, from a fresh read.
+ * Creates are never retried blindly, so this is how a duplicate is avoided.
+ */
+export function findCreated(
+  threads: readonly ReviewThread[],
+  before: ReadonlySet<string>,
+  body: string,
+  where: { threadId: string } | { path: string },
+): { thread: ReviewThread; comment: ReviewComment } | null {
+  const want = body.trim()
+  for (const thread of threads) {
+    if ('threadId' in where ? thread.id !== where.threadId : thread.path !== where.path) continue
+    for (const comment of thread.comments) {
+      if (comment.viewerDidAuthor && !before.has(comment.id) && comment.body.trim() === want) return { thread, comment }
+    }
+  }
+  return null
+}

@@ -124,7 +124,10 @@ function initialState(head: string): MockState {
   }
   const thread = (
     path: string,
-    where: { side: Side; line: number; startLine?: number } | 'FILE' | { outdated: number },
+    where:
+      | { side: Side; line: number; startLine?: number; startSide?: Side; originalLine?: number }
+      | 'FILE'
+      | { outdated: number; outdatedStart?: number },
     comments: CommentSpec[],
     opts: { resolved?: boolean; hunk?: string } = {},
   ): void => {
@@ -147,18 +150,31 @@ function initialState(head: string): MockState {
     if (where === 'FILE') {
       st.threads.push({ ...base, subjectType: 'FILE', side: null, startSide: null, line: null, startLine: null, originalLine: null, originalStartLine: null, isOutdated: false })
     } else if ('outdated' in where) {
-      st.threads.push({ ...base, subjectType: 'LINE', side: 'RIGHT', startSide: null, line: null, startLine: null, originalLine: where.outdated, originalStartLine: null, isOutdated: true })
+      const start = where.outdatedStart ?? null
+      st.threads.push({
+        ...base,
+        subjectType: 'LINE',
+        side: 'RIGHT',
+        startSide: start === null ? null : 'RIGHT',
+        line: null,
+        startLine: null,
+        originalLine: where.outdated,
+        originalStartLine: start,
+        isOutdated: true,
+      })
     } else {
       const start = where.startLine ?? null
+      // A later push moved the line: `originalLine` is where it was first commented.
+      const shift = where.originalLine === undefined ? 0 : where.originalLine - where.line
       st.threads.push({
         ...base,
         subjectType: 'LINE',
         side: where.side,
-        startSide: start === null ? null : where.side,
+        startSide: start === null ? null : (where.startSide ?? where.side),
         line: where.line,
         startLine: start,
-        originalLine: where.line,
-        originalStartLine: start,
+        originalLine: where.line + shift,
+        originalStartLine: start === null ? null : start + shift,
         isOutdated: false,
       })
     }
@@ -205,6 +221,14 @@ function initialState(head: string): MockState {
   thread(main, { side: 'RIGHT', line: lineOf(main, 'RIGHT', 'export function helper20(') }, [
     { author: 'alice', body: 'Unrelated, but helper20 is unused.' },
   ])
+  // A range from a removed line to the line that replaced it.
+  thread(main, { side: 'RIGHT', startSide: 'LEFT', startLine: lineOf(main, 'LEFT', 'const DEFAULT_PORT = 8080'), line: port }, [
+    { author: 'alice', body: 'Old and new value side by side: the port change is intended?' },
+  ])
+  thread(main, { side: 'RIGHT', line: lineOf(main, 'RIGHT', 'export function helper3('), originalLine: 41 }, [
+    { body: 'helper3 moved down after the last push; the comment followed it.' },
+  ])
+  thread(main, { outdated: 52, outdatedStart: 49 }, [{ body: 'This whole range was rewritten.' }])
   thread(main, { outdated: 40 }, [{ body: 'This block moved; is the old order still needed?' }], {
     hunk: "@@ -36,6 +38,8 @@ const DEFAULT_PORT = 8080\n export function helper0(value: number): number {\n-  return value\n+  // helper 0 keeps the example long enough to fold unchanged regions\n+  return value * 1 + 0\n }",
   })
