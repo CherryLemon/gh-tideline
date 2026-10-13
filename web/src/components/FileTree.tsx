@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import type { ChangedFile, ViewedState } from '../api'
+import type { ThreadCounts } from '../threads'
 import { fileLabel, type TreeRow } from '../tree'
 
 /** Which files the tree lists: the changed ones, or the whole head tree. */
@@ -28,6 +29,8 @@ interface Props {
   currentPath: string | null
   /** Viewed marks of the paths GitHub lists; other files get no checkbox. */
   viewed: ReadonlyMap<string, ViewedState>
+  /** Review threads per file path (see `fileCounts`). */
+  threadCounts: ReadonlyMap<string, ThreadCounts>
   onOpen(path: string): void
   onToggle(key: string): void
   onToggleViewed(path: string, viewed: boolean): void
@@ -57,6 +60,20 @@ function Counts({ file }: { file: ChangedFile }) {
     <span className="counts">
       {a > 0 && <span className="add">+{a}</span>}
       {d > 0 && <span className="del">-{d}</span>}
+    </span>
+  )
+}
+
+function ThreadBadge({ counts }: { counts: ThreadCounts | undefined }) {
+  if (!counts || counts.threads === 0) return null
+  const { threads, unresolved } = counts
+  const title = `${threads} ${threads === 1 ? 'comment thread' : 'comment threads'}${unresolved > 0 ? `, ${unresolved} unresolved` : ', all resolved'}`
+  return (
+    <span className={`thread-badge${unresolved > 0 ? ' has-unresolved' : ''}`} title={title} aria-label={title}>
+      <svg viewBox="0 0 16 16" aria-hidden>
+        <path d="M2.5 3.5a1 1 0 0 1 1-1h9a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1H7l-3 2.5v-2.5h-.5a1 1 0 0 1-1-1z" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round" />
+      </svg>
+      {unresolved > 0 ? unresolved : threads}
     </span>
   )
 }
@@ -91,6 +108,7 @@ export function FileTree({
   onRetryListing,
   currentPath,
   viewed,
+  threadCounts,
   onOpen,
   onToggle,
   onToggleViewed,
@@ -175,6 +193,7 @@ export function FileTree({
                     {name}
                   </span>
                   <Counts file={f} />
+                  <ThreadBadge counts={threadCounts.get(f.path)} />
                   {mark !== undefined && (
                     <input
                       type="checkbox"
@@ -204,6 +223,7 @@ export function FileTree({
                 >
                   <span className="status-letter" />
                   <span className="file-name">{baseName(row.entry.path)}</span>
+                  <ThreadBadge counts={threadCounts.get(row.entry.path)} />
                 </div>
               )
             }

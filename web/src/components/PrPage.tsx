@@ -30,7 +30,7 @@ import {
 } from '../tree'
 import { usePersistentState } from '../storage'
 import { ViewedSync, isTypingTarget, nextUnviewed, viewedMap } from '../viewed'
-import { threadsForFile, type PanelReason } from '../threads'
+import { fileCounts, threadsForFile, type PanelReason } from '../threads'
 import { useReview, type ReviewRead } from '../useReview'
 import { DiffPane, type ChangeInfo, type DiffPaneHandle, type PaneReview, type PendingJump } from './DiffPane'
 import { FileTree, type ListingState, type TreeScope } from './FileTree'
@@ -308,6 +308,7 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
     const all = isChanged(current) ? threadsForFile(snapshot.threads, current) : snapshot.threads.filter((t) => t.path === current.path)
     return settling ? all.filter((t) => t.subjectType === 'FILE') : all
   }, [snapshot, current, settling])
+  const threadCounts = useMemo(() => (snapshot ? fileCounts(snapshot.threads, files) : new Map()), [snapshot, files])
   const renderThread = useCallback((thread: ReviewThread, reason?: PanelReason) => <ThreadCard thread={thread} reason={reason} />, [])
   const paneReview = useMemo<PaneReview | undefined>(() => {
     if (!fileThreads) return undefined
@@ -524,6 +525,7 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
             onRetryListing={listingState?.kind === 'error' && listingState.stale ? onRefresh : retryListing}
             currentPath={current?.path ?? null}
             viewed={marks}
+            threadCounts={threadCounts}
             onOpen={openFile}
             onToggle={toggle}
             onToggleViewed={toggleViewed}
