@@ -1,7 +1,7 @@
 {
   "name": "tideline-web",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.3.0",
   "license": "MIT",
   "type": "module",
   "packageManager": "pnpm@12.11.2",
