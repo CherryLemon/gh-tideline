@@ -7,15 +7,17 @@ interface Props {
   renderThread(thread: ReviewThread, reason: PanelReason): React.ReactNode
   /** Shown above the threads, e.g. that they were read at another commit. */
   notice?: React.ReactNode
+  /** The box for a new comment on the file, when open; shown however the list is folded. */
+  composer?: React.ReactNode
 }
 
 /**
  * Above the diff: the file's comments that have no line in it (file-level, outdated, or
  * unplaceable, each card saying why). Shown for every kind of file.
  */
-export function PaneThreads({ items, renderThread, notice }: Props) {
+export function PaneThreads({ items, renderThread, notice, composer }: Props) {
   const [open, setOpen] = useState(true)
-  if (items.length === 0 && !notice) return null
+  if (items.length === 0 && !notice && !composer) return null
   const files = items.filter((i) => i.reason === 'file').length
   const others = items.length - files
   const summary = [
@@ -35,13 +37,15 @@ export function PaneThreads({ items, renderThread, notice }: Props) {
         </button>
       )}
       {notice}
-      {open && items.length > 0 && (
-        <div className="pane-threads-list">
-          {items.map((i) => (
-            <div key={i.thread.id} className="pane-thread">
-              {renderThread(i.thread, i.reason)}
-            </div>
-          ))}
+      {((open && items.length > 0) || composer) && (
+        <div className={`pane-threads-list${items.length > 0 ? '' : ' is-alone'}`}>
+          {open &&
+            items.map((i) => (
+              <div key={i.thread.id} className="pane-thread">
+                {renderThread(i.thread, i.reason)}
+              </div>
+            ))}
+          {composer}
         </div>
       )}
     </div>

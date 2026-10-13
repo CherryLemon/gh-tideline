@@ -129,6 +129,30 @@ export interface ReviewThreads {
   threads: ReviewThread[]
 }
 
+/** `single`: post now ("Add single comment"); `review`: add to the viewer's pending review. */
+export type CommentMode = 'single' | 'review'
+
+/** What a new thread is on: the file, or a line or range of lines on one side. */
+export type NewThreadTarget =
+  | { subjectType: 'FILE' }
+  | { subjectType: 'LINE'; side: DiffSide; line: number; startLine?: number; startSide?: DiffSide }
+
+export type NewThreadRequest = NewThreadTarget & {
+  /** The head the lines refer to. */
+  head: string
+  path: string
+  body: string
+  mode: CommentMode
+}
+
+export interface CreatedThread {
+  /** null when the comment was posted but its thread couldn't be read back: read again. */
+  thread: ReviewThread | null
+  pendingReview: PendingReview | null
+  /** A single comment on a file that was added but not submitted (it stays pending): why. */
+  submitError?: string
+}
+
 export interface ApiErrorBody {
   error: { code: string; message: string }
 }
@@ -152,8 +176,14 @@ const CODE_MESSAGES: Record<string, string> = {
   bad_request: 'Invalid request',
   stale_head: STALE_HEAD_MESSAGE,
   rejected: 'GitHub refused the change',
+  pending_review_exists: 'You have a pending review: add the comment to it, or submit or discard the review first',
+  review_changed: 'Your pending review changed on GitHub; refresh to see it',
+  http_413: 'The comment is too long',
   network: "Can't reach the Tideline server",
 }
+
+/** Codes whose fixed text says it all (the server's detail would repeat it). */
+const FIXED_MESSAGES = new Set(['unauthorized', 'stale_head', 'pending_review_exists', 'review_changed', 'http_413'])
 
 export class ApiError extends Error {
   readonly status: number
@@ -162,9 +192,7 @@ export class ApiError extends Error {
 
   constructor(status: number, code: string, detail: string) {
     const base = CODE_MESSAGES[code] ?? `Request failed (HTTP ${status})`
-    // These always show the fixed text; other codes append the server detail.
-    const fixed = code === 'unauthorized' || code === 'stale_head'
-    super(fixed || !detail || detail === base ? base : `${base}: ${detail}`)
+    super(FIXED_MESSAGES.has(code) || !detail || detail === base ? base : `${base}: ${detail}`)
     this.name = 'ApiError'
     this.status = status
     this.code = code
@@ -251,6 +279,33 @@ export async function setThreadResolved(r: RepoRef, n: number, threadId: string,
     body: JSON.stringify({ resolved }),
   })
   return ((await res.json()) as { thread: ReviewThread }).thread
+}
+
+/** Starts a review thread (see `CommentMode`). Never retried: see `findCreated`. */
+export async function createThread(r: RepoRef, n: number, req: NewThreadRequest): Promise<CreatedThread> {
+  const res = await request(`${repoBase(r)}/pulls/${n}/threads`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(req),
+  })
+  return (await res.json()) as CreatedThread
+}
+
+/** Deletes the pending review `reviewId` (the one shown) with all its comments. */
+export async function discardReview(r: RepoRef, n: number, reviewId: string): Promise<void> {
+  await request(`${repoBase(r)}/pulls/${n}/review`, {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ reviewId }),
+  })
+}
+
+/**
+ * Whether a failed write may still have landed on GitHub: the server couldn't be reached, or
+ * GitHub failed or timed out (it may have done the write first). Look before trying again.
+ */
+export function mayHaveLanded(e: unknown): boolean {
+  return e instanceof ApiError && (e.code === 'network' || e.status === 502 || e.status === 504)
 }
 
 /** Raw blob response; the caller decides whether to read the body (see Content-Length checks). */

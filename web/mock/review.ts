@@ -96,7 +96,7 @@ interface CommentSpec {
   edited?: boolean
 }
 
-function initialState(head: string): MockState {
+function initialState(head: string, withPending: boolean): MockState {
   minute = 0
   let n = 0
   const st: MockState = { threads: [], pendingReview: null, nextId: 1000 }
@@ -267,26 +267,40 @@ function initialState(head: string): MockState {
 
   thread('assets/logo.png', 'FILE', [{ author: 'alice', body: 'The new logo is a bit blurry at 1x.' }])
 
-  st.pendingReview = {
-    id: 'PRR_mock_pending',
-    body: '',
-    commit: head,
-    createdAt: at(),
-    url: `${PR_URL}#pullrequestreview-1`,
+  if (withPending) {
+    st.pendingReview = {
+      id: 'PRR_mock_pending',
+      body: '',
+      commit: head,
+      createdAt: at(),
+      url: `${PR_URL}#pullrequestreview-1`,
+    }
+  } else {
+    dropPending(st)
   }
   return st
 }
 
+/** Takes the viewer's pending comments out (threads left without comments go too). */
+function dropPending(st: MockState): void {
+  st.threads = st.threads
+    .map((t) => ({ ...t, comments: t.comments.filter((c) => c.state !== 'PENDING') }))
+    .filter((t) => t.comments.length > 0)
+}
+
 let state: MockState | null = null
+let startPending = true
 
 /** The review state, built on first use (the pending review starts on `head`). */
 export function reviewState(head: string): MockState {
-  state ??= initialState(head)
+  state ??= initialState(head, startPending)
   return state
 }
 
-export function resetReview(): void {
+/** Back to the fixtures; `pending: false` starts without the viewer's pending review. */
+export function resetReview(opts: { pending?: boolean } = {}): void {
   state = null
+  startPending = opts.pending ?? true
 }
 
 export function threadsResponse(head: string): {
@@ -297,4 +311,139 @@ export function threadsResponse(head: string): {
 } {
   const st = reviewState(head)
   return { head, locked: false, pendingReview: st.pendingReview, threads: st.threads }
+}
+
+export interface MockResult {
+  status: number
+  body: unknown
+}
+
+function fail(status: number, code: string, message: string): MockResult {
+  return { status, body: { error: { code, message } } }
+}
+
+const LINE_REJECTED = 'GitHub only takes comments on lines in the diff, or within 3 lines of a change'
+const THREAD_FIELDS = new Set(['head', 'path', 'body', 'mode', 'subjectType', 'side', 'line', 'startSide', 'startLine'])
+const isSide = (v: unknown): v is Side => v === 'LEFT' || v === 'RIGHT'
+const isLine = (v: unknown): v is number => typeof v === 'number' && Number.isInteger(v) && v >= 1
+
+/** `/fail 422|409|502|502-after|submit` in a comment makes the write fail that way. */
+function injected(body: string): string | null {
+  return /\/fail (422|409|502-after|502|submit)\b/.exec(body)?.[1] ?? null
+}
+
+function newComment(st: MockState, body: string, reviewId: string, pending: boolean): MockComment {
+  const n = st.nextId++
+  return {
+    id: `PRRC_mock_new${n}`,
+    author: { login: VIEWER, avatarUrl: null },
+    body,
+    bodyHtml: renderBody(body),
+    createdAt: new Date().toISOString().replace(/\.\d+Z$/, 'Z'),
+    lastEditedAt: null,
+    url: `${PR_URL}/files#discussion_r${n}`,
+    state: pending ? 'PENDING' : 'SUBMITTED',
+    reviewId,
+    replyTo: null,
+    isMinimized: false,
+    minimizedReason: null,
+    viewerCanUpdate: true,
+    viewerCanDelete: true,
+    viewerDidAuthor: true,
+  }
+}
+
+function startReview(st: MockState, head: string): MockPendingReview {
+  const n = st.nextId++
+  st.pendingReview = { id: `PRR_mock_new${n}`, body: '', commit: head, createdAt: new Date().toISOString(), url: `${PR_URL}#pullrequestreview-${n}` }
+  return st.pendingReview
+}
+
+/**
+ * `POST /threads`, checked like the server does (fields, lines, path, pending review, head).
+ * `listed`: GitHub's file list. GitHub's own check of the lines is left out: `/fail 422`.
+ */
+export function createThread(head: string, listed: (path: string) => boolean, raw: unknown): MockResult {
+  if (!raw || typeof raw !== 'object') return fail(400, 'bad_request', 'invalid request body')
+  const req = raw as Record<string, unknown>
+  const unknown = Object.keys(req).find((k) => !THREAD_FIELDS.has(k))
+  if (unknown) return fail(400, 'bad_request', `invalid request body: unknown field \`${unknown}\``)
+  const { path, body, mode, subjectType, side, line, startSide, startLine } = req
+  if (typeof req.head !== 'string' || !/^[0-9a-f]{40}$/.test(req.head)) return fail(400, 'bad_request', 'head must be 40 lowercase hex characters')
+  if (typeof path !== 'string' || typeof body !== 'string' || (mode !== 'single' && mode !== 'review')) {
+    return fail(400, 'bad_request', 'invalid request body')
+  }
+  if (body.trim() === '') return fail(400, 'bad_request', 'the comment is empty')
+  if ([...body].length > 65536) return fail(400, 'bad_request', 'the comment is longer than 65536 characters')
+  if (subjectType === 'FILE') {
+    if (side != null || line != null || startSide != null || startLine != null) return fail(400, 'bad_request', 'a comment on a file has no side or lines')
+  } else if (subjectType === 'LINE') {
+    if (!isSide(side) || !isLine(line)) return fail(400, 'bad_request', 'a comment on lines needs a side and a line')
+    if (startLine != null && (!isLine(startLine) || startLine >= line)) return fail(400, 'bad_request', `invalid range of lines ${startLine} to ${line}`)
+    if (startSide != null && (!isSide(startSide) || startSide !== side)) return fail(400, 'bad_request', 'a range of lines must be on one side')
+    if (startSide != null && startLine == null) return fail(400, 'bad_request', 'a start side needs a start line')
+  } else {
+    return fail(400, 'bad_request', 'invalid request body')
+  }
+  if (!listed(path)) return fail(400, 'bad_request', `${path} is not part of the pull request`)
+
+  const st = reviewState(head)
+  if (mode === 'single' && st.pendingReview) {
+    return fail(409, 'pending_review_exists', 'you have a pending review: add the comment to it, or submit or discard it first')
+  }
+  const how = injected(body)
+  if (how === '409' || ((subjectType === 'LINE' || !st.pendingReview) && req.head !== head)) {
+    return fail(409, 'stale_head', 'the pull request has new commits; refresh before commenting')
+  }
+  if (how === '422') return fail(422, 'rejected', subjectType === 'FILE' ? 'GitHub did not take a comment on this file' : LINE_REJECTED)
+  if (how === '502') return fail(502, 'github_error', 'GraphQL request to github.com failed: operation timed out')
+
+  // A single comment on a file waits in a review that `/fail submit` leaves pending.
+  const pending = mode === 'review' || how === 'submit'
+  const review = pending ? (st.pendingReview ?? startReview(st, head)) : null
+  const comment = newComment(st, body, review?.id ?? `PRR_mock_new${st.nextId++}`, pending)
+  const lines = subjectType === 'LINE'
+  const thread: MockThread = {
+    id: `PRRT_mock_new${st.nextId++}`,
+    path,
+    subjectType: lines ? 'LINE' : 'FILE',
+    side: lines ? (side as Side) : null,
+    startSide: lines && startLine != null ? (side as Side) : null,
+    line: lines ? (line as number) : null,
+    startLine: lines ? ((startLine as number | undefined) ?? null) : null,
+    originalLine: lines ? (line as number) : null,
+    originalStartLine: lines ? ((startLine as number | undefined) ?? null) : null,
+    diffHunk: '',
+    isResolved: false,
+    isOutdated: false,
+    isCollapsed: false,
+    resolvedBy: null,
+    viewerCanReply: true,
+    viewerCanResolve: !pending,
+    viewerCanUnresolve: false,
+    comments: [comment],
+  }
+  st.threads.push(thread)
+  if (how === '502-after') return fail(502, 'github_error', 'GraphQL request to github.com failed: operation timed out')
+  return {
+    status: 200,
+    body: {
+      thread,
+      pendingReview: st.pendingReview,
+      ...(how === 'submit' ? { submitError: 'Something went wrong while executing your query.' } : {}),
+    },
+  }
+}
+
+/** `DELETE /review {reviewId}`: the pending review shown goes with its comments. */
+export function discardReview(head: string, raw: unknown): MockResult {
+  const id = (raw as { reviewId?: unknown } | null)?.reviewId
+  if (typeof id !== 'string' || !/^[A-Za-z0-9_=+/-]{1,128}$/.test(id)) return fail(400, 'bad_request', 'invalid id')
+  const st = reviewState(head)
+  if (st.pendingReview && st.pendingReview.id !== id) {
+    return fail(409, 'review_changed', 'your pending review on GitHub is not the one shown; refresh to see it')
+  }
+  st.pendingReview = null
+  dropPending(st)
+  return { status: 200, body: { pendingReview: null } }
 }

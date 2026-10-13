@@ -47,6 +47,14 @@ export function mockApi(): Plugin {
         if (!url.pathname.startsWith('/api/')) return next()
 
         if (url.pathname === '/api/health') return json(res, 200, { app: 'tideline', version: '0.1.0-mock' })
+        // Test hook: the review state back to its fixtures (`{"pending": false}`: no pending review).
+        if (url.pathname === '/api/__mock/reset' && req.method === 'POST') {
+          void readJson(req).then((body) => {
+            review.resetReview({ pending: (body as { pending?: unknown } | null)?.pending !== false })
+            json(res, 200, { ok: true })
+          })
+          return
+        }
         if (req.headers['x-dr'] !== '1' && req.headers['sec-fetch-site'] !== 'same-origin') {
           return error(res, 401, 'unauthorized', 'missing X-DR header')
         }
@@ -72,9 +80,21 @@ export function mockApi(): Plugin {
               const asked = url.searchParams.get('head')
               return json(res, 200, { head: pr.head.sha, entries: asked && asked !== pr.head.sha ? [] : data.tree })
             }
-            if (sub === 'threads' && req.method === 'GET') {
+            if (sub === 'threads' && parts.length === 6 && req.method === 'GET') {
               await delay(250)
               return json(res, 200, review.threadsResponse(pr.head.sha))
+            }
+            if (sub === 'threads' && parts.length === 6 && req.method === 'POST') {
+              const body = await readJson(req)
+              await delay(500)
+              const r = review.createThread(pr.head.sha, (p) => data.viewed.has(p), body)
+              return json(res, r.status, r.body)
+            }
+            if (sub === 'review' && parts.length === 6 && req.method === 'DELETE') {
+              const body = await readJson(req)
+              await delay(400)
+              const r = review.discardReview(pr.head.sha, body)
+              return json(res, r.status, r.body)
             }
             if (sub === 'viewed' && req.method === 'PUT') {
               const body = (await readJson(req)) as { path?: unknown; viewed?: unknown; head?: unknown } | null

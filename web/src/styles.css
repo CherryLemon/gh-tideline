@@ -1202,6 +1202,78 @@ kbd {
   overflow: auto;
 }
 
+/* With no comments above it, the new comment box gets the panel's top padding. */
+.pane-threads-list.is-alone {
+  padding-top: 8px;
+}
+
+/* A box for a new comment (`Composer`). */
+.composer {
+  display: flex;
+  flex-direction: column;
+  flex: none;
+  gap: 6px;
+  padding: 8px;
+}
+
+.composer-input {
+  width: 100%;
+  min-height: 72px;
+  max-height: 320px;
+  field-sizing: content;
+  padding: 6px 8px;
+  border: 1px solid var(--selection-bg);
+  border-radius: 3px;
+  background: #fff;
+  color: var(--syn-variables);
+  font: 13px/1.45 var(--ui-font);
+  resize: vertical;
+}
+
+.composer-input:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.composer-input[readonly] {
+  background: var(--second-bg);
+  color: var(--text);
+}
+
+.composer-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.composer-hint,
+.composer-note {
+  font-size: 12px;
+}
+
+.composer-ask {
+  font-weight: 600;
+}
+
+.composer-error {
+  padding: 4px 8px;
+  border-radius: 3px;
+  background: #d4413e14;
+  color: var(--del);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.btn-danger {
+  border-color: #e9a7a5;
+  color: var(--del);
+}
+
+.btn-danger:hover {
+  background: #d4413e1a;
+}
+
 /* GitHub-rendered markdown (`SafeHtml`). */
 .tl-md {
   overflow-wrap: anywhere;

@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import {
   ApiError,
   STALE_HEAD_MESSAGE,
+  createThread,
   getPr,
   getPrFiles,
   getPrTree,
@@ -10,6 +11,8 @@ import {
   setThreadResolved,
   setViewed,
   type ChangedFile,
+  type CommentMode,
+  type NewThreadTarget,
   type PrSummary,
   type RepoRef,
   type ReviewThread,
@@ -32,11 +35,14 @@ import { usePersistentState } from '../storage'
 import { ViewedSync, isTypingTarget, nextUnviewed, viewedMap } from '../viewed'
 import { fileCounts, threadsForFile, type PanelReason } from '../threads'
 import { useReview, type ReviewRead } from '../useReview'
+import { DraftStore, draftKey, sessionDraftStorage, type DraftTarget } from '../drafts'
+import { postThread } from '../compose'
 import { DiffPane, type ChangeInfo, type DiffPaneHandle, type PaneReview, type PendingJump } from './DiffPane'
 import { FileTree, type ListingState, type TreeScope } from './FileTree'
 import { FileFinder } from './FileFinder'
 import { Toast, type ToastMessage } from './Toast'
 import { ThreadCard } from './ThreadCard'
+import { Composer } from './Composer'
 
 interface Props {
   route: PrRoute
@@ -285,6 +291,40 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
     if (review.error) showToast(`Couldn't load the review comments: ${review.error.message}`, { label: 'Retry', run: retryReview })
   }, [review.error, retryReview, showToast])
 
+  // Open comment boxes, per pull request; a box's text survives file switches and reloads.
+  const drafts = useMemo(() => new DraftStore(`${repo.host}/${repo.owner}/${repo.repo}#${pr.number}`, sessionDraftStorage()), [repo, pr.number])
+  const draftViews = useSyncExternalStore(drafts.subscribe, drafts.getSnapshot)
+  const writing = useRef({ store: review.store, retry: retryReview, head })
+  writing.current = { store: review.store, retry: retryReview, head }
+  /** Sends the draft `key` as a new thread on `target`, at the head the page shows. */
+  const sendThread = useCallback(
+    (key: string, target: NewThreadTarget & { path: string }, mode: CommentMode) => {
+      void drafts.send(key, async (body) => {
+        const { store, retry, head } = writing.current
+        if (!store) throw new Error("The review comments haven't loaded yet")
+        try {
+          const posted = await postThread(
+            {
+              store,
+              create: (req) => createThread(repo, pr.number, req),
+              read: () => getThreads(repo, pr.number),
+              reread: retry,
+              settle: () => new Promise((r) => setTimeout(r, 1000)),
+            },
+            { ...target, head, body, mode },
+          )
+          if (posted.submitError) {
+            showToast(`Your comment was added to a pending review, but posting the review failed: ${posted.submitError}`)
+          }
+        } catch (e) {
+          if (e instanceof ApiError && e.code === 'stale_head') showToast(e.message, { label: 'Refresh', run: onRefresh })
+          throw e
+        }
+      })
+    },
+    [drafts, repo, pr.number, showToast, onRefresh],
+  )
+
   const currentIndex = changedCurrent ? order.indexOf(changedCurrent) : -1
   /** A changed file, or an unchanged file of the head tree. */
   const current: ChangedFile | TreeEntry | null =
@@ -310,6 +350,32 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
   }, [snapshot, current, settling])
   const threadCounts = useMemo(() => (snapshot ? fileCounts(snapshot.threads, files) : new Map()), [snapshot, files])
   const renderThread = useCallback((thread: ReviewThread, reason?: PanelReason) => <ThreadCard thread={thread} reason={reason} />, [])
+
+  // GitHub takes comments on the files it lists for the pull request (those with a viewed mark).
+  const commentPath = changedCurrent && marks.has(changedCurrent.path) && snapshot ? changedCurrent.path : null
+  const fileTarget = useMemo<DraftTarget | null>(() => (commentPath === null ? null : { kind: 'file', path: commentPath }), [commentPath])
+  const fileKey = fileTarget ? draftKey(fileTarget) : null
+  const fileDraft = fileKey ? draftViews.get(fileKey) : undefined
+  const commentOnFile = useCallback(() => fileTarget && drafts.open(fileTarget, head), [drafts, fileTarget, head])
+  const pendingReview = snapshot?.pendingReview != null
+  const locked = snapshot?.locked ?? false
+  const fileComposer = useMemo(
+    () =>
+      fileKey && fileDraft && commentPath !== null ? (
+        <Composer
+          key={fileKey}
+          drafts={drafts}
+          draftKey={fileKey}
+          view={fileDraft}
+          pendingReview={pendingReview}
+          locked={locked}
+          label={`Comment on ${commentPath}`}
+          onSend={(mode) => sendThread(fileKey, { subjectType: 'FILE', path: commentPath }, mode)}
+        />
+      ) : undefined,
+    [drafts, fileKey, fileDraft, commentPath, pendingReview, locked, sendThread],
+  )
+
   const paneReview = useMemo<PaneReview | undefined>(() => {
     if (!fileThreads) return undefined
     const stale = !headOk && !settling && fileThreads.some((t) => t.subjectType === 'LINE')
@@ -317,6 +383,7 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
       threads: fileThreads,
       headOk,
       renderThread,
+      composer: fileComposer,
       notice: stale ? (
         <div className="pane-threads-notice">
           <span>These comments are from another version of the pull request, so they're listed here.</span>
@@ -326,7 +393,7 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
         </div>
       ) : undefined,
     }
-  }, [fileThreads, headOk, settling, renderThread, onRefresh])
+  }, [fileThreads, headOk, settling, renderThread, fileComposer, onRefresh])
 
   // Without a valid ?file=, show the first file (replace, so Back leaves the PR).
   useEffect(() => {
@@ -408,8 +475,14 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
     let lastShift = 0
     const onKeyDown = (e: KeyboardEvent) => {
       const { neighbor, openFile, finderOpen, toggleCurrentViewed } = nav.current
+      // In a comment box (or any text field) keys are text, but Ctrl+P (the box keeps its draft).
+      const typing = isTypingTarget(e.target)
       if (e.key === 'Shift') {
         if (e.repeat) return
+        if (typing) {
+          lastShift = 0
+          return
+        }
         const now = performance.now()
         if (!finderOpen && now - lastShift < DOUBLE_SHIFT_MS) {
           lastShift = 0
@@ -425,6 +498,12 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
         e.stopPropagation()
       }
       const plain = !e.altKey && !e.ctrlKey && !e.metaKey
+      if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'p') {
+        consume()
+        setFinderOpen(true)
+        return
+      }
+      if (typing) return
       if (e.key === 'F7' && plain) {
         // Captured on window before Monaco sees it: overrides its accessible-diff-viewer binding.
         consume()
@@ -441,12 +520,7 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
         if (target) openFile(target.path)
         return
       }
-      if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'p') {
-        consume()
-        setFinderOpen(true)
-        return
-      }
-      if (plain && !e.shiftKey && isVKey(e) && !e.repeat && !e.isComposing && !isTypingTarget(e.target)) {
+      if (plain && !e.shiftKey && isVKey(e) && !e.repeat && !e.isComposing) {
         consume()
         toggleCurrentViewed()
       }
@@ -543,7 +617,18 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
               sideBySide={sideBySide}
               ignoreTrimWhitespace={ignoreWs}
               pendingJump={pendingJump}
-              headerActions={changedCurrent && <ViewedCheck path={changedCurrent.path} mark={marks.get(changedCurrent.path)} onToggle={toggleViewed} />}
+              headerActions={
+                changedCurrent && (
+                  <>
+                    {fileTarget && (
+                      <button className="btn" onClick={commentOnFile} title="Comment on the whole file">
+                        Comment on file
+                      </button>
+                    )}
+                    <ViewedCheck path={changedCurrent.path} mark={marks.get(changedCurrent.path)} onToggle={toggleViewed} />
+                  </>
+                )
+              }
               review={paneReview}
               onChangeInfo={setChangeInfo}
             />

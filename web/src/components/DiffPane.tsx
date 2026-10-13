@@ -46,6 +46,8 @@ export interface PaneReview {
   renderThread(thread: ReviewThread, reason?: PanelReason): React.ReactNode
   /** Shown above the listed threads. */
   notice?: React.ReactNode
+  /** The open box for a new comment on the file, shown with the listed threads. */
+  composer?: React.ReactNode
 }
 
 interface Props {
@@ -528,7 +530,9 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
         plainReason={state.kind === 'text' || state.kind === 'single' ? state.plainReason : null}
         actions={headerActions}
       />
-      {review && placement && <PaneThreads items={placement.panel} renderThread={review.renderThread} notice={review.notice} />}
+      {review && placement && (
+        <PaneThreads items={placement.panel} renderThread={review.renderThread} notice={review.notice} composer={review.composer} />
+      )}
       <div className="diff-body">
         {singleWanted && (
           <div className={`diff-editor single-editor${showSingle ? '' : ' is-hidden'}`} data-testid="single-editor">
