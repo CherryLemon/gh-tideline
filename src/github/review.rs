@@ -79,6 +79,77 @@ query($id: ID!, $cursor: String) {
     comment_fragment!()
 );
 
+const REVIEW_STATE_QUERY: &str = concat!(
+    r#"
+query($owner: String!, $repo: String!, $number: Int!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      id headRefOid
+      reviews(states: [PENDING], first: 5) { nodes { ...PendingReview } }
+    }
+  }
+}
+"#,
+    pending_review_fragment!()
+);
+
+const THREAD_QUERY: &str = concat!(
+    r#"
+query($id: ID!) {
+  node(id: $id) { __typename ...Thread }
+}
+"#,
+    thread_fragment!(),
+    comment_fragment!()
+);
+
+const ADD_REVIEW: &str = concat!(
+    r#"
+mutation($pr: ID!, $commit: GitObjectID!, $event: PullRequestReviewEvent,
+         $threads: [DraftPullRequestReviewThread]) {
+  addPullRequestReview(input: {pullRequestId: $pr, commitOID: $commit, event: $event,
+                               threads: $threads}) {
+    pullRequestReview { ...PendingReview comments(first: 1) { nodes { id } } }
+  }
+}
+"#,
+    pending_review_fragment!()
+);
+
+const ADD_THREAD: &str = concat!(
+    r#"
+mutation($review: ID!, $path: String!, $body: String!,
+         $subjectType: PullRequestReviewThreadSubjectType, $line: Int, $side: DiffSide,
+         $startLine: Int, $startSide: DiffSide) {
+  addPullRequestReviewThread(input: {pullRequestReviewId: $review, path: $path, body: $body,
+                                     subjectType: $subjectType, line: $line, side: $side,
+                                     startLine: $startLine, startSide: $startSide}) {
+    thread { ...Thread }
+  }
+}
+"#,
+    thread_fragment!(),
+    comment_fragment!()
+);
+
+const SUBMIT_REVIEW: &str = r#"
+mutation($review: ID!, $event: PullRequestReviewEvent!, $body: String) {
+  submitPullRequestReview(input: {pullRequestReviewId: $review, event: $event, body: $body}) {
+    pullRequestReview { id }
+  }
+}
+"#;
+
+const DELETE_REVIEW: &str = r#"
+mutation($review: ID!) {
+  deletePullRequestReview(input: {pullRequestReviewId: $review}) { pullRequestReview { id } }
+}
+"#;
+
+/// What GitHub says when it does not take a line for a comment (a null thread, no error).
+const LINE_REJECTED: &str =
+    "GitHub only takes comments on lines in the diff, or within 3 lines of a change";
+
 /// Everything the diff view needs about review comments, read fresh from GitHub.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -159,6 +230,71 @@ pub struct ReviewComment {
 pub struct Author {
     pub login: String,
     pub avatar_url: Option<String>,
+}
+
+/// What every write starts from, read fresh: the PR's node id, its head and the viewer's
+/// pending review.
+#[derive(Debug, Clone)]
+pub struct ReviewState {
+    pub pr_id: String,
+    pub head: String,
+    pub pending: Option<PendingReview>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum DiffSide {
+    Left,
+    Right,
+}
+
+impl DiffSide {
+    fn as_str(self) -> &'static str {
+        match self {
+            DiffSide::Left => "LEFT",
+            DiffSide::Right => "RIGHT",
+        }
+    }
+}
+
+/// What a new thread is on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThreadTarget {
+    File,
+    /// `line`, or `start_line..=line`, all on `side`.
+    Lines {
+        side: DiffSide,
+        line: u32,
+        start_line: Option<u32>,
+    },
+}
+
+/// A thread to start, already validated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewThread {
+    pub path: String,
+    pub body: String,
+    pub target: ThreadTarget,
+}
+
+impl NewThread {
+    /// The line fields as GraphQL variables (null for a file).
+    fn line_fields(&self) -> serde_json::Value {
+        match &self.target {
+            ThreadTarget::File => json!({ "line": null, "side": null, "startLine": null,
+                                          "startSide": null }),
+            ThreadTarget::Lines {
+                side,
+                line,
+                start_line,
+            } => json!({
+                "line": line,
+                "side": side.as_str(),
+                "startLine": start_line,
+                "startSide": start_line.map(|_| side.as_str()),
+            }),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -300,6 +436,100 @@ struct ThreadNode {
     comments: Option<Page<GqlComment>>,
 }
 
+#[derive(Deserialize)]
+struct StateData {
+    repository: Option<StateRepository>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StateRepository {
+    pull_request: Option<StatePr>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StatePr {
+    id: String,
+    head_ref_oid: String,
+    reviews: Option<Nodes<GqlPendingReview>>,
+}
+
+#[derive(Deserialize)]
+struct NodeData {
+    node: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AddReviewData {
+    add_pull_request_review: Option<AddReviewPayload>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AddReviewPayload {
+    pull_request_review: Option<GqlAddedReview>,
+}
+
+#[derive(Deserialize)]
+struct GqlAddedReview {
+    #[serde(flatten)]
+    review: GqlPendingReview,
+    comments: Nodes<GqlId>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AddThreadData {
+    add_pull_request_review_thread: Option<AddThreadPayload>,
+}
+
+#[derive(Deserialize)]
+struct AddThreadPayload {
+    thread: Option<GqlThread>,
+}
+
+/// GitHub's own words for lines it does not take in a review ("Line could not be resolved"),
+/// said the way `add_thread` says them.
+fn line_rejection(e: AppError) -> AppError {
+    if e.code == ErrorCode::Rejected && e.message.contains("could not be resolved") {
+        AppError::rejected(LINE_REJECTED)
+    } else {
+        e
+    }
+}
+
+/// The thread of a `node(id:)` query; `None` for no node, or a node of another type.
+fn thread_node(node: Option<serde_json::Value>) -> Result<Option<GqlThread>, AppError> {
+    let Some(node) = node.filter(|n| n["__typename"] == "PullRequestReviewThread") else {
+        return Ok(None);
+    };
+    serde_json::from_value(node)
+        .map(Some)
+        .map_err(|e| AppError::github(format!("unexpected review thread: {e}")))
+}
+
+/// The thread `addPullRequestReviewThread` created; no thread means GitHub did not take it.
+/// `None`: it was created, but came back without its comment (read it again).
+fn added_thread(
+    data: AddThreadData,
+    target: &ThreadTarget,
+) -> Result<Option<ReviewThread>, AppError> {
+    let Some(added) = data.add_pull_request_review_thread.and_then(|p| p.thread) else {
+        return Err(AppError::rejected(match target {
+            ThreadTarget::File => "GitHub did not take a comment on this file",
+            ThreadTarget::Lines { .. } => LINE_REJECTED,
+        }));
+    };
+    let id = added.id.clone();
+    let thread = added.into_api(Vec::new());
+    if thread.is_none() {
+        eprintln!("gh-tideline: GitHub returned the new thread {id} without its comment");
+    }
+    Ok(thread)
+}
+
 fn side(s: Option<String>) -> Option<String> {
     s.filter(|s| s == "LEFT" || s == "RIGHT")
 }
@@ -420,18 +650,27 @@ impl GqlThread {
     }
 }
 
+impl GqlPendingReview {
+    fn into_api(self) -> PendingReview {
+        PendingReview {
+            id: self.id,
+            body: self.body,
+            commit: self
+                .commit
+                .map(|c| c.oid)
+                .filter(|oid| check_oid(oid).is_ok()),
+            created_at: self.created_at,
+            url: self.url,
+        }
+    }
+}
+
 fn pending_review(reviews: Option<Nodes<GqlPendingReview>>) -> Option<PendingReview> {
     reviews?
         .into_vec()
         .into_iter()
         .find(|r| r.viewer_did_author)
-        .map(|r| PendingReview {
-            id: r.id,
-            body: r.body,
-            commit: r.commit.map(|c| c.oid).filter(|oid| check_oid(oid).is_ok()),
-            created_at: r.created_at,
-            url: r.url,
-        })
+        .map(GqlPendingReview::into_api)
 }
 
 /// Reads of a PR whose head moves between thread pages are retried this many times in total.
@@ -595,6 +834,175 @@ impl Github {
             }
         }
         Ok(out)
+    }
+}
+
+impl Github {
+    /// The PR's node id, head and the viewer's pending review, read fresh before a write.
+    pub async fn review_state(
+        &self,
+        host: &str,
+        token: &str,
+        owner: &str,
+        repo: &str,
+        number: u64,
+    ) -> Result<ReviewState, AppError> {
+        let data: StateData = self
+            .graphql(
+                host,
+                token,
+                REVIEW_STATE_QUERY,
+                json!({ "owner": owner, "repo": repo, "number": number }),
+            )
+            .await?;
+        let pr = data
+            .repository
+            .and_then(|r| r.pull_request)
+            .ok_or_else(|| {
+                AppError::not_found(format!("pull request {owner}/{repo}#{number} not found"))
+            })?;
+        check_oid(&pr.head_ref_oid)?;
+        Ok(ReviewState {
+            pr_id: pr.id,
+            head: pr.head_ref_oid,
+            pending: pending_review(pr.reviews),
+        })
+    }
+
+    /// One review thread with all its comments; `None` once it is gone.
+    pub async fn review_thread(
+        &self,
+        host: &str,
+        token: &str,
+        id: &str,
+    ) -> Result<Option<ReviewThread>, AppError> {
+        let data: NodeData = match self
+            .graphql(host, token, THREAD_QUERY, json!({ "id": id }))
+            .await
+        {
+            Ok(data) => data,
+            Err(e) if e.code == ErrorCode::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let Some(thread) = thread_node(data.node)? else {
+            return Ok(None);
+        };
+        let extra = match thread.comments.next_cursor() {
+            Some(cursor) => self.more_comments(host, token, &thread.id, cursor).await?,
+            None => Vec::new(),
+        };
+        Ok(thread.into_api(extra))
+    }
+
+    /// Starts the viewer's pending review on `commit`.
+    pub async fn start_review(
+        &self,
+        host: &str,
+        token: &str,
+        pr_id: &str,
+        commit: &str,
+    ) -> Result<PendingReview, AppError> {
+        let added = self
+            .add_review(host, token, json!({ "pr": pr_id, "commit": commit }))
+            .await?;
+        Ok(added.review.into_api())
+    }
+
+    /// Posts a comment on lines right away, as a review of that one comment on `commit`.
+    /// GitHub refuses the whole review when it does not take the lines. Returns the comment's
+    /// id (GitHub does not return its thread).
+    pub async fn comment_on_lines(
+        &self,
+        host: &str,
+        token: &str,
+        pr_id: &str,
+        commit: &str,
+        thread: &NewThread,
+    ) -> Result<Option<String>, AppError> {
+        if thread.target == ThreadTarget::File {
+            return Err(AppError::bad_request(
+                "a comment on a file needs a pending review",
+            ));
+        }
+        let mut draft = thread.line_fields();
+        draft["path"] = json!(thread.path);
+        draft["body"] = json!(thread.body);
+        let added = self
+            .add_review(
+                host,
+                token,
+                json!({ "pr": pr_id, "commit": commit, "event": "COMMENT", "threads": [draft] }),
+            )
+            .await
+            .map_err(line_rejection)?;
+        Ok(added.comments.into_vec().into_iter().next().map(|c| c.id))
+    }
+
+    async fn add_review(
+        &self,
+        host: &str,
+        token: &str,
+        variables: serde_json::Value,
+    ) -> Result<GqlAddedReview, AppError> {
+        let data: AddReviewData = self.mutate(host, token, ADD_REVIEW, variables).await?;
+        data.add_pull_request_review
+            .and_then(|p| p.pull_request_review)
+            .ok_or_else(|| AppError::github("GitHub returned no review"))
+    }
+
+    /// Adds a thread to the pending review `review_id`. GitHub answers lines it does not take
+    /// with no thread and no error; that is `rejected` here. `None`: added, but GitHub's
+    /// answer lacks the thread's comment.
+    pub async fn add_thread(
+        &self,
+        host: &str,
+        token: &str,
+        review_id: &str,
+        thread: &NewThread,
+    ) -> Result<Option<ReviewThread>, AppError> {
+        let mut variables = thread.line_fields();
+        variables["review"] = json!(review_id);
+        variables["path"] = json!(thread.path);
+        variables["body"] = json!(thread.body);
+        variables["subjectType"] = json!(match thread.target {
+            ThreadTarget::File => "FILE",
+            ThreadTarget::Lines { .. } => "LINE",
+        });
+        let data: AddThreadData = self.mutate(host, token, ADD_THREAD, variables).await?;
+        added_thread(data, &thread.target)
+    }
+
+    /// Submits the pending review `review_id` as `event` (COMMENT, APPROVE, REQUEST_CHANGES).
+    pub async fn submit_review(
+        &self,
+        host: &str,
+        token: &str,
+        review_id: &str,
+        event: &str,
+        body: Option<&str>,
+    ) -> Result<(), AppError> {
+        let _: serde_json::Value = self
+            .mutate(
+                host,
+                token,
+                SUBMIT_REVIEW,
+                json!({ "review": review_id, "event": event, "body": body }),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Deletes the pending review `review_id` with all its comments.
+    pub async fn delete_review(
+        &self,
+        host: &str,
+        token: &str,
+        review_id: &str,
+    ) -> Result<(), AppError> {
+        let _: serde_json::Value = self
+            .mutate(host, token, DELETE_REVIEW, json!({ "review": review_id }))
+            .await?;
+        Ok(())
     }
 }
 
@@ -884,7 +1292,16 @@ mod tests {
     /// GraphQL rejects a query with an undefined or an unused fragment.
     #[test]
     fn queries_define_exactly_the_fragments_they_spread() {
-        for q in [THREADS_QUERY, THREAD_COMMENTS_QUERY] {
+        for q in [
+            THREADS_QUERY,
+            THREAD_COMMENTS_QUERY,
+            REVIEW_STATE_QUERY,
+            THREAD_QUERY,
+            ADD_REVIEW,
+            ADD_THREAD,
+            SUBMIT_REVIEW,
+            DELETE_REVIEW,
+        ] {
             for name in ["Comment", "Thread", "PendingReview"] {
                 let spread =
                     q.contains(&format!("...{name} ")) || q.contains(&format!("...{name}\n"));
@@ -892,6 +1309,123 @@ mod tests {
                 assert_eq!(spread, defined, "{name} in {q}");
             }
         }
+    }
+
+    #[test]
+    fn new_threads_become_graphql_variables() {
+        let new = |target| NewThread {
+            path: "src/a.rs".into(),
+            body: "x".into(),
+            target,
+        };
+        assert_eq!(
+            new(ThreadTarget::File).line_fields(),
+            json!({ "line": null, "side": null, "startLine": null, "startSide": null })
+        );
+        assert_eq!(
+            new(ThreadTarget::Lines {
+                side: DiffSide::Left,
+                line: 9,
+                start_line: None
+            })
+            .line_fields(),
+            json!({ "line": 9, "side": "LEFT", "startLine": null, "startSide": null })
+        );
+        assert_eq!(
+            new(ThreadTarget::Lines {
+                side: DiffSide::Right,
+                line: 9,
+                start_line: Some(4)
+            })
+            .line_fields(),
+            json!({ "line": 9, "side": "RIGHT", "startLine": 4, "startSide": "RIGHT" })
+        );
+    }
+
+    #[test]
+    fn written_reviews_and_threads_are_read_back() {
+        let review: AddReviewData = serde_json::from_str(
+            r#"{"addPullRequestReview": {"pullRequestReview": {"id": "PRR_9", "body": "",
+                "createdAt": "2026-10-13T00:00:00Z", "url": "https://github.com/o/r/pull/1#pullrequestreview-9",
+                "viewerDidAuthor": true, "commit": {"oid": "2222222222222222222222222222222222222222"},
+                "comments": {"nodes": [{"id": "PRRC_1"}]}}}}"#,
+        )
+        .unwrap();
+        let added = review
+            .add_pull_request_review
+            .and_then(|p| p.pull_request_review)
+            .unwrap();
+        assert_eq!(added.comments.into_vec()[0].id, "PRRC_1");
+        assert_eq!(added.review.into_api().commit.as_deref(), Some(HEAD));
+
+        // GitHub answers lines it does not take with a null thread and no error (spike S12).
+        let none: AddThreadData =
+            serde_json::from_str(r#"{"addPullRequestReviewThread": {"thread": null}}"#).unwrap();
+        let line = ThreadTarget::Lines {
+            side: DiffSide::Right,
+            line: 1,
+            start_line: None,
+        };
+        let err = added_thread(none, &line).unwrap_err();
+        assert_eq!(
+            (err.code, err.message.as_str()),
+            (ErrorCode::Rejected, LINE_REJECTED)
+        );
+        let none: AddThreadData =
+            serde_json::from_str(r#"{"addPullRequestReviewThread": null}"#).unwrap();
+        assert_eq!(
+            added_thread(none, &ThreadTarget::File).unwrap_err().code,
+            ErrorCode::Rejected
+        );
+        let t = thread(
+            "PRRT_9",
+            "LINE",
+            "RIGHT",
+            "null",
+            "3",
+            "null",
+            &[comment("C1", "PENDING", "me")],
+            false,
+        );
+        let some: AddThreadData = serde_json::from_str(&format!(
+            r#"{{"addPullRequestReviewThread": {{"thread": {t}}}}}"#
+        ))
+        .unwrap();
+        let got = added_thread(some, &line).unwrap().unwrap();
+        assert_eq!((got.id.as_str(), got.line), ("PRRT_9", Some(3)));
+        // Created, but without its comment: not an error (it landed).
+        let bare = thread("PRRT_10", "LINE", "RIGHT", "null", "3", "null", &[], false);
+        let bare: AddThreadData = serde_json::from_str(&format!(
+            r#"{{"addPullRequestReviewThread": {{"thread": {bare}}}}}"#
+        ))
+        .unwrap();
+        assert!(added_thread(bare, &line).unwrap().is_none());
+
+        // The single-comment review says it its own way (spike S12).
+        let unresolved = line_rejection(AppError::rejected("Line could not be resolved"));
+        assert_eq!(unresolved.message, LINE_REJECTED);
+        let other = line_rejection(AppError::rejected("Can not approve your own pull request"));
+        assert_eq!(other.message, "Can not approve your own pull request");
+
+        // node(id:) of a thread, of something else, of nothing.
+        let node: serde_json::Value = serde_json::from_str(&t.replacen(
+            '{',
+            r#"{"__typename": "PullRequestReviewThread", "#,
+            1,
+        ))
+        .unwrap();
+        assert_eq!(
+            thread_node(Some(node)).unwrap().map(|t| t.id),
+            Some("PRRT_9".into())
+        );
+        let other = json!({ "__typename": "Issue" });
+        assert!(thread_node(Some(other)).unwrap().is_none());
+        assert!(thread_node(None).unwrap().is_none());
+        let broken = json!({ "__typename": "PullRequestReviewThread", "id": "PRRT_9" });
+        assert_eq!(
+            thread_node(Some(broken)).err().map(|e| e.code),
+            Some(ErrorCode::GithubError)
+        );
     }
 
     #[test]

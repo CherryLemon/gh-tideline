@@ -8,10 +8,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Bytes;
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, put};
+use axum::routing::{delete, get, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -56,6 +56,9 @@ pub fn state(
     })
 }
 
+/// Request bodies: a comment of GitHub's 65536 characters, JSON-escaped, with room to spare.
+const BODY_LIMIT: usize = 512 * 1024;
+
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/health", get(health))
@@ -72,10 +75,15 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/api/{host}/{owner}/{repo}/pulls/{n}/threads",
-            get(review::threads),
+            get(review::threads).post(review::create_thread),
+        )
+        .route(
+            "/api/{host}/{owner}/{repo}/pulls/{n}/review",
+            delete(review::discard_review),
         )
         .route("/api/{host}/{owner}/{repo}/blobs/{oid}", get(blob))
         .fallback(fallback)
+        .layer(DefaultBodyLimit::max(BODY_LIMIT))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             security::middleware,
@@ -137,6 +145,16 @@ fn check_repo(state: &Inner, host: &str, owner: &str, repo: &str) -> Result<(), 
         return Err(AppError::bad_request("invalid owner or repo name"));
     }
     Ok(())
+}
+
+fn check_head(head: &str) -> Result<(), AppError> {
+    if is_oid(head) {
+        Ok(())
+    } else {
+        Err(AppError::bad_request(
+            "head must be 40 (or 64) lowercase hex characters",
+        ))
+    }
 }
 
 fn parse_pr_number(n: &str) -> Result<u64, AppError> {
@@ -254,11 +272,7 @@ async fn set_viewed(
     let number = parse_pr_number(&n)?;
     let body: ViewedBody = serde_json::from_slice(&body)
         .map_err(|e| AppError::bad_request(format!("invalid request body: {e}")))?;
-    if !is_oid(&body.head) {
-        return Err(AppError::bad_request(
-            "head must be 40 (or 64) lowercase hex characters",
-        ));
-    }
+    check_head(&body.head)?;
     let key = PrKey {
         host,
         owner,

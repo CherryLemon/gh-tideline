@@ -15,6 +15,8 @@ pub enum ErrorCode {
     BadRequest,
     StaleHead,
     Rejected,
+    PendingReviewExists,
+    ReviewChanged,
 }
 
 impl ErrorCode {
@@ -29,6 +31,8 @@ impl ErrorCode {
             ErrorCode::BadRequest => "bad_request",
             ErrorCode::StaleHead => "stale_head",
             ErrorCode::Rejected => "rejected",
+            ErrorCode::PendingReviewExists => "pending_review_exists",
+            ErrorCode::ReviewChanged => "review_changed",
         }
     }
 
@@ -43,6 +47,8 @@ impl ErrorCode {
             ErrorCode::BadRequest => StatusCode::BAD_REQUEST,
             ErrorCode::StaleHead => StatusCode::CONFLICT,
             ErrorCode::Rejected => StatusCode::UNPROCESSABLE_ENTITY,
+            ErrorCode::PendingReviewExists => StatusCode::CONFLICT,
+            ErrorCode::ReviewChanged => StatusCode::CONFLICT,
         }
     }
 }
@@ -87,6 +93,15 @@ impl AppError {
     /// GitHub refused a write; the message is GitHub's.
     pub fn rejected(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::Rejected, message)
+    }
+    /// A single comment while the viewer has a pending review (GitHub allows one per PR).
+    pub fn pending_review_exists(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::PendingReviewExists, message)
+    }
+    /// The viewer's pending review on GitHub is not the one the client acts on (submitted,
+    /// discarded or started elsewhere).
+    pub fn review_changed(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::ReviewChanged, message)
     }
 }
 

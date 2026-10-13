@@ -11,7 +11,9 @@ use serde_json::json;
 
 use crate::error::{AppError, ErrorCode};
 
-pub use review::ReviewThreads;
+pub use review::{
+    DiffSide, NewThread, PendingReview, ReviewState, ReviewThread, ReviewThreads, ThreadTarget,
+};
 
 const TOKEN_TTL: Duration = Duration::from_secs(600);
 
@@ -349,6 +351,9 @@ impl Github {
         if !status.is_success() {
             return Err(http_error("GraphQL", status, &text));
         }
+        if op == Op::Write {
+            return write_result(&text);
+        }
         let parsed: GqlResponse<T> = serde_json::from_str(&text)
             .map_err(|e| AppError::github(format!("unexpected GraphQL response: {e}")))?;
         if let Some(errors) = parsed.errors.filter(|e| !e.is_empty()) {
@@ -477,6 +482,49 @@ enum Op {
 /// The error for a GraphQL response's `errors`. GitHub refusing a write (`UNPROCESSABLE`:
 /// the comment's line isn't in the diff, approving your own PR, ...; `FORBIDDEN`: no
 /// permission) is `rejected`; the same on a read is a `github_error` like any other.
+/// What a mutation returned. A mutation whose payload came back happened, even when GitHub
+/// also reports errors (about some field of the answer): those are logged, not returned, so
+/// the client doesn't take a write that landed for one that failed. An answer that can't be
+/// read is still an error (502): the client looks before trying again.
+fn write_result<T: DeserializeOwned>(text: &str) -> Result<T, AppError> {
+    let parsed: GqlResponse<serde_json::Value> = serde_json::from_str(text)
+        .map_err(|e| AppError::github(format!("unexpected GraphQL response: {e}")))?;
+    let landed = payload_returned(parsed.data.as_ref());
+    if let Some(errors) = parsed.errors.filter(|e| !e.is_empty()) {
+        if !landed {
+            return Err(classify_gql_errors(&errors, Op::Write));
+        }
+        let messages: Vec<&str> = errors.iter().map(|e| e.message.as_str()).collect();
+        eprintln!(
+            "gh-tideline: GitHub made a change but reported: {}",
+            messages.join("; ")
+        );
+    }
+    let data = parsed
+        .data
+        .ok_or_else(|| AppError::github("GraphQL response has no data"))?;
+    serde_json::from_value(data).map_err(|e| {
+        let made = if landed {
+            "GitHub made the change, but "
+        } else {
+            ""
+        };
+        AppError::github(format!("{made}its answer was unexpected: {e}"))
+    })
+}
+
+/// Whether some mutation in `data` returned a payload with a value in it.
+fn payload_returned(data: Option<&serde_json::Value>) -> bool {
+    let Some(data) = data.and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+    data.values().any(|payload| {
+        payload
+            .as_object()
+            .is_some_and(|p| p.values().any(|v| !v.is_null()))
+    })
+}
+
 fn classify_gql_errors(errors: &[GqlError], op: Op) -> AppError {
     let message = errors
         .iter()
@@ -586,6 +634,50 @@ mod tests {
                 (ErrorCode::GithubError, "Something went wrong; again".into())
             );
         }
+    }
+
+    #[test]
+    fn writes_that_returned_a_payload_landed() {
+        #[derive(Deserialize, Debug)]
+        #[serde(rename_all = "camelCase")]
+        struct Data {
+            delete_pull_request_review: Option<serde_json::Value>,
+        }
+        let refused = write_result::<Data>(
+            r#"{"data": {"deletePullRequestReview": null}, "errors": [{"type": "UNPROCESSABLE",
+                "message": "Can not delete"}]}"#,
+        )
+        .unwrap_err();
+        assert_eq!(refused.code, ErrorCode::Rejected);
+        // Done, with an error about some field of the answer: a success.
+        let landed = write_result::<Data>(
+            r#"{"data": {"deletePullRequestReview": {"pullRequestReview": {"id": "PRR_1"}}},
+                "errors": [{"message": "Something went wrong reading a field"}]}"#,
+        )
+        .unwrap();
+        assert!(landed.delete_pull_request_review.is_some());
+        // An answer with nothing in it says nothing about the write.
+        let empty = write_result::<Data>(
+            r#"{"data": {"deletePullRequestReview": {"clientMutationId": null}},
+                "errors": [{"type": "FORBIDDEN", "message": "no"}]}"#,
+        )
+        .unwrap_err();
+        assert_eq!(empty.code, ErrorCode::Rejected);
+        // Done, but the answer can't be read: an error that says the change was made.
+        let odd = write_result::<u32>(
+            r#"{"data": {"deletePullRequestReview": {"pullRequestReview": {"id": "PRR_1"}}}}"#,
+        )
+        .unwrap_err();
+        assert_eq!(odd.code, ErrorCode::GithubError);
+        assert!(
+            odd.message.starts_with("GitHub made the change"),
+            "{}",
+            odd.message
+        );
+        assert_eq!(
+            write_result::<u32>("not json").unwrap_err().code,
+            ErrorCode::GithubError
+        );
     }
 
     #[test]
