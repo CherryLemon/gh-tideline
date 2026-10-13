@@ -78,6 +78,13 @@ type PaneState =
 /** Which editor shows a file: the diff editor, or the plain one for unchanged files. */
 type Attached = 'diff' | 'single' | null
 
+/** Where the threads of `path` went; `diff`: placed against a computed diff. */
+interface Placed {
+  path: string
+  diff: boolean
+  placement: Placement
+}
+
 /** Diff limits for the attached file; a force-loaded file has none. */
 function diffLimits(forced: boolean): Pick<Monaco.editor.IDiffEditorOptions, 'maxComputationTime' | 'maxFileSize'> {
   return {
@@ -442,15 +449,15 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
   const oldPath = changed?.oldPath !== undefined && changed.oldPath !== changed.path ? changed.oldPath : undefined
   const threads = review?.threads
   const headOk = review?.headOk ?? true
-  const lastPlaced = useRef<{ path: string; placement: Placement } | null>(null)
-  const placed = useMemo<{ path: string; placement: Placement } | null>(() => {
+  const lastPlaced = useRef<Placed | null>(null)
+  const placed = useMemo<Placed | null>(() => {
     if (!threads) return null
     if (state.kind === 'loading') return lastPlaced.current?.path === file.path ? lastPlaced.current : null
     const ed = editorRef.current
     const model = state.kind === 'text' && attached === 'diff' ? ed?.getModel() : null
     const lineChanges = model ? (ed?.getLineChanges() ?? null) : null
     // The new content of a reloaded file is shown before its diff is computed.
-    if (model && !lineChanges && lastPlaced.current?.path === file.path) return lastPlaced.current
+    if (model && !lineChanges && lastPlaced.current?.path === file.path && lastPlaced.current.diff) return lastPlaced.current
     const placement = placeThreads({
       threads,
       oldPath,
@@ -459,7 +466,7 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
       lineCounts: { original: model?.original.getLineCount() ?? 0, modified: model?.modified.getLineCount() ?? 0 },
       headOk,
     })
-    return { path: file.path, placement }
+    return { path: file.path, diff: lineChanges !== null, placement }
     // `diffTick` stands for the editor's diff, read above.
   }, [threads, file.path, oldPath, state.kind, attached, sideBySide, headOk, diffTick])
   const placement = placed?.placement ?? null

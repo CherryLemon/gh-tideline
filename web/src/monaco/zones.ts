@@ -101,9 +101,10 @@ export class ZoneHost {
     this.observer = new ResizeObserver((entries) => this.onResize(entries))
     for (const ed of [diff.getOriginalEditor(), diff.getModifiedEditor()]) {
       this.disposables.push(ed.onDidLayoutChange(() => this.layoutWidths(ed)))
+      // A new model drops that editor's view zones; its cards wait, hidden, for the next sync.
+      // An editor given the model it already has (one side unchanged) keeps its zones.
+      this.disposables.push(ed.onDidChangeModel(() => this.reset(ed)))
     }
-    // A new model drops the view zones; the cards wait, hidden, for the next sync.
-    this.disposables.push(diff.onDidChangeModel(() => this.reset()))
   }
 
   /** The node to render a card into; it exists from the first call until the card is synced away. */
@@ -153,7 +154,8 @@ export class ZoneHost {
             afterLineNumber: c.spec.afterLine,
             ordinal: c.spec.ordinal,
             heightInPx: this.measure(c) ?? c.height ?? ESTIMATED_HEIGHT,
-            domNode: document.createElement('div'),
+            // The space the card's overlay is drawn over.
+            domNode: Object.assign(document.createElement('div'), { className: 'tl-zone-space' }),
             onDomNodeTop: (top) => this.place(c, top),
           }
           c.zone = zone
@@ -172,8 +174,9 @@ export class ZoneHost {
   }
 
   /** The zones are gone (the model changed): hide the cards, keeping their nodes. */
-  private reset(): void {
+  private reset(ed: CodeEditorT): void {
     for (const c of this.cards.values()) {
+      if (c.host !== ed) continue
       c.zone = null
       c.zoneId = null
       this.place(c, PARKED_TOP)
