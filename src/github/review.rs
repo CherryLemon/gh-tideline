@@ -1,10 +1,12 @@
 //! Review threads and the viewer's pending review (GraphQL).
 
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::{Github, GqlPageInfo, check_oid};
-use crate::error::AppError;
+use crate::error::{AppError, ErrorCode};
 
 // GraphQL rejects unused fragments, so each query concatenates exactly the ones it spreads.
 macro_rules! comment_fragment {
@@ -302,7 +304,8 @@ fn side(s: Option<String>) -> Option<String> {
     s.filter(|s| s == "LEFT" || s == "RIGHT")
 }
 
-/// A range start only counts with its own side, and on the same side it must come first.
+/// A range start only counts with its own side and an end, and on the same side it must come
+/// first.
 /// (GitHub returns `startLine == line` with no start side for single-line threads, and odd
 /// values for some.)
 fn range_start(
@@ -311,10 +314,11 @@ fn range_start(
     end: Option<u32>,
     end_side: &Option<String>,
 ) -> Option<u32> {
-    let (start, start_side) = (start?, start_side.as_ref()?);
-    match end {
-        Some(end) if Some(start_side) == end_side.as_ref() && start >= end => None,
-        _ => Some(start),
+    let (start, start_side, end) = (start?, start_side.as_ref()?, end?);
+    if Some(start_side) == end_side.as_ref() && start >= end {
+        None
+    } else {
+        Some(start)
     }
 }
 
@@ -328,7 +332,13 @@ impl GqlComment {
             created_at: self.created_at,
             last_edited_at: self.last_edited_at,
             url: self.url,
-            state: self.state,
+            // GitHub's enum has only these two; anything new is treated as posted.
+            state: if self.state == "PENDING" {
+                "PENDING"
+            } else {
+                "SUBMITTED"
+            }
+            .to_string(),
             review_id: self.pull_request_review.map(|r| r.id),
             reply_to: self.reply_to.map(|r| r.id),
             is_minimized: self.is_minimized,
@@ -424,6 +434,51 @@ fn pending_review(reviews: Option<Nodes<GqlPendingReview>>) -> Option<PendingRev
         })
 }
 
+/// Reads of a PR whose head moves between thread pages are retried this many times in total.
+const THREAD_READ_ATTEMPTS: usize = 3;
+
+/// The thread pages read so far.
+#[derive(Default)]
+struct ThreadPages {
+    head: String,
+    locked: bool,
+    pending: Option<PendingReview>,
+    raw: Vec<GqlThread>,
+    /// A thread added or removed between pages shifts the rest, so one can come twice.
+    seen: HashSet<String>,
+}
+
+enum PageEnd {
+    Next(String),
+    Done,
+    /// Line numbers on this page refer to a different commit than the first page's.
+    HeadMoved,
+}
+
+impl ThreadPages {
+    fn add(&mut self, pr: ThreadsPr, first: bool) -> Result<PageEnd, AppError> {
+        if first {
+            check_oid(&pr.head_ref_oid)?;
+            self.head = pr.head_ref_oid;
+            self.locked = pr.locked.unwrap_or(false);
+            self.pending = pending_review(pr.reviews);
+        } else if pr.head_ref_oid != self.head {
+            return Ok(PageEnd::HeadMoved);
+        }
+        let next = pr.review_threads.next_cursor();
+        let seen = &mut self.seen;
+        self.raw.extend(
+            pr.review_threads
+                .nodes
+                .unwrap_or_default()
+                .into_iter()
+                .flatten()
+                .filter(|t| seen.insert(t.id.clone())),
+        );
+        Ok(next.map_or(PageEnd::Done, PageEnd::Next))
+    }
+}
+
 impl Github {
     /// Every review thread of the PR (all pages, all comments) plus the viewer's pending
     /// review and the head the line numbers refer to.
@@ -435,11 +490,31 @@ impl Github {
         repo: &str,
         number: u64,
     ) -> Result<ReviewThreads, AppError> {
+        for _ in 0..THREAD_READ_ATTEMPTS {
+            if let Some(threads) = self
+                .review_threads_once(host, token, owner, repo, number)
+                .await?
+            {
+                return Ok(threads);
+            }
+        }
+        Err(AppError::github(
+            "the pull request kept changing while its review threads were read; try again",
+        ))
+    }
+
+    /// One read of all thread pages; `None` if the head moved between pages, since line
+    /// numbers on the later pages would then refer to a different commit.
+    async fn review_threads_once(
+        &self,
+        host: &str,
+        token: &str,
+        owner: &str,
+        repo: &str,
+        number: u64,
+    ) -> Result<Option<ReviewThreads>, AppError> {
+        let mut pages = ThreadPages::default();
         let mut cursor: Option<String> = None;
-        let mut head = String::new();
-        let mut locked = false;
-        let mut pending = None;
-        let mut raw: Vec<GqlThread> = Vec::new();
         loop {
             let first = cursor.is_none();
             let data: ThreadsData = self
@@ -457,39 +532,38 @@ impl Github {
                 .ok_or_else(|| {
                     AppError::not_found(format!("pull request {owner}/{repo}#{number} not found"))
                 })?;
-            if first {
-                check_oid(&pr.head_ref_oid)?;
-                head = pr.head_ref_oid;
-                locked = pr.locked.unwrap_or(false);
-                pending = pending_review(pr.reviews);
-            }
-            let next = pr.review_threads.next_cursor();
-            raw.extend(
-                pr.review_threads
-                    .nodes
-                    .unwrap_or_default()
-                    .into_iter()
-                    .flatten(),
-            );
-            match next {
-                Some(c) => cursor = Some(c),
-                None => break,
+            match pages.add(pr, first)? {
+                PageEnd::Next(c) => cursor = Some(c),
+                PageEnd::Done => break,
+                PageEnd::HeadMoved => return Ok(None),
             }
         }
+        let ThreadPages {
+            head,
+            locked,
+            pending,
+            raw,
+            ..
+        } = pages;
         let mut threads = Vec::with_capacity(raw.len());
         for t in raw {
             let extra = match t.comments.next_cursor() {
-                Some(c) => self.more_comments(host, token, &t.id, c).await?,
+                Some(c) => match self.more_comments(host, token, &t.id, c).await {
+                    Ok(extra) => extra,
+                    // Deleted since the first query.
+                    Err(e) if e.code == ErrorCode::NotFound => continue,
+                    Err(e) => return Err(e),
+                },
                 None => Vec::new(),
             };
             threads.extend(t.into_api(extra));
         }
-        Ok(ReviewThreads {
+        Ok(Some(ReviewThreads {
             head,
             locked,
             pending_review: pending,
             threads,
-        })
+        }))
     }
 
     /// The comments of a thread after `cursor` (threads with more than 100 comments).
@@ -580,17 +654,49 @@ mod tests {
         )
     }
 
-    fn parse(threads: &[String], pending: &str) -> ThreadsPr {
+    /// An outdated thread: no current lines, only the original ones.
+    fn outdated(
+        id: &str,
+        side: &str,
+        start_side: &str,
+        original_line: u32,
+        original_start_line: Option<u32>,
+    ) -> String {
+        let c = comment(&format!("C{id}"), "SUBMITTED", "alice");
+        let mut t: serde_json::Value = serde_json::from_str(&thread(
+            id,
+            "LINE",
+            side,
+            start_side,
+            "null",
+            "null",
+            &[c],
+            false,
+        ))
+        .unwrap();
+        t["originalLine"] = json!(original_line);
+        t["originalStartLine"] = json!(original_start_line);
+        t["isOutdated"] = json!(true);
+        t.to_string()
+    }
+
+    fn page(head: &str, threads: &[String], pending: &str, next: Option<&str>) -> ThreadsPr {
         let body = format!(
             r#"{{"data": {{"repository": {{"pullRequest": {{
-                "headRefOid": "{HEAD}", "locked": false,
+                "headRefOid": "{head}", "locked": false,
                 "reviews": {{"nodes": [{pending}]}},
-                "reviewThreads": {{"pageInfo": {{"hasNextPage": false, "endCursor": null}}, "nodes": [{}]}}
+                "reviewThreads": {{"pageInfo": {{"hasNextPage": {}, "endCursor": {}}}, "nodes": [{}]}}
             }}}}}}}}"#,
+            next.is_some(),
+            next.map_or("null".to_string(), |c| format!("\"{c}\"")),
             threads.join(",")
         );
         let resp: GqlResponse<ThreadsData> = serde_json::from_str(&body).unwrap();
         resp.data.unwrap().repository.unwrap().pull_request.unwrap()
+    }
+
+    fn parse(threads: &[String], pending: &str) -> ThreadsPr {
+        page(HEAD, threads, pending, None)
     }
 
     fn normalize(pr: ThreadsPr) -> Vec<ReviewThread> {
@@ -786,5 +892,100 @@ mod tests {
                 assert_eq!(spread, defined, "{name} in {q}");
             }
         }
+    }
+
+    #[test]
+    fn outdated_threads_keep_their_original_range() {
+        let mut stale_start: serde_json::Value =
+            serde_json::from_str(&outdated("O2", "RIGHT", "RIGHT", 20, Some(15))).unwrap();
+        // A start without an end on the current commit is dropped.
+        stale_start["startLine"] = json!(15);
+        let t = normalize(parse(
+            &[
+                // Single line: the start echoes the line and has no side.
+                outdated("O1", "RIGHT", "null", 40, Some(40)),
+                stale_start.to_string(),
+                outdated("O3", "RIGHT", "LEFT", 5, Some(9)),
+                // Same side, start after the end: not a range.
+                outdated("O4", "LEFT", "LEFT", 5, Some(9)),
+            ],
+            "",
+        ));
+        fn original(
+            t: &ReviewThread,
+        ) -> (Option<&str>, Option<&str>, Option<u32>, Option<u32>, bool) {
+            (
+                t.side.as_deref(),
+                t.start_side.as_deref(),
+                t.original_line,
+                t.original_start_line,
+                t.is_outdated,
+            )
+        }
+        assert_eq!(original(&t[0]), (Some("RIGHT"), None, Some(40), None, true));
+        assert_eq!(
+            original(&t[1]),
+            (Some("RIGHT"), Some("RIGHT"), Some(20), Some(15), true)
+        );
+        assert_eq!((t[1].line, t[1].start_line), (None, None));
+        // Across sides the numbers are not comparable, so the start stays.
+        assert_eq!(
+            original(&t[2]),
+            (Some("RIGHT"), Some("LEFT"), Some(5), Some(9), true)
+        );
+        assert_eq!(original(&t[3]), (Some("LEFT"), None, Some(5), None, true));
+    }
+
+    #[test]
+    fn unknown_comment_states_count_as_submitted() {
+        let t = normalize(parse(
+            &[thread(
+                "T1",
+                "LINE",
+                "RIGHT",
+                "null",
+                "3",
+                "3",
+                &[comment("C1", "SOMETHING_NEW", "a")],
+                false,
+            )],
+            "",
+        ));
+        assert_eq!(t[0].comments[0].state, "SUBMITTED");
+    }
+
+    #[test]
+    fn thread_pages_are_merged_once_and_must_share_a_head() {
+        let c = |id: &str| comment(id, "SUBMITTED", "a");
+        let t = |id: &str| thread(id, "LINE", "RIGHT", "null", "3", "3", &[c(id)], false);
+        let mut pages = ThreadPages::default();
+        assert!(matches!(
+            pages.add(page(HEAD, &[t("T1"), t("T2")], "", Some("p2")), true),
+            Ok(PageEnd::Next(c)) if c == "p2"
+        ));
+        // T2 shows up again after a thread before it was added.
+        assert!(matches!(
+            pages.add(page(HEAD, &[t("T2"), t("T3")], "", None), false),
+            Ok(PageEnd::Done)
+        ));
+        let ids: Vec<&str> = pages.raw.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, ["T1", "T2", "T3"]);
+        assert_eq!(pages.head, HEAD);
+
+        let mut pages = ThreadPages::default();
+        pages
+            .add(page(HEAD, &[t("T1")], "", Some("p2")), true)
+            .unwrap();
+        let moved = "3333333333333333333333333333333333333333";
+        assert!(matches!(
+            pages.add(page(moved, &[t("T2")], "", None), false),
+            Ok(PageEnd::HeadMoved)
+        ));
+        // A bad head on the first page is an error, not a retry.
+        assert!(
+            ThreadPages::default()
+                .add(page("nope", &[], "", None), true)
+                .is_err()
+        );
     }
 }
