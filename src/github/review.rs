@@ -146,6 +146,55 @@ mutation($review: ID!) {
 }
 "#;
 
+const ADD_REPLY: &str = concat!(
+    r#"
+mutation($thread: ID!, $review: ID, $body: String!) {
+  addPullRequestReviewThreadReply(input: {pullRequestReviewThreadId: $thread,
+                                          pullRequestReviewId: $review, body: $body}) {
+    comment { ...Comment }
+  }
+}
+"#,
+    comment_fragment!()
+);
+
+const RESOLVE_THREAD: &str = concat!(
+    r#"
+mutation($thread: ID!) {
+  resolveReviewThread(input: {threadId: $thread}) { thread { ...Thread } }
+}
+"#,
+    thread_fragment!(),
+    comment_fragment!()
+);
+
+const UNRESOLVE_THREAD: &str = concat!(
+    r#"
+mutation($thread: ID!) {
+  unresolveReviewThread(input: {threadId: $thread}) { thread { ...Thread } }
+}
+"#,
+    thread_fragment!(),
+    comment_fragment!()
+);
+
+const UPDATE_COMMENT: &str = concat!(
+    r#"
+mutation($comment: ID!, $body: String!) {
+  updatePullRequestReviewComment(input: {pullRequestReviewCommentId: $comment, body: $body}) {
+    pullRequestReviewComment { ...Comment }
+  }
+}
+"#,
+    comment_fragment!()
+);
+
+const DELETE_COMMENT: &str = r#"
+mutation($comment: ID!) {
+  deletePullRequestReviewComment(input: {id: $comment}) { pullRequestReview { id } }
+}
+"#;
+
 /// What GitHub says when it does not take a line for a comment (a null thread, no error).
 const LINE_REJECTED: &str =
     "GitHub only takes comments on lines in the diff, or within 3 lines of a change";
@@ -482,12 +531,43 @@ struct GqlAddedReview {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AddThreadData {
-    add_pull_request_review_thread: Option<AddThreadPayload>,
+    add_pull_request_review_thread: Option<ThreadPayload>,
 }
 
 #[derive(Deserialize)]
-struct AddThreadPayload {
+struct ThreadPayload {
     thread: Option<GqlThread>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AddReplyData {
+    add_pull_request_review_thread_reply: Option<CommentPayload>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateCommentData {
+    update_pull_request_review_comment: Option<UpdatedComment>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdatedComment {
+    pull_request_review_comment: Option<GqlComment>,
+}
+
+#[derive(Deserialize)]
+struct CommentPayload {
+    comment: Option<GqlComment>,
+}
+
+/// `resolveReviewThread` and `unresolveReviewThread` answer alike.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResolveData {
+    #[serde(alias = "unresolveReviewThread")]
+    resolve_review_thread: Option<ThreadPayload>,
 }
 
 /// GitHub's own words for lines it does not take in a review ("Line could not be resolved"),
@@ -884,9 +964,19 @@ impl Github {
             Err(e) if e.code == ErrorCode::NotFound => return Ok(None),
             Err(e) => return Err(e),
         };
-        let Some(thread) = thread_node(data.node)? else {
-            return Ok(None);
-        };
+        match thread_node(data.node)? {
+            Some(thread) => self.full_thread(host, token, thread).await,
+            None => Ok(None),
+        }
+    }
+
+    /// `thread` with the comments after its first page.
+    async fn full_thread(
+        &self,
+        host: &str,
+        token: &str,
+        thread: GqlThread,
+    ) -> Result<Option<ReviewThread>, AppError> {
         let extra = match thread.comments.next_cursor() {
             Some(cursor) => self.more_comments(host, token, &thread.id, cursor).await?,
             None => Vec::new(),
@@ -1001,6 +1091,93 @@ impl Github {
     ) -> Result<(), AppError> {
         let _: serde_json::Value = self
             .mutate(host, token, DELETE_REVIEW, json!({ "review": review_id }))
+            .await?;
+        Ok(())
+    }
+
+    /// Replies to `thread_id`: in the pending review `review_id`, or posted right away without
+    /// one (spike S13). `None`: GitHub answered without the comment.
+    pub async fn add_reply(
+        &self,
+        host: &str,
+        token: &str,
+        thread_id: &str,
+        review_id: Option<&str>,
+        body: &str,
+    ) -> Result<Option<ReviewComment>, AppError> {
+        let data: AddReplyData = self
+            .mutate(
+                host,
+                token,
+                ADD_REPLY,
+                json!({ "thread": thread_id, "review": review_id, "body": body }),
+            )
+            .await?;
+        Ok(data
+            .add_pull_request_review_thread_reply
+            .and_then(|p| p.comment)
+            .map(GqlComment::into_api))
+    }
+
+    /// Resolves or unresolves `thread_id`; returns the thread as it is now.
+    pub async fn set_resolved(
+        &self,
+        host: &str,
+        token: &str,
+        thread_id: &str,
+        resolved: bool,
+    ) -> Result<ReviewThread, AppError> {
+        let query = if resolved {
+            RESOLVE_THREAD
+        } else {
+            UNRESOLVE_THREAD
+        };
+        let data: ResolveData = self
+            .mutate(host, token, query, json!({ "thread": thread_id }))
+            .await?;
+        let thread = match data.resolve_review_thread.and_then(|p| p.thread) {
+            Some(thread) => self.full_thread(host, token, thread).await?,
+            None => None,
+        };
+        thread.ok_or_else(|| AppError::github("GitHub did not return the thread"))
+    }
+
+    /// Replaces the body of the comment `comment_id`.
+    pub async fn update_comment(
+        &self,
+        host: &str,
+        token: &str,
+        comment_id: &str,
+        body: &str,
+    ) -> Result<ReviewComment, AppError> {
+        let data: UpdateCommentData = self
+            .mutate(
+                host,
+                token,
+                UPDATE_COMMENT,
+                json!({ "comment": comment_id, "body": body }),
+            )
+            .await?;
+        data.update_pull_request_review_comment
+            .and_then(|p| p.pull_request_review_comment)
+            .map(GqlComment::into_api)
+            .ok_or_else(|| AppError::github("GitHub did not return the comment"))
+    }
+
+    /// Deletes the comment `comment_id` (a submitted one, or one in the pending review).
+    pub async fn delete_comment(
+        &self,
+        host: &str,
+        token: &str,
+        comment_id: &str,
+    ) -> Result<(), AppError> {
+        let _: serde_json::Value = self
+            .mutate(
+                host,
+                token,
+                DELETE_COMMENT,
+                json!({ "comment": comment_id }),
+            )
             .await?;
         Ok(())
     }
@@ -1301,6 +1478,11 @@ mod tests {
             ADD_THREAD,
             SUBMIT_REVIEW,
             DELETE_REVIEW,
+            ADD_REPLY,
+            RESOLVE_THREAD,
+            UNRESOLVE_THREAD,
+            UPDATE_COMMENT,
+            DELETE_COMMENT,
         ] {
             for name in ["Comment", "Thread", "PendingReview"] {
                 let spread =
@@ -1426,6 +1608,54 @@ mod tests {
             thread_node(Some(broken)).err().map(|e| e.code),
             Some(ErrorCode::GithubError)
         );
+    }
+
+    #[test]
+    fn thread_writes_are_read_back() {
+        let c = comment("PRRC_7", "PENDING", "me");
+        let reply: AddReplyData = serde_json::from_str(&format!(
+            r#"{{"addPullRequestReviewThreadReply": {{"comment": {c}}}}}"#
+        ))
+        .unwrap();
+        let got = reply
+            .add_pull_request_review_thread_reply
+            .and_then(|p| p.comment)
+            .map(GqlComment::into_api)
+            .unwrap();
+        assert_eq!((got.id.as_str(), got.state.as_str()), ("PRRC_7", "PENDING"));
+        let none: AddReplyData =
+            serde_json::from_str(r#"{"addPullRequestReviewThreadReply": {"comment": null}}"#)
+                .unwrap();
+        assert!(
+            none.add_pull_request_review_thread_reply
+                .and_then(|p| p.comment)
+                .is_none()
+        );
+
+        let edited: UpdateCommentData = serde_json::from_str(&format!(
+            r#"{{"updatePullRequestReviewComment": {{"pullRequestReviewComment": {c}}}}}"#
+        ))
+        .unwrap();
+        assert!(
+            edited
+                .update_pull_request_review_comment
+                .and_then(|p| p.pull_request_review_comment)
+                .is_some()
+        );
+
+        // Both resolve mutations answer with the thread, under their own names.
+        let t = thread("PRRT_3", "LINE", "RIGHT", "null", "3", "null", &[c], false);
+        for name in ["resolveReviewThread", "unresolveReviewThread"] {
+            let data: ResolveData =
+                serde_json::from_str(&format!(r#"{{"{name}": {{"thread": {t}}}}}"#)).unwrap();
+            assert_eq!(
+                data.resolve_review_thread
+                    .and_then(|p| p.thread)
+                    .map(|t| t.id),
+                Some("PRRT_3".into()),
+                "{name}"
+            );
+        }
     }
 
     #[test]

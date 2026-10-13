@@ -12,7 +12,8 @@ use serde_json::json;
 use crate::error::{AppError, ErrorCode};
 
 pub use review::{
-    DiffSide, NewThread, PendingReview, ReviewState, ReviewThread, ReviewThreads, ThreadTarget,
+    DiffSide, NewThread, PendingReview, ReviewComment, ReviewState, ReviewThread, ReviewThreads,
+    ThreadTarget,
 };
 
 const TOKEN_TTL: Duration = Duration::from_secs(600);

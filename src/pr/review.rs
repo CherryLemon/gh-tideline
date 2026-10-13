@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{AppError, ErrorCode};
 use crate::github::{
-    DiffSide, NewThread, PendingReview, ReviewState, ReviewThread, ReviewThreads, ThreadTarget,
+    DiffSide, NewThread, PendingReview, ReviewComment, ReviewState, ReviewThread, ReviewThreads,
+    ThreadTarget,
 };
 use crate::state::PrKey;
 
@@ -65,6 +66,46 @@ pub struct CreatedThread {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DiscardRequest {
     pub review_id: String,
+}
+
+/// `POST /threads/{t}/replies`: a reply, posted now or added to the pending review.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReplyRequest {
+    /// The head the client shows: a reply that starts a review starts it there.
+    pub head: String,
+    pub body: String,
+    pub mode: Mode,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Replied {
+    /// `None` when GitHub took the reply but did not return it.
+    pub comment: Option<ReviewComment>,
+    pub pending_review: Option<PendingReview>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeletedComment {
+    /// `None` once the thread has no comments left.
+    pub thread: Option<ReviewThread>,
+    pub pending_review: Option<PendingReview>,
+}
+
+/// `PUT /threads/{t}/resolved`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolveRequest {
+    pub resolved: bool,
+}
+
+/// `PATCH /threads/{t}/comments/{c}`: the comment's new text.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditRequest {
+    pub body: String,
 }
 
 /// Rejects an empty body, or one longer than GitHub takes.
@@ -142,22 +183,22 @@ fn new_thread(req: &ThreadRequest) -> Result<NewThread, AppError> {
 /// Rejects writes the viewer's pending review stands in the way of (409), or that would land
 /// on another head than the one the client shows (409 `stale_head`). Line numbers refer to
 /// the client's head, and GitHub anchors new threads to its current head (spike S13d); a new
-/// review starts on the head as well. A file comment added to an existing review has neither.
-/// `listed_head`: the head of the file list the path was checked against.
-fn check_create(
+/// review starts on the head as well. A file comment or a reply added to an existing review
+/// has neither. `listed_head`: the head of the file list a path was checked against.
+fn check_write(
     mode: Mode,
-    thread: &NewThread,
+    on_lines: bool,
     state: &ReviewState,
     client_head: &str,
-    listed_head: &str,
+    listed_head: Option<&str>,
 ) -> Result<(), AppError> {
     if mode == Mode::Single && state.pending.is_some() {
         return Err(AppError::pending_review_exists(
             "you have a pending review: add the comment to it, or submit or discard it first",
         ));
     }
-    let on_lines = thread.target != ThreadTarget::File;
-    let heads_differ = state.head != client_head || listed_head != client_head;
+    let heads_differ =
+        state.head != client_head || listed_head.is_some_and(|listed| listed != client_head);
     if (on_lines || state.pending.is_none()) && heads_differ {
         return Err(AppError::stale_head(
             "the pull request has new commits; refresh before commenting",
@@ -191,6 +232,65 @@ fn gone_review(e: AppError) -> AppError {
     } else {
         e
     }
+}
+
+/// A thread or comment deleted meanwhile (on github.com, or in another tab), said plainly.
+fn gone(e: AppError, what: &str) -> AppError {
+    if e.code == ErrorCode::NotFound {
+        eprintln!("gh-tideline: {what} was not found: {e}");
+        AppError::not_found(format!(
+            "{what} is no longer on GitHub; refresh to see the rest"
+        ))
+    } else {
+        e
+    }
+}
+
+/// A failed reply into the pending review `review_id`: GitHub names the node it can't find.
+fn reply_error(e: AppError, review_id: &str) -> AppError {
+    if e.code == ErrorCode::NotFound && e.message.contains(review_id) {
+        gone_review(e)
+    } else {
+        gone(e, "this thread")
+    }
+}
+
+/// Starting a review failed because the viewer has one now (started on github.com since it
+/// was read): like a pending review that changed.
+fn start_error(e: AppError) -> AppError {
+    if e.code == ErrorCode::Rejected && e.message.contains("one pending review") {
+        AppError::review_changed(
+            "you started a pending review elsewhere meanwhile; refresh to see it",
+        )
+    } else {
+        e
+    }
+}
+
+/// A delete of `comment_id` that found it gone already counts as done (GitHub names the node
+/// it can't find); any other failure stands.
+fn deleted_already(result: Result<(), AppError>, comment_id: &str) -> Result<(), AppError> {
+    match result {
+        Err(e) if e.code == ErrorCode::NotFound && e.message.contains(comment_id) => Ok(()),
+        other => other,
+    }
+}
+
+/// A read after a delete that landed failed: the delete isn't what failed.
+fn read_back_error(mut e: AppError) -> AppError {
+    e.message = format!(
+        "the comment was deleted, but reading its thread back failed: {}",
+        e.message
+    );
+    e
+}
+
+/// A thread read back after deleting `comment_id`, in case the read still has it; `None` once
+/// no comment is left (GitHub drops the thread).
+fn without_comment(thread: Option<ReviewThread>, comment_id: &str) -> Option<ReviewThread> {
+    let mut thread = thread?;
+    thread.comments.retain(|c| c.id != comment_id);
+    (!thread.comments.is_empty()).then_some(thread)
 }
 
 /// Says so when the cleanup after a failed write failed too: the empty review it left would
@@ -243,7 +343,14 @@ impl PrService {
             .github
             .review_state(&key.host, &token, &key.owner, &key.repo, key.number)
             .await?;
-        check_create(req.mode, &thread, &state, &req.head, &data.summary.head.sha)?;
+        let on_lines = thread.target != ThreadTarget::File;
+        check_write(
+            req.mode,
+            on_lines,
+            &state,
+            &req.head,
+            Some(&data.summary.head.sha),
+        )?;
         match (req.mode, &thread.target) {
             (Mode::Single, ThreadTarget::Lines { .. }) => {
                 self.comment_on_lines(key, &token, &state, &thread).await
@@ -301,7 +408,8 @@ impl PrService {
         let review = self
             .github
             .start_review(host, token, &state.pr_id, &state.head)
-            .await?;
+            .await
+            .map_err(start_error)?;
         let added = match self
             .github
             .add_thread(host, token, &review.id, thread)
@@ -355,7 +463,8 @@ impl PrService {
             None => (
                 self.github
                     .start_review(host, token, &state.pr_id, &state.head)
-                    .await?,
+                    .await
+                    .map_err(start_error)?,
                 true,
             ),
         };
@@ -394,6 +503,139 @@ impl PrService {
             Err(e) if e.code == ErrorCode::NotFound => Ok(()),
             done => done,
         }
+    }
+
+    /// Replies to `thread_id`, as a single comment or in the viewer's pending review (see
+    /// [`Mode`]). Nothing is retried: a reply that failed midway may have landed.
+    pub async fn reply(
+        &self,
+        key: &PrKey,
+        thread_id: &str,
+        req: &ReplyRequest,
+    ) -> Result<Replied, AppError> {
+        check_body(&req.body)?;
+        let host = &key.host;
+        let token = self.tokens.get(host).await?;
+        let _writing = self.review_write(key).await;
+        let state = self
+            .github
+            .review_state(host, &token, &key.owner, &key.repo, key.number)
+            .await?;
+        check_write(req.mode, false, &state, &req.head, None)?;
+        if req.mode == Mode::Single {
+            let comment = self
+                .github
+                .add_reply(host, &token, thread_id, None, &req.body)
+                .await
+                .map_err(|e| gone(e, "this thread"))?;
+            // A reply sent without a review goes into the viewer's pending review if there is
+            // one (spike S13): one started since the read above. Then it is that review's.
+            let pending_review = match &comment {
+                Some(c) if c.state == "PENDING" => self
+                    .github
+                    .review_state(host, &token, &key.owner, &key.repo, key.number)
+                    .await
+                    .ok()
+                    .and_then(|state| state.pending),
+                _ => None,
+            };
+            return Ok(Replied {
+                comment,
+                pending_review,
+            });
+        }
+        let (review, started) = match state.pending {
+            Some(review) => (review, false),
+            None => (
+                self.github
+                    .start_review(host, &token, &state.pr_id, &state.head)
+                    .await
+                    .map_err(start_error)?,
+                true,
+            ),
+        };
+        match self
+            .github
+            .add_reply(host, &token, thread_id, Some(&review.id), &req.body)
+            .await
+        {
+            // GitHub answers a thread it won't take with nothing (spike S12); a reply too, for
+            // all we know. The review started for it would be left empty.
+            Ok(None) if started => {
+                let cleaned = self.delete_review_quietly(host, &token, &review.id).await;
+                Err(with_cleanup(
+                    AppError::rejected("GitHub did not take the reply"),
+                    cleaned,
+                ))
+            }
+            Ok(comment) => Ok(Replied {
+                comment,
+                pending_review: Some(review),
+            }),
+            Err(e) if started => {
+                let cleaned = self.delete_review_quietly(host, &token, &review.id).await;
+                Err(with_cleanup(gone(e, "this thread"), cleaned))
+            }
+            Err(e) => Err(reply_error(e, &review.id)),
+        }
+    }
+
+    /// Resolves or unresolves a thread; it comes back as GitHub has it now.
+    pub async fn set_resolved(
+        &self,
+        key: &PrKey,
+        thread_id: &str,
+        resolved: bool,
+    ) -> Result<ReviewThread, AppError> {
+        let token = self.tokens.get(&key.host).await?;
+        self.github
+            .set_resolved(&key.host, &token, thread_id, resolved)
+            .await
+            .map_err(|e| gone(e, "this thread"))
+    }
+
+    /// Replaces the text of one of the viewer's comments.
+    pub async fn edit_comment(
+        &self,
+        key: &PrKey,
+        comment_id: &str,
+        body: &str,
+    ) -> Result<ReviewComment, AppError> {
+        check_body(body)?;
+        let token = self.tokens.get(&key.host).await?;
+        self.github
+            .update_comment(&key.host, &token, comment_id, body)
+            .await
+            .map_err(|e| gone(e, "this comment"))
+    }
+
+    /// Deletes a comment, then reads its thread and the pending review again: the thread is
+    /// `None` once it has no comments left, and GitHub drops a pending review with its last
+    /// comment. A comment that is gone already counts as deleted, so a delete whose answer was
+    /// lost can be sent again.
+    pub async fn delete_comment(
+        &self,
+        key: &PrKey,
+        thread_id: &str,
+        comment_id: &str,
+    ) -> Result<DeletedComment, AppError> {
+        let host = &key.host;
+        let token = self.tokens.get(host).await?;
+        // A create that read the pending review must not find it dropped before it writes.
+        let _writing = self.review_write(key).await;
+        deleted_already(
+            self.github.delete_comment(host, &token, comment_id).await,
+            comment_id,
+        )?;
+        let (thread, state) = tokio::join!(
+            self.github.review_thread(host, &token, thread_id),
+            self.github
+                .review_state(host, &token, &key.owner, &key.repo, key.number),
+        );
+        Ok(DeletedComment {
+            thread: without_comment(thread.map_err(read_back_error)?, comment_id),
+            pending_review: state.map_err(read_back_error)?.pending,
+        })
     }
 
     /// Cleanup after a failed write; the write's own error is the one to report. Whether the
@@ -571,8 +813,15 @@ mod tests {
     fn creates_check_the_pending_review_and_the_head() {
         let line = new_thread(&lines(Some(Right), Some(3), None, None)).unwrap();
         let file = new_thread(&req(SubjectType::File)).unwrap();
-        let check =
-            |mode, t: &NewThread, s: &ReviewState| code(check_create(mode, t, s, HEAD, HEAD));
+        let check = |mode, t: &NewThread, s: &ReviewState| {
+            code(check_write(
+                mode,
+                t.target != ThreadTarget::File,
+                s,
+                HEAD,
+                Some(HEAD),
+            ))
+        };
         // Single comments only without a pending review.
         assert_eq!(check(Mode::Single, &line, &state(HEAD, false)), Ok(()));
         assert_eq!(
@@ -608,7 +857,14 @@ mod tests {
         assert_eq!(check(Mode::Review, &file, &state(OTHER, true)), Ok(()));
         // The path was checked against another head's files (a push came in while loading).
         let listed_other = |mode, t: &NewThread, pending| {
-            code(check_create(mode, t, &state(HEAD, pending), HEAD, OTHER))
+            let on_lines = t.target != ThreadTarget::File;
+            code(check_write(
+                mode,
+                on_lines,
+                &state(HEAD, pending),
+                HEAD,
+                Some(OTHER),
+            ))
         };
         assert_eq!(
             listed_other(Mode::Review, &line, true),
@@ -619,6 +875,189 @@ mod tests {
             Err(ErrorCode::StaleHead)
         );
         assert_eq!(listed_other(Mode::Review, &file, true), Ok(()));
+    }
+
+    #[test]
+    fn replies_check_the_pending_review_and_the_head() {
+        let check = |mode, s: &ReviewState| code(check_write(mode, false, s, HEAD, None));
+        assert_eq!(check(Mode::Single, &state(HEAD, false)), Ok(()));
+        assert_eq!(
+            check(Mode::Single, &state(HEAD, true)),
+            Err(ErrorCode::PendingReviewExists)
+        );
+        assert_eq!(check(Mode::Review, &state(HEAD, true)), Ok(()));
+        // Starting a review (a single reply is one too) needs the client's head.
+        assert_eq!(
+            check(Mode::Single, &state(OTHER, false)),
+            Err(ErrorCode::StaleHead)
+        );
+        assert_eq!(
+            check(Mode::Review, &state(OTHER, false)),
+            Err(ErrorCode::StaleHead)
+        );
+        // Adding to the pending review doesn't.
+        assert_eq!(check(Mode::Review, &state(OTHER, true)), Ok(()));
+    }
+
+    #[test]
+    fn writes_on_deleted_nodes_say_what_went() {
+        let missing = |id: &str| {
+            AppError::not_found(format!(
+                "Could not resolve to a node with the global id of '{id}'"
+            ))
+        };
+        let thread = gone(missing("PRRT_1"), "this thread");
+        assert_eq!(thread.code, ErrorCode::NotFound);
+        assert!(
+            thread
+                .message
+                .starts_with("this thread is no longer on GitHub")
+        );
+        assert_eq!(
+            gone(AppError::rejected("no"), "this thread"),
+            AppError::rejected("no")
+        );
+        // A reply names whichever of the thread and the pending review went.
+        assert_eq!(
+            reply_error(missing("PRR_1"), "PRR_1").code,
+            ErrorCode::ReviewChanged
+        );
+        let thread = reply_error(missing("PRRT_1"), "PRR_1");
+        assert_eq!(thread.code, ErrorCode::NotFound);
+        assert!(thread.message.starts_with("this thread"));
+        assert_eq!(
+            reply_error(AppError::rejected("locked"), "PRR_1"),
+            AppError::rejected("locked")
+        );
+    }
+
+    fn mk_comment(id: &str) -> ReviewComment {
+        ReviewComment {
+            id: id.into(),
+            author: None,
+            body: "b".into(),
+            body_html: "<p>b</p>".into(),
+            created_at: "2026-10-13T00:00:00Z".into(),
+            last_edited_at: None,
+            url: "https://github.com/o/r/pull/1#discussion_r1".into(),
+            state: "PENDING".into(),
+            review_id: Some("PRR_1".into()),
+            reply_to: None,
+            is_minimized: false,
+            minimized_reason: None,
+            viewer_can_update: true,
+            viewer_can_delete: true,
+            viewer_did_author: true,
+        }
+    }
+
+    fn mk_thread(comments: &[&str]) -> ReviewThread {
+        ReviewThread {
+            id: "PRRT_1".into(),
+            path: "a.rs".into(),
+            subject_type: "FILE".into(),
+            side: None,
+            start_side: None,
+            line: None,
+            start_line: None,
+            original_line: None,
+            original_start_line: None,
+            diff_hunk: String::new(),
+            is_resolved: false,
+            is_outdated: false,
+            is_collapsed: false,
+            resolved_by: None,
+            viewer_can_reply: true,
+            viewer_can_resolve: false,
+            viewer_can_unresolve: false,
+            comments: comments.iter().map(|id| mk_comment(id)).collect(),
+        }
+    }
+
+    #[test]
+    fn deletes_count_only_their_own_comment_as_gone() {
+        let missing = |id: &str| {
+            AppError::not_found(format!(
+                "Could not resolve to a node with the global id of '{id}'"
+            ))
+        };
+        assert_eq!(deleted_already(Ok(()), "PRRC_1"), Ok(()));
+        assert_eq!(deleted_already(Err(missing("PRRC_1")), "PRRC_1"), Ok(()));
+        // Something else not found (a wrong host's endpoint, another node) is a failure.
+        assert_eq!(
+            code(deleted_already(Err(missing("PRRT_1")), "PRRC_1")),
+            Err(ErrorCode::NotFound)
+        );
+        assert_eq!(
+            deleted_already(Err(AppError::rejected("no")), "PRRC_1"),
+            Err(AppError::rejected("no"))
+        );
+        assert_eq!(
+            code(deleted_already(Err(AppError::github("down")), "PRRC_1")),
+            Err(ErrorCode::GithubError)
+        );
+        let late = read_back_error(AppError::github("timed out"));
+        assert_eq!(late.code, ErrorCode::GithubError);
+        assert!(late.message.starts_with("the comment was deleted"));
+    }
+
+    #[test]
+    fn a_thread_read_back_leaves_the_deleted_comment_out() {
+        let kept = without_comment(Some(mk_thread(&["PRRC_1", "PRRC_2"])), "PRRC_1").unwrap();
+        assert_eq!(kept.comments.len(), 1);
+        assert_eq!(kept.comments[0].id, "PRRC_2");
+        assert!(without_comment(Some(mk_thread(&["PRRC_1"])), "PRRC_1").is_none());
+        assert!(without_comment(None, "PRRC_1").is_none());
+    }
+
+    #[test]
+    fn a_review_started_elsewhere_meanwhile_is_a_changed_review() {
+        let raced = start_error(AppError::rejected(
+            "User can only have one pending review per pull request",
+        ));
+        assert_eq!(raced.code, ErrorCode::ReviewChanged);
+        assert_eq!(
+            start_error(AppError::rejected("Pull request is locked")),
+            AppError::rejected("Pull request is locked")
+        );
+    }
+
+    #[test]
+    fn thread_write_answers_keep_their_nulls() {
+        let replied = serde_json::to_value(Replied {
+            comment: None,
+            pending_review: None,
+        })
+        .unwrap();
+        assert_eq!(
+            replied,
+            serde_json::json!({ "comment": null, "pendingReview": null })
+        );
+        let deleted = serde_json::to_value(DeletedComment {
+            thread: None,
+            pending_review: None,
+        })
+        .unwrap();
+        assert_eq!(
+            deleted,
+            serde_json::json!({ "thread": null, "pendingReview": null })
+        );
+    }
+
+    #[test]
+    fn thread_write_requests_parse() {
+        let reply: ReplyRequest = serde_json::from_str(&format!(
+            r#"{{"head": "{HEAD}", "body": "yes", "mode": "review"}}"#
+        ))
+        .unwrap();
+        assert_eq!((reply.mode, reply.body.as_str()), (Mode::Review, "yes"));
+        assert!(serde_json::from_str::<ReplyRequest>(r#"{"head": "x", "body": "y"}"#).is_err());
+        let resolve: ResolveRequest = serde_json::from_str(r#"{"resolved": false}"#).unwrap();
+        assert!(!resolve.resolved);
+        assert!(serde_json::from_str::<ResolveRequest>(r#"{"resolve": true}"#).is_err());
+        let edit: EditRequest = serde_json::from_str(r#"{"body": "fixed"}"#).unwrap();
+        assert_eq!(edit.body, "fixed");
+        assert!(serde_json::from_str::<EditRequest>(r#"{"body": "a", "id": "b"}"#).is_err());
     }
 
     #[test]

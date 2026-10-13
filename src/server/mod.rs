@@ -11,7 +11,7 @@ use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, put};
+use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -80,6 +80,18 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/{host}/{owner}/{repo}/pulls/{n}/review",
             delete(review::discard_review),
+        )
+        .route(
+            "/api/{host}/{owner}/{repo}/pulls/{n}/threads/{t}/replies",
+            post(review::reply),
+        )
+        .route(
+            "/api/{host}/{owner}/{repo}/pulls/{n}/threads/{t}/resolved",
+            put(review::set_resolved),
+        )
+        .route(
+            "/api/{host}/{owner}/{repo}/pulls/{n}/threads/{t}/comments/{c}",
+            patch(review::edit_comment).delete(review::delete_comment),
         )
         .route("/api/{host}/{owner}/{repo}/blobs/{oid}", get(blob))
         .fallback(fallback)

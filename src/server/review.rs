@@ -10,10 +10,14 @@ use std::future::Future;
 
 use super::{AppState, Inner, check_head, check_repo, parse_pr_number};
 use crate::error::AppError;
-use crate::pr::review::{DiscardRequest, ThreadRequest};
+use crate::pr::review::{DiscardRequest, EditRequest, ReplyRequest, ResolveRequest, ThreadRequest};
 use crate::state::PrKey;
 
 type PrPath = Path<(String, String, String, String)>;
+/// A PR path plus a thread id.
+type ThreadPath = Path<(String, String, String, String, String)>;
+/// A PR path plus a thread id and one of its comments' ids.
+type CommentPath = Path<(String, String, String, String, String, String)>;
 
 fn pr_key(
     state: &Inner,
@@ -94,6 +98,59 @@ pub(super) async fn discard_review(
     let pr = state.pr.clone();
     to_the_end(async move { pr.discard_review(&key, &req.review_id).await }).await?;
     Ok(Json(json!({ "pendingReview": null })).into_response())
+}
+
+pub(super) async fn reply(
+    State(state): State<AppState>,
+    Path((host, owner, repo, n, thread)): ThreadPath,
+    body: Bytes,
+) -> Result<Response, AppError> {
+    let key = pr_key(&state, (host, owner, repo, n))?;
+    check_node_id(&thread)?;
+    let req: ReplyRequest = parse_body(&body)?;
+    check_head(&req.head)?;
+    let pr = state.pr.clone();
+    let replied = to_the_end(async move { pr.reply(&key, &thread, &req).await }).await?;
+    Ok(Json(replied).into_response())
+}
+
+pub(super) async fn set_resolved(
+    State(state): State<AppState>,
+    Path((host, owner, repo, n, thread)): ThreadPath,
+    body: Bytes,
+) -> Result<Response, AppError> {
+    let key = pr_key(&state, (host, owner, repo, n))?;
+    check_node_id(&thread)?;
+    let req: ResolveRequest = parse_body(&body)?;
+    let thread = state.pr.set_resolved(&key, &thread, req.resolved).await?;
+    Ok(Json(json!({ "thread": thread })).into_response())
+}
+
+pub(super) async fn edit_comment(
+    State(state): State<AppState>,
+    Path((host, owner, repo, n, thread, comment)): CommentPath,
+    body: Bytes,
+) -> Result<Response, AppError> {
+    let key = pr_key(&state, (host, owner, repo, n))?;
+    check_node_id(&thread)?;
+    check_node_id(&comment)?;
+    let req: EditRequest = parse_body(&body)?;
+    let comment = state.pr.edit_comment(&key, &comment, &req.body).await?;
+    Ok(Json(json!({ "comment": comment })).into_response())
+}
+
+pub(super) async fn delete_comment(
+    State(state): State<AppState>,
+    Path((host, owner, repo, n, thread, comment)): CommentPath,
+) -> Result<Response, AppError> {
+    let key = pr_key(&state, (host, owner, repo, n))?;
+    check_node_id(&thread)?;
+    check_node_id(&comment)?;
+    // It may drop the pending review: a create waiting for the lock must not read it first.
+    let pr = state.pr.clone();
+    let deleted =
+        to_the_end(async move { pr.delete_comment(&key, &thread, &comment).await }).await?;
+    Ok(Json(deleted).into_response())
 }
 
 #[cfg(test)]
