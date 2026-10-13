@@ -11,7 +11,7 @@ use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, patch, post, put};
+use axum::routing::{get, patch, post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -79,7 +79,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/api/{host}/{owner}/{repo}/pulls/{n}/review",
-            delete(review::discard_review),
+            post(review::submit_review).delete(review::discard_review),
         )
         .route(
             "/api/{host}/{owner}/{repo}/pulls/{n}/threads/{t}/replies",

@@ -10,7 +10,9 @@ use std::future::Future;
 
 use super::{AppState, Inner, check_head, check_repo, parse_pr_number};
 use crate::error::AppError;
-use crate::pr::review::{DiscardRequest, EditRequest, ReplyRequest, ResolveRequest, ThreadRequest};
+use crate::pr::review::{
+    DiscardRequest, EditRequest, ReplyRequest, ResolveRequest, SubmitRequest, ThreadRequest,
+};
 use crate::state::PrKey;
 
 type PrPath = Path<(String, String, String, String)>;
@@ -98,6 +100,22 @@ pub(super) async fn discard_review(
     let pr = state.pr.clone();
     to_the_end(async move { pr.discard_review(&key, &req.review_id).await }).await?;
     Ok(Json(json!({ "pendingReview": null })).into_response())
+}
+
+pub(super) async fn submit_review(
+    State(state): State<AppState>,
+    Path(params): PrPath,
+    body: Bytes,
+) -> Result<Response, AppError> {
+    let key = pr_key(&state, params)?;
+    let req: SubmitRequest = parse_body(&body)?;
+    check_head(&req.head)?;
+    if let Some(id) = &req.review_id {
+        check_node_id(id)?;
+    }
+    let pr = state.pr.clone();
+    let submitted = to_the_end(async move { pr.submit_review(&key, &req).await }).await?;
+    Ok(Json(submitted).into_response())
 }
 
 pub(super) async fn reply(

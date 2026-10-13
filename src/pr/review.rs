@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{AppError, ErrorCode};
 use crate::github::{
     DiffSide, NewThread, PendingReview, ReviewComment, ReviewState, ReviewThread, ReviewThreads,
-    ThreadTarget,
+    SubmittedReview, ThreadTarget,
 };
 use crate::state::PrKey;
 
@@ -68,6 +68,45 @@ pub struct DiscardRequest {
     pub review_id: String,
 }
 
+/// What a review says of the pull request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ReviewEvent {
+    Comment,
+    Approve,
+    RequestChanges,
+}
+
+impl ReviewEvent {
+    fn as_str(self) -> &'static str {
+        match self {
+            ReviewEvent::Comment => "COMMENT",
+            ReviewEvent::Approve => "APPROVE",
+            ReviewEvent::RequestChanges => "REQUEST_CHANGES",
+        }
+    }
+}
+
+/// `POST /review`: submits the pending review the client shows (`reviewId`), or with none, a
+/// review of just the summary.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SubmitRequest {
+    /// The head the client shows: a review is of the commits the reviewer saw.
+    pub head: String,
+    pub review_id: Option<String>,
+    pub event: ReviewEvent,
+    /// The summary; may be empty.
+    pub body: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Submitted {
+    /// `None` when GitHub took the review but did not return it.
+    pub review: Option<SubmittedReview>,
+}
+
 /// `POST /threads/{t}/replies`: a reply, posted now or added to the pending review.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -119,6 +158,19 @@ pub fn check_body(body: &str) -> Result<(), AppError> {
         )));
     }
     Ok(())
+}
+
+/// A review's summary: none when blank (GitHub then asks for one where it needs it).
+fn summary(body: &str) -> Result<Option<&str>, AppError> {
+    if body.trim().is_empty() {
+        return Ok(None);
+    }
+    if body.chars().count() > MAX_BODY_CHARS {
+        return Err(AppError::bad_request(format!(
+            "the summary is longer than {MAX_BODY_CHARS} characters"
+        )));
+    }
+    Ok(Some(body))
 }
 
 /// The thread a request asks for, if it is well formed: lines for a LINE thread (a range
@@ -217,6 +269,49 @@ fn review_to_discard<'a>(
         None => Ok(None),
         Some(review) if review.id == shown => Ok(Some(&review.id)),
         Some(_) => Err(AppError::review_changed(
+            "your pending review on GitHub is not the one shown; refresh to see it",
+        )),
+    }
+}
+
+/// GitHub refuses a review with neither comments nor a summary unless it approves, and says
+/// nothing why for a new one (live, 2026-10-13): say it first.
+fn check_summary(
+    event: ReviewEvent,
+    body: Option<&str>,
+    review: Option<&PendingReview>,
+) -> Result<(), AppError> {
+    let no_comments = review.is_none_or(|r| r.comment_count == 0);
+    if no_comments && body.is_none() && event != ReviewEvent::Approve {
+        return Err(AppError::bad_request(
+            "write a summary: a review with no comments needs one",
+        ));
+    }
+    Ok(())
+}
+
+/// The pending review a submit of `shown` submits (`None`: a new review of just the summary).
+/// Only on the head the client shows, and only the review it shows: another one's comments
+/// would go out unseen, and a summary sent as a review of its own when the one shown went
+/// (submitted or discarded elsewhere) is not what was asked for.
+fn review_to_submit<'a>(
+    state: &'a ReviewState,
+    shown: Option<&str>,
+    client_head: &str,
+) -> Result<Option<&'a PendingReview>, AppError> {
+    if state.head != client_head {
+        return Err(AppError::stale_head(
+            "the pull request has new commits; refresh to see them before submitting",
+        ));
+    }
+    match (state.pending.as_ref(), shown) {
+        (None, None) => Ok(None),
+        (Some(review), Some(shown)) if review.id == shown => Ok(Some(review)),
+        // Submitted or discarded: elsewhere, or by a request whose answer was lost.
+        (None, Some(_)) => Err(AppError::review_changed(
+            "your pending review is no longer pending (submitted or discarded); refresh to see it",
+        )),
+        (Some(_), _) => Err(AppError::review_changed(
             "your pending review on GitHub is not the one shown; refresh to see it",
         )),
     }
@@ -503,6 +598,39 @@ impl PrService {
             Err(e) if e.code == ErrorCode::NotFound => Ok(()),
             done => done,
         }
+    }
+
+    /// Submits the viewer's pending review `req.review_id`, or a review of just the summary
+    /// when there is none (see [`review_to_submit`]). GitHub refuses approving or requesting
+    /// changes on one's own pull request (422); the pending review is kept then.
+    pub async fn submit_review(
+        &self,
+        key: &PrKey,
+        req: &SubmitRequest,
+    ) -> Result<Submitted, AppError> {
+        let body = summary(&req.body)?;
+        let token = self.tokens.get(&key.host).await?;
+        let _writing = self.review_write(key).await;
+        let state = self
+            .github
+            .review_state(&key.host, &token, &key.owner, &key.repo, key.number)
+            .await?;
+        let event = req.event.as_str();
+        let pending = review_to_submit(&state, req.review_id.as_deref(), &req.head)?;
+        check_summary(req.event, body, pending)?;
+        let review = match pending {
+            Some(pending) => self
+                .github
+                .submit_review(&key.host, &token, &pending.id, event, body)
+                .await
+                .map_err(gone_review)?,
+            None => {
+                self.github
+                    .submit_new_review(&key.host, &token, &state.pr_id, &state.head, event, body)
+                    .await?
+            }
+        };
+        Ok(Submitted { review })
     }
 
     /// Replies to `thread_id`, as a single comment or in the viewer's pending review (see
@@ -805,6 +933,7 @@ mod tests {
                 commit: Some(OTHER.into()),
                 created_at: "2026-10-13T00:00:00Z".into(),
                 url: "https://github.com/o/r/pull/1".into(),
+                comment_count: 1,
             }),
         }
     }
@@ -1085,6 +1214,102 @@ mod tests {
             code(review_to_discard(pending.as_ref(), "PRR_0")),
             Err(ErrorCode::ReviewChanged)
         );
+    }
+
+    #[test]
+    fn submits_need_the_head_and_the_review_shown() {
+        let none = state(HEAD, false);
+        let pending = state(HEAD, true);
+        let id = |r: Result<Option<&PendingReview>, AppError>| r.map(|r| r.map(|r| r.id.clone()));
+        assert_eq!(id(review_to_submit(&none, None, HEAD)), Ok(None));
+        assert_eq!(
+            id(review_to_submit(&pending, Some("PRR_1"), HEAD)),
+            Ok(Some("PRR_1".into()))
+        );
+        // New commits: a review, an approval above all, is of the commits seen.
+        assert_eq!(
+            code(id(review_to_submit(
+                &state(OTHER, true),
+                Some("PRR_1"),
+                HEAD
+            ))),
+            Err(ErrorCode::StaleHead)
+        );
+        assert_eq!(
+            code(id(review_to_submit(&none, None, OTHER))),
+            Err(ErrorCode::StaleHead)
+        );
+        // A pending review not shown, gone, or another one.
+        for (s, shown) in [
+            (&pending, None),
+            (&none, Some("PRR_1")),
+            (&pending, Some("PRR_0")),
+        ] {
+            assert_eq!(
+                code(id(review_to_submit(s, shown, HEAD))),
+                Err(ErrorCode::ReviewChanged),
+                "{shown:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reviews_without_comments_need_a_summary_unless_they_approve() {
+        use ReviewEvent::{Approve, Comment, RequestChanges};
+        assert_eq!(
+            code(check_summary(Comment, None, None)),
+            Err(ErrorCode::BadRequest)
+        );
+        assert_eq!(
+            code(check_summary(RequestChanges, None, None)),
+            Err(ErrorCode::BadRequest)
+        );
+        assert_eq!(check_summary(Approve, None, None), Ok(()));
+        assert_eq!(check_summary(Comment, Some("x"), None), Ok(()));
+        let mut pending = state(HEAD, true).pending.unwrap();
+        assert_eq!(check_summary(Comment, None, Some(&pending)), Ok(()));
+        // An empty pending review (a cleanup that failed) is like none.
+        pending.comment_count = 0;
+        assert_eq!(
+            code(check_summary(RequestChanges, None, Some(&pending))),
+            Err(ErrorCode::BadRequest)
+        );
+        assert_eq!(check_summary(Approve, None, Some(&pending)), Ok(()));
+    }
+
+    #[test]
+    fn summaries_may_be_blank_but_must_fit() {
+        assert_eq!(summary(" \n"), Ok(None));
+        assert_eq!(summary("LGTM"), Ok(Some("LGTM")));
+        assert_eq!(
+            code(summary(&"é".repeat(MAX_BODY_CHARS + 1))),
+            Err(ErrorCode::BadRequest)
+        );
+    }
+
+    #[test]
+    fn submit_requests_parse() {
+        let r: SubmitRequest = serde_json::from_str(&format!(
+            r#"{{"head": "{HEAD}", "reviewId": null, "event": "REQUEST_CHANGES", "body": ""}}"#
+        ))
+        .unwrap();
+        assert_eq!(
+            (r.review_id, r.event, r.body.as_str()),
+            (None, ReviewEvent::RequestChanges, "")
+        );
+        assert_eq!(ReviewEvent::RequestChanges.as_str(), "REQUEST_CHANGES");
+        let r: SubmitRequest = serde_json::from_str(&format!(
+            r#"{{"head": "{HEAD}", "reviewId": "PRR_1", "event": "APPROVE", "body": "LGTM"}}"#
+        ))
+        .unwrap();
+        assert_eq!(r.review_id.as_deref(), Some("PRR_1"));
+        for bad in [
+            r#"{"head": "h", "reviewId": null, "event": "approve", "body": ""}"#,
+            r#"{"head": "h", "reviewId": null, "event": "DISMISS", "body": ""}"#,
+            r#"{"head": "h", "reviewId": null, "event": "COMMENT", "body": "", "pr": 1}"#,
+        ] {
+            assert!(serde_json::from_str::<SubmitRequest>(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

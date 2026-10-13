@@ -13,7 +13,7 @@ use crate::error::{AppError, ErrorCode};
 
 pub use review::{
     DiffSide, NewThread, PendingReview, ReviewComment, ReviewState, ReviewThread, ReviewThreads,
-    ThreadTarget,
+    SubmittedReview, ThreadTarget,
 };
 
 const TOKEN_TTL: Duration = Duration::from_secs(600);
@@ -527,11 +527,16 @@ fn payload_returned(data: Option<&serde_json::Value>) -> bool {
 }
 
 fn classify_gql_errors(errors: &[GqlError], op: Op) -> AppError {
-    let message = errors
+    let mut message = errors
         .iter()
-        .map(|e| e.message.as_str())
+        .map(|e| e.message.trim())
+        .filter(|m| !m.is_empty())
         .collect::<Vec<_>>()
         .join("; ");
+    // As for a new review with neither comments nor a summary.
+    if message.is_empty() {
+        message = "GitHub gave no reason".into();
+    }
     let has = |kind: &str| errors.iter().any(|e| e.kind.as_deref() == Some(kind));
     if has("NOT_FOUND") {
         AppError::not_found(message)
@@ -616,6 +621,7 @@ mod tests {
         );
         let untyped =
             errors(r#"{"errors": [{"message": "Something went wrong"}, {"message": "again"}]}"#);
+        let silent = errors(r#"{"errors": [{"type": "UNPROCESSABLE", "message": ""}]}"#);
 
         let classify = |e: &[GqlError], op| {
             let err = classify_gql_errors(e, op);
@@ -626,6 +632,10 @@ mod tests {
             (ErrorCode::Rejected, "Line could not be resolved".into())
         );
         assert_eq!(classify(&forbidden, Op::Write).0, ErrorCode::Rejected);
+        assert_eq!(
+            classify(&silent, Op::Write),
+            (ErrorCode::Rejected, "GitHub gave no reason".into())
+        );
         assert_eq!(classify(&unprocessable, Op::Read).0, ErrorCode::GithubError);
         assert_eq!(classify(&forbidden, Op::Read).0, ErrorCode::GithubError);
         for op in [Op::Read, Op::Write] {

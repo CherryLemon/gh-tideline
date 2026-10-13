@@ -39,7 +39,7 @@ macro_rules! pending_review_fragment {
     () => {
         r#"
 fragment PendingReview on PullRequestReview {
-  id body createdAt url viewerDidAuthor commit { oid }
+  id body createdAt url viewerDidAuthor commit { oid } commentCount: comments { totalCount }
 }
 "#
     };
@@ -53,6 +53,7 @@ query($owner: String!, $repo: String!, $number: Int!, $cursor: String, $first: B
       headRefOid
       locked @include(if: $first)
       reviews(states: [PENDING], first: 5) @include(if: $first) { nodes { ...PendingReview } }
+      viewerLatestReview @include(if: $first) { id state url body }
       reviewThreads(first: 100, after: $cursor) {
         pageInfo { hasNextPage endCursor }
         nodes { ...Thread }
@@ -135,7 +136,17 @@ mutation($review: ID!, $path: String!, $body: String!,
 const SUBMIT_REVIEW: &str = r#"
 mutation($review: ID!, $event: PullRequestReviewEvent!, $body: String) {
   submitPullRequestReview(input: {pullRequestReviewId: $review, event: $event, body: $body}) {
-    pullRequestReview { id }
+    pullRequestReview { id state url body }
+  }
+}
+"#;
+
+/// A review of just a summary, submitted in the same call.
+const SUBMIT_NEW_REVIEW: &str = r#"
+mutation($pr: ID!, $commit: GitObjectID!, $event: PullRequestReviewEvent!, $body: String) {
+  addPullRequestReview(input: {pullRequestId: $pr, commitOID: $commit, event: $event,
+                               body: $body}) {
+    pullRequestReview { id state url body }
   }
 }
 "#;
@@ -208,6 +219,9 @@ pub struct ReviewThreads {
     /// A locked conversation: GitHub refuses comments from non-maintainers.
     pub locked: bool,
     pub pending_review: Option<PendingReview>,
+    /// The viewer's latest submitted review (never a pending one): a submit whose answer was
+    /// lost shows here.
+    pub latest_review: Option<SubmittedReview>,
     pub threads: Vec<ReviewThread>,
 }
 
@@ -221,6 +235,20 @@ pub struct PendingReview {
     pub commit: Option<String>,
     pub created_at: String,
     pub url: String,
+    /// GitHub refuses to submit an empty review without a summary (and doesn't say why).
+    #[serde(skip_serializing)]
+    pub comment_count: u32,
+}
+
+/// A review as submitted: `state` is GitHub's (`COMMENTED`, `APPROVED`, `CHANGES_REQUESTED`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SubmittedReview {
+    pub id: String,
+    pub state: String,
+    pub url: String,
+    /// The summary (Markdown; empty for the review a single comment makes): with `state`, how a
+    /// summary-only submit whose answer was lost is told apart from other reviews.
+    pub body: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -365,6 +393,8 @@ struct ThreadsPr {
     locked: Option<bool>,
     #[serde(default)]
     reviews: Option<Nodes<GqlPendingReview>>,
+    #[serde(default)]
+    viewer_latest_review: Option<SubmittedReview>,
     review_threads: Page<GqlThread>,
 }
 
@@ -408,11 +438,19 @@ struct GqlPendingReview {
     url: String,
     viewer_did_author: bool,
     commit: Option<GqlCommit>,
+    #[serde(default)]
+    comment_count: Option<GqlCount>,
 }
 
 #[derive(Deserialize)]
 struct GqlCommit {
     oid: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GqlCount {
+    total_count: u32,
 }
 
 #[derive(Deserialize)]
@@ -537,6 +575,28 @@ struct AddThreadData {
 #[derive(Deserialize)]
 struct ThreadPayload {
     thread: Option<GqlThread>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SubmitData {
+    // A review submitted on its own, or added already submitted.
+    #[serde(alias = "addPullRequestReview")]
+    submit_pull_request_review: Option<SubmitPayload>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SubmitPayload {
+    pull_request_review: Option<SubmittedReview>,
+}
+
+impl SubmitData {
+    /// `None`: GitHub took it (no error) but did not return the review.
+    fn review(self) -> Option<SubmittedReview> {
+        self.submit_pull_request_review
+            .and_then(|p| p.pull_request_review)
+    }
 }
 
 #[derive(Deserialize)]
@@ -741,6 +801,7 @@ impl GqlPendingReview {
                 .filter(|oid| check_oid(oid).is_ok()),
             created_at: self.created_at,
             url: self.url,
+            comment_count: self.comment_count.map_or(0, |c| c.total_count),
         }
     }
 }
@@ -762,6 +823,7 @@ struct ThreadPages {
     head: String,
     locked: bool,
     pending: Option<PendingReview>,
+    latest: Option<SubmittedReview>,
     raw: Vec<GqlThread>,
     /// A thread added or removed between pages shifts the rest, so one can come twice.
     seen: HashSet<String>,
@@ -781,6 +843,7 @@ impl ThreadPages {
             self.head = pr.head_ref_oid;
             self.locked = pr.locked.unwrap_or(false);
             self.pending = pending_review(pr.reviews);
+            self.latest = pr.viewer_latest_review;
         } else if pr.head_ref_oid != self.head {
             return Ok(PageEnd::HeadMoved);
         }
@@ -861,6 +924,7 @@ impl Github {
             head,
             locked,
             pending,
+            latest,
             raw,
             ..
         } = pages;
@@ -881,6 +945,7 @@ impl Github {
             head,
             locked,
             pending_review: pending,
+            latest_review: latest,
             threads,
         }))
     }
@@ -1063,6 +1128,7 @@ impl Github {
     }
 
     /// Submits the pending review `review_id` as `event` (COMMENT, APPROVE, REQUEST_CHANGES).
+    /// `None`: submitted, but GitHub's answer lacks the review.
     pub async fn submit_review(
         &self,
         host: &str,
@@ -1070,8 +1136,8 @@ impl Github {
         review_id: &str,
         event: &str,
         body: Option<&str>,
-    ) -> Result<(), AppError> {
-        let _: serde_json::Value = self
+    ) -> Result<Option<SubmittedReview>, AppError> {
+        let data: SubmitData = self
             .mutate(
                 host,
                 token,
@@ -1079,7 +1145,25 @@ impl Github {
                 json!({ "review": review_id, "event": event, "body": body }),
             )
             .await?;
-        Ok(())
+        Ok(data.review())
+    }
+
+    /// Submits a review of just `body` (none for an approval without words) on `commit`, when
+    /// the viewer has no pending review. `None` as for [`Self::submit_review`].
+    pub async fn submit_new_review(
+        &self,
+        host: &str,
+        token: &str,
+        pr_id: &str,
+        commit: &str,
+        event: &str,
+        body: Option<&str>,
+    ) -> Result<Option<SubmittedReview>, AppError> {
+        let variables = json!({ "pr": pr_id, "commit": commit, "event": event, "body": body });
+        let data: SubmitData = self
+            .mutate(host, token, SUBMIT_NEW_REVIEW, variables)
+            .await?;
+        Ok(data.review())
     }
 
     /// Deletes the pending review `review_id` with all its comments.
@@ -1466,6 +1550,38 @@ mod tests {
         assert!(pr.locked.is_none() && pr.reviews.is_none());
     }
 
+    #[test]
+    fn the_latest_review_and_the_pending_comment_count_are_read() {
+        let body = format!(
+            r#"{{"data": {{"repository": {{"pullRequest": {{
+                "headRefOid": "{HEAD}", "locked": false,
+                "reviews": {{"nodes": [{{"id": "R1", "body": "", "createdAt": "2026-10-13T00:00:00Z",
+                    "url": "u", "viewerDidAuthor": true, "commit": null,
+                    "commentCount": {{"totalCount": 2}}}}]}},
+                "viewerLatestReview": {{"id": "R0", "state": "APPROVED", "url": "u0", "body": "LGTM"}},
+                "reviewThreads": {{"pageInfo": {{"hasNextPage": false, "endCursor": null}}, "nodes": []}}
+            }}}}}}}}"#
+        );
+        let resp: GqlResponse<ThreadsData> = serde_json::from_str(&body).unwrap();
+        let pr = resp.data.unwrap().repository.unwrap().pull_request.unwrap();
+        let latest = SubmittedReview {
+            id: "R0".into(),
+            state: "APPROVED".into(),
+            url: "u0".into(),
+            body: "LGTM".into(),
+        };
+        assert_eq!(pr.viewer_latest_review, Some(latest));
+        assert_eq!(pending_review(pr.reviews).unwrap().comment_count, 2);
+        // No review yet.
+        let none = body.replace(
+            r#"{"id": "R0", "state": "APPROVED", "url": "u0", "body": "LGTM"}"#,
+            "null",
+        );
+        let resp: GqlResponse<ThreadsData> = serde_json::from_str(&none).unwrap();
+        let pr = resp.data.unwrap().repository.unwrap().pull_request.unwrap();
+        assert_eq!(pr.viewer_latest_review, None);
+    }
+
     /// GraphQL rejects a query with an undefined or an unused fragment.
     #[test]
     fn queries_define_exactly_the_fragments_they_spread() {
@@ -1477,6 +1593,7 @@ mod tests {
             ADD_REVIEW,
             ADD_THREAD,
             SUBMIT_REVIEW,
+            SUBMIT_NEW_REVIEW,
             DELETE_REVIEW,
             ADD_REPLY,
             RESOLVE_THREAD,
@@ -1539,6 +1656,25 @@ mod tests {
             .unwrap();
         assert_eq!(added.comments.into_vec()[0].id, "PRRC_1");
         assert_eq!(added.review.into_api().commit.as_deref(), Some(HEAD));
+
+        // A submitted review, either way it was submitted.
+        let want = SubmittedReview {
+            id: "PRR_9".into(),
+            state: "APPROVED".into(),
+            url: "https://github.com/o/r/pull/1#pullrequestreview-9".into(),
+            body: "ok".into(),
+        };
+        for field in ["submitPullRequestReview", "addPullRequestReview"] {
+            let data: SubmitData = serde_json::from_str(&format!(
+                r#"{{"{field}": {{"pullRequestReview": {{"id": "PRR_9", "state": "APPROVED",
+                    "url": "https://github.com/o/r/pull/1#pullrequestreview-9", "body": "ok"}}}}}}"#
+            ))
+            .unwrap();
+            assert_eq!(data.review(), Some(want.clone()), "{field}");
+        }
+        let none: SubmitData =
+            serde_json::from_str(r#"{"submitPullRequestReview": null}"#).unwrap();
+        assert_eq!(none.review(), None);
 
         // GitHub answers lines it does not take with a null thread and no error (spike S12).
         let none: AddThreadData =
