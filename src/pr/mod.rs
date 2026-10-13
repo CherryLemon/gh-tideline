@@ -1,5 +1,6 @@
 //! Opening a PR: GitHub metadata + cache-repo fetch + diff, with a short in-memory cache.
 
+mod review;
 pub mod target;
 
 use std::collections::HashMap;

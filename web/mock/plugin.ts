@@ -32,6 +32,7 @@ export function mockApi(): Plugin {
     apply: 'serve',
     async configureServer(server) {
       const data = await import('./data.ts')
+      const review = await import('./review.ts')
       server.config.logger.info(`  [mock] serving fake PR with ${data.files.length} files at /github.com/acme/demo-app/pull/42`)
 
       server.middlewares.use((req: IncomingMessage, res: ServerResponse, next: () => void) => {
@@ -70,6 +71,10 @@ export function mockApi(): Plugin {
               // Like the server: a head it has moved on from gets the new head and no entries.
               const asked = url.searchParams.get('head')
               return json(res, 200, { head: pr.head.sha, entries: asked && asked !== pr.head.sha ? [] : data.tree })
+            }
+            if (sub === 'threads' && req.method === 'GET') {
+              await delay(250)
+              return json(res, 200, review.threadsResponse(pr.head.sha))
             }
             if (sub === 'viewed' && req.method === 'PUT') {
               const body = (await readJson(req)) as { path?: unknown; viewed?: unknown; head?: unknown } | null

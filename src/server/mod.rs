@@ -1,6 +1,7 @@
 //! HTTP server: routes, auth flow, API handlers and static assets.
 
 mod assets;
+mod review;
 pub mod security;
 
 use std::sync::Arc;
@@ -68,6 +69,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/{host}/{owner}/{repo}/pulls/{n}/viewed",
             put(set_viewed),
+        )
+        .route(
+            "/api/{host}/{owner}/{repo}/pulls/{n}/threads",
+            get(review::threads),
         )
         .route("/api/{host}/{owner}/{repo}/blobs/{oid}", get(blob))
         .fallback(fallback)

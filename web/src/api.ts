@@ -55,6 +55,80 @@ export interface PrTree {
   entries: TreeEntry[]
 }
 
+/** LEFT is the old (base) file, RIGHT the new (head) file. */
+export type DiffSide = 'LEFT' | 'RIGHT'
+
+export interface ReviewAuthor {
+  login: string
+  avatarUrl: string | null
+}
+
+export interface ReviewComment {
+  id: string
+  /** null for a deleted account ("ghost"). */
+  author: ReviewAuthor | null
+  /** Markdown source. */
+  body: string
+  /** GitHub-rendered HTML; only ever displayed through `sanitize.ts`. */
+  bodyHtml: string
+  createdAt: string
+  lastEditedAt: string | null
+  url: string
+  /** PENDING: part of the viewer's unsubmitted review. */
+  state: 'PENDING' | 'SUBMITTED'
+  reviewId: string | null
+  replyTo: string | null
+  isMinimized: boolean
+  minimizedReason: string | null
+  viewerCanUpdate: boolean
+  viewerCanDelete: boolean
+  viewerDidAuthor: boolean
+}
+
+export interface ReviewThread {
+  id: string
+  /** GitHub's path; a LEFT thread of a renamed file may carry the old path. */
+  path: string
+  subjectType: 'LINE' | 'FILE'
+  /** null for file-level threads. */
+  side: DiffSide | null
+  /** Only for multi-line threads (it may differ from `side`). */
+  startSide: DiffSide | null
+  /** Line in the whole file on `side` at the threads' head; null when outdated or file-level. */
+  line: number | null
+  startLine: number | null
+  originalLine: number | null
+  originalStartLine: number | null
+  /** The diff hunk GitHub showed when the thread was started (plain text). */
+  diffHunk: string
+  isResolved: boolean
+  isOutdated: boolean
+  isCollapsed: boolean
+  resolvedBy: string | null
+  viewerCanReply: boolean
+  viewerCanResolve: boolean
+  viewerCanUnresolve: boolean
+  comments: ReviewComment[]
+}
+
+/** The viewer's own unsubmitted review. */
+export interface PendingReview {
+  id: string
+  body: string
+  /** The commit the review was started on; it stays there when the PR moves on. */
+  commit: string | null
+  createdAt: string
+  url: string
+}
+
+export interface ReviewThreads {
+  /** The head the line numbers refer to (compare it with the head the page shows). */
+  head: string
+  locked: boolean
+  pendingReview: PendingReview | null
+  threads: ReviewThread[]
+}
+
 export interface ApiErrorBody {
   error: { code: string; message: string }
 }
@@ -160,6 +234,12 @@ export async function setViewed(r: RepoRef, n: number, path: string, viewed: boo
     body: JSON.stringify({ path, viewed, head }),
   })
   return ((await res.json()) as { viewed: ViewedState }).viewed
+}
+
+/** Review threads and the viewer's pending review, read fresh from GitHub. */
+export async function getThreads(r: RepoRef, n: number, signal?: AbortSignal): Promise<ReviewThreads> {
+  const res = await request(`${repoBase(r)}/pulls/${n}/threads`, { signal })
+  return (await res.json()) as ReviewThreads
 }
 
 /** Raw blob response; the caller decides whether to read the body (see Content-Length checks). */

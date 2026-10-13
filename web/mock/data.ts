@@ -490,6 +490,15 @@ function buildFiles(): MockChangedFile[] {
 
 export const files: MockChangedFile[] = buildFiles()
 
+/** Lines of a changed file on one side (LEFT = old, RIGHT = new), for review-thread fixtures. */
+export function fileLines(path: string, side: 'LEFT' | 'RIGHT'): string[] {
+  const f = files.find((f) => f.path === path)
+  const oid = f && (side === 'LEFT' ? f.oldOid : f.newOid)
+  const blob = oid ? blobs.get(oid) : undefined
+  if (!blob) throw new Error(`mock: no ${side} text for ${path}`)
+  return blob.toString('utf8').split('\n')
+}
+
 export interface MockTreeEntry {
   path: string
   mode: string

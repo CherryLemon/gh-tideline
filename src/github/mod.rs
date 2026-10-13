@@ -1,5 +1,7 @@
 //! GitHub access: per-host token resolution, hand-written GraphQL query and REST compare.
 
+mod review;
+
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -8,6 +10,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::error::{AppError, ErrorCode};
+
+pub use review::ReviewThreads;
 
 const TOKEN_TTL: Duration = Duration::from_secs(600);
 
