@@ -1,7 +1,8 @@
 import { useEffect, useId, useRef, useState } from 'react'
 import type { PendingReview, ReviewEvent } from '../api'
 import { draftKey, type DraftStore, type DraftView } from '../drafts'
-import { focusWhenShown } from './Composer'
+import { focusWhenShown } from '../focus'
+import { MarkdownField } from './MarkdownField'
 
 /** The summary's box in the drafts. */
 export const REVIEW_KEY = draftKey({ kind: 'review' })
@@ -42,6 +43,7 @@ const plural = (n: number, one: string) => `${n} ${one}${n === 1 ? '' : 's'}`
 export function ReviewDialog({ drafts, view, pendingReview, pendingCount, head, own, locked, onSubmit, onDiscard, onClose }: Props) {
   const [text, setText] = useState(() => drafts.text(REVIEW_KEY))
   const [event, setEvent] = useState<ReviewEvent>('COMMENT')
+  const [preview, setPreview] = useState(false)
   /** The pending review a discard was asked for. */
   const [confirming, setConfirming] = useState<string | null>(null)
   const [discarding, setDiscarding] = useState(false)
@@ -78,7 +80,10 @@ export function ReviewDialog({ drafts, view, pendingReview, pendingCount, head, 
   // A button disabled while busy may have taken the focus with it: back to the summary.
   useEffect(() => {
     const lost = document.activeElement === null || document.activeElement === document.body
-    if (!busy && lost && input.current) focusWhenShown(input.current)
+    if (!busy && lost && input.current) {
+      setPreview(false)
+      focusWhenShown(input.current)
+    }
   }, [busy])
 
   const change = (value: string) => {
@@ -92,6 +97,7 @@ export function ReviewDialog({ drafts, view, pendingReview, pendingCount, head, 
   }
   const keep = () => {
     setConfirming(null)
+    setPreview(false)
     if (input.current) focusWhenShown(input.current)
   }
   const discard = () => {
@@ -144,15 +150,16 @@ export function ReviewDialog({ drafts, view, pendingReview, pendingCount, head, 
               <code>{olderCommit.slice(0, 7)}</code>): its comments stay on the lines of that version.
             </div>
           )}
-          <textarea
-            ref={input}
-            className="composer-input"
-            aria-label="Summary of your review"
-            aria-describedby={notes || undefined}
-            placeholder="Leave a summary (Markdown)"
+          <MarkdownField
+            input={input}
             value={text}
+            onChange={change}
+            preview={preview}
+            onPreview={setPreview}
+            label="Summary of your review"
+            describedBy={notes || undefined}
+            placeholder="Leave a summary (Markdown)"
             readOnly={busy}
-            onChange={(e) => change(e.target.value)}
           />
           <fieldset className="review-events" disabled={busy} aria-label="Your verdict">
             {EVENTS.map((o) => {

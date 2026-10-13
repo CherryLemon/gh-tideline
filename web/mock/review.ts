@@ -82,6 +82,24 @@ export function renderBody(body: string): string {
     .join('\n')
 }
 
+/**
+ * `POST /markdown`: a preview, with **bold** and `code` on top of `renderBody`. `/fail 502` in
+ * the text fails it; `/xss` answers with the XSS fixture (what the client must sanitize).
+ */
+export function renderPreview(body: unknown): { status: number; body: unknown } {
+  const text = (body as { text?: unknown } | null)?.text
+  if (typeof text !== 'string') return { status: 400, body: { error: { code: 'bad_request', message: 'expected {text}' } } }
+  if ([...text].length > 65536) return { status: 400, body: { error: { code: 'bad_request', message: 'the text is longer than 65536 characters' } } }
+  if (/\/fail 502\b/.test(text)) return { status: 502, body: { error: { code: 'github_error', message: 'GitHub markdown returned 502 Bad Gateway' } } }
+  if (text.includes('/xss')) return { status: 200, body: { html: XSS_BODY_HTML } }
+  const html = text.trim()
+    ? renderBody(text)
+        .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+        .replace(/`([^`]+)`/g, '<code>$1</code>')
+    : ''
+  return { status: 200, body: { html } }
+}
+
 export interface MockState {
   threads: MockThread[]
   pendingReview: MockPendingReview | null

@@ -1,6 +1,8 @@
 import { useEffect, useId, useRef, useState } from 'react'
 import type { CommentMode } from '../api'
 import type { DraftStore, DraftView } from '../drafts'
+import { focusWhenShown } from '../focus'
+import { MarkdownField } from './MarkdownField'
 
 /**
  * What a box sends: a new comment (a thread, or a reply), or a comment's new text. A lost box
@@ -42,29 +44,17 @@ interface Props {
   onKeepLines?(): void
 }
 
-/** Frames to wait for a new box to show (a box in the diff waits for its zone) before focusing. */
-const FOCUS_FRAMES = 30
-
-/**
- * Focuses `el` once it can take focus. Inside the diff editor the page must not scroll: the
- * editor scrolls itself (`ZoneHost`), and a scrolled editor container misplaces everything.
- */
-export function focusWhenShown(el: HTMLElement, frames = FOCUS_FRAMES): void {
-  if (!el.isConnected) return
-  el.focus({ preventScroll: !!el.closest('.tl-zone') })
-  if (document.activeElement !== el && frames > 0) requestAnimationFrame(() => focusWhenShown(el, frames - 1))
-}
-
 /**
  * A box for a new comment. Without a pending review it offers "Start a review" (the comment
  * waits in a new pending review) and "Add single comment" (posted at once); with one, the
  * comment goes into it. Ctrl+Enter does the first; Esc closes an empty box, or asks first.
  * A box that edits a comment offers "Update comment"; Esc closes it while it is unchanged.
- * A lost box offers "Copy text" and Discard.
+ * A lost box offers "Copy text" and Discard. Every box can preview its text as GitHub will show it.
  */
 export function Composer({ drafts, draftKey, view, action, locked = false, label, heading, placeholder, onKeepLines }: Props) {
   const [text, setText] = useState(() => drafts.text(draftKey))
   const [confirming, setConfirming] = useState(false)
+  const [preview, setPreview] = useState(false)
   /** What "Copy text" did. */
   const [copyHint, setCopyHint] = useState('')
   const input = useRef<HTMLTextAreaElement>(null)
@@ -84,6 +74,7 @@ export function Composer({ drafts, draftKey, view, action, locked = false, label
     if (!drafts.takeFocus(draftKey) || !input.current) return
     const from = document.activeElement
     if (from instanceof HTMLElement && from !== document.body) returnTo.current = from
+    setPreview(false)
     focusWhenShown(input.current)
   })
   useEffect(
@@ -112,6 +103,7 @@ export function Composer({ drafts, draftKey, view, action, locked = false, label
     // Without the clipboard (or refused it), the text is selected for Ctrl+C.
     const select = () => {
       if (!input.current) return
+      setPreview(false)
       focusWhenShown(input.current)
       input.current.select()
       setCopyHint('Press Ctrl+C to copy')
@@ -125,10 +117,11 @@ export function Composer({ drafts, draftKey, view, action, locked = false, label
   }
   const keepEditing = () => {
     setConfirming(false)
+    setPreview(false)
     if (input.current) focusWhenShown(input.current)
   }
 
-  const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+  const onKeyDown = (e: React.KeyboardEvent) => {
     // Also Safari's Esc ending a composition (`isComposing` already false there).
     if (e.nativeEvent.isComposing || e.keyCode === 229) return
     if (e.key === 'Enter' && (e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey) {
@@ -151,15 +144,16 @@ export function Composer({ drafts, draftKey, view, action, locked = false, label
   return (
     <div className="tl-card composer" data-draft={draftKey} aria-busy={busy}>
       {heading && <div className="composer-heading">{heading}</div>}
-      <textarea
-        ref={input}
-        className="composer-input"
-        aria-label={label}
-        aria-describedby={notes || undefined}
-        placeholder={placeholder ?? 'Leave a comment (Markdown)'}
+      <MarkdownField
+        input={input}
         value={text}
+        onChange={change}
+        preview={preview}
+        onPreview={setPreview}
+        label={label}
+        describedBy={notes || undefined}
+        placeholder={placeholder ?? 'Leave a comment (Markdown)'}
         readOnly={busy}
-        onChange={(e) => change(e.target.value)}
         onKeyDown={onKeyDown}
       />
       {stale && (

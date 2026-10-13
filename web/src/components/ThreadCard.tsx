@@ -1,8 +1,9 @@
 import { createContext, memo, useContext, useEffect, useId, useRef, useState } from 'react'
 import type { CommentMode, DiffSide, ReviewComment, ReviewThread } from '../api'
 import { boxText, editKey, replyKey, type DraftStore, type DraftsSnapshot } from '../drafts'
+import { focusWhenShown } from '../focus'
 import { hunkOf, type LineAnchor, type PanelReason } from '../threads'
-import { Composer, focusWhenShown } from './Composer'
+import { Composer } from './Composer'
 import { SafeHtml } from './SafeHtml'
 
 /** What the cards may do with their threads; without it they only show them. */

@@ -10,6 +10,7 @@ import {
   getPrFiles,
   getPrTree,
   getThreads,
+  renderMarkdown,
   errorMessage,
   replyToThread,
   setThreadResolved,
@@ -46,6 +47,7 @@ import { useReview, type ReviewRead } from '../useReview'
 import { boxText, draftKey, draftStoreFor, editKey, lostDrafts, replyKey, type DraftTarget, type DraftView } from '../drafts'
 import { postDelete, postDiscard, postReply, postSubmit, postThread, threadRequest, type ReadDeps } from '../compose'
 import { stamp, type ReviewStore } from '../review'
+import { MarkdownContext, markdownRenderer } from '../markdown'
 import { DiffPane, type ChangeInfo, type DiffPaneHandle, type PaneReview, type PendingJump } from './DiffPane'
 import { FileTree, type ListingState, type TreeScope } from './FileTree'
 import { FileFinder } from './FileFinder'
@@ -93,6 +95,8 @@ export function PrPage({ route, search }: Props) {
     () => ({ host: route.host, owner: route.owner, repo: route.repo }),
     [route.host, route.owner, route.repo],
   )
+  // Comment previews, as GitHub renders them in this repository.
+  const markdown = useMemo(() => markdownRenderer((text) => renderMarkdown(repo, text)), [repo])
   const [data, setData] = useState<Data | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [refreshing, setRefreshing] = useState(false)
@@ -159,7 +163,11 @@ export function PrPage({ route, search }: Props) {
       </div>
     )
   }
-  return <PrView repo={repo} data={data} search={search} onRefresh={refresh} refreshing={refreshing} />
+  return (
+    <MarkdownContext.Provider value={markdown}>
+      <PrView repo={repo} data={data} search={search} onRefresh={refresh} refreshing={refreshing} />
+    </MarkdownContext.Provider>
+  )
 }
 
 interface ViewProps {

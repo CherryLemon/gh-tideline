@@ -94,6 +94,10 @@ pub fn router(state: AppState) -> Router {
             patch(review::edit_comment).delete(review::delete_comment),
         )
         .route("/api/{host}/{owner}/{repo}/blobs/{oid}", get(blob))
+        .route(
+            "/api/{host}/{owner}/{repo}/markdown",
+            post(review::markdown),
+        )
         .fallback(fallback)
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
         .layer(axum::middleware::from_fn_with_state(

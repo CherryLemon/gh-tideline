@@ -472,6 +472,38 @@ impl Github {
         check_oid(&compare.merge_base_commit.sha)?;
         Ok(compare.merge_base_commit.sha)
     }
+
+    /// `text` rendered as GitHub renders a comment in `owner/repo` (`gfm`: `#12` and `@user`
+    /// link there), for a preview. The HTML is GitHub's, sanitized by the client like a
+    /// comment body.
+    pub async fn render_markdown(
+        &self,
+        host: &str,
+        token: &str,
+        owner: &str,
+        repo: &str,
+        text: &str,
+    ) -> Result<String, AppError> {
+        let resp = self
+            .http
+            .post(format!("{}/markdown", rest_base(host)))
+            .bearer_auth(token)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .json(&json!({ "text": text, "mode": "gfm", "context": format!("{owner}/{repo}") }))
+            .send()
+            .await
+            .map_err(|e| AppError::github(format!("markdown request to {host} failed: {e}")))?;
+        let status = resp.status();
+        let html = resp
+            .text()
+            .await
+            .map_err(|e| AppError::github(format!("reading markdown response: {e}")))?;
+        if !status.is_success() {
+            return Err(http_error("markdown", status, &html));
+        }
+        Ok(html)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

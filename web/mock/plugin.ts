@@ -160,6 +160,12 @@ export function mockApi(): Plugin {
               return json(res, 200, { path: body.path, viewed: state })
             }
           }
+          if (kind === 'markdown' && parts.length === 4 && req.method === 'POST') {
+            const body = await readJson(req)
+            await delay(300)
+            const r = review.renderPreview(body)
+            return json(res, r.status, r.body)
+          }
           if (kind === 'blobs' && id && sub === undefined) {
             if (!/^[0-9a-f]{40}$/.test(id)) return error(res, 400, 'bad_request', 'invalid oid')
             const blob = data.blobs.get(id)

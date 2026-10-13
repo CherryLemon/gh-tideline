@@ -11,7 +11,8 @@ use std::future::Future;
 use super::{AppState, Inner, check_head, check_repo, parse_pr_number};
 use crate::error::AppError;
 use crate::pr::review::{
-    DiscardRequest, EditRequest, ReplyRequest, ResolveRequest, SubmitRequest, ThreadRequest,
+    DiscardRequest, EditRequest, MarkdownRequest, ReplyRequest, ResolveRequest, SubmitRequest,
+    ThreadRequest,
 };
 use crate::state::PrKey;
 
@@ -41,6 +42,22 @@ pub(super) async fn threads(
 ) -> Result<Response, AppError> {
     let key = pr_key(&state, params)?;
     Ok(Json(state.pr.threads(&key).await?).into_response())
+}
+
+/// `POST /api/{host}/{owner}/{repo}/markdown {text}` → `{html}`: a comment's preview, as
+/// GitHub renders it in that repository. Reads nothing and writes nothing on GitHub.
+pub(super) async fn markdown(
+    State(state): State<AppState>,
+    Path((host, owner, repo)): Path<(String, String, String)>,
+    body: Bytes,
+) -> Result<Response, AppError> {
+    check_repo(&state, &host, &owner, &repo)?;
+    let req: MarkdownRequest = parse_body(&body)?;
+    let html = state
+        .pr
+        .render_markdown(&host, &owner, &repo, &req.text)
+        .await?;
+    Ok(Json(json!({ "html": html })).into_response())
 }
 
 fn parse_body<T: DeserializeOwned>(body: &Bytes) -> Result<T, AppError> {

@@ -140,6 +140,13 @@ pub struct ResolveRequest {
     pub resolved: bool,
 }
 
+/// `POST /markdown`: text to render for a preview.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MarkdownRequest {
+    pub text: String,
+}
+
 /// `PATCH /threads/{t}/comments/{c}`: the comment's new text.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -152,12 +159,12 @@ pub fn check_body(body: &str) -> Result<(), AppError> {
     if body.trim().is_empty() {
         return Err(AppError::bad_request("the comment is empty"));
     }
-    if body.chars().count() > MAX_BODY_CHARS {
-        return Err(AppError::bad_request(format!(
-            "the comment is longer than {MAX_BODY_CHARS} characters"
-        )));
-    }
-    Ok(())
+    check_length(body, "the comment")
+}
+
+/// Text to preview: anything a comment or a summary can hold, blank included.
+pub fn check_preview(text: &str) -> Result<(), AppError> {
+    check_length(text, "the text")
 }
 
 /// A review's summary: none when blank (GitHub then asks for one where it needs it).
@@ -165,12 +172,18 @@ fn summary(body: &str) -> Result<Option<&str>, AppError> {
     if body.trim().is_empty() {
         return Ok(None);
     }
-    if body.chars().count() > MAX_BODY_CHARS {
+    check_length(body, "the summary")?;
+    Ok(Some(body))
+}
+
+/// `what` ("the comment") is at most as long as GitHub takes.
+fn check_length(text: &str, what: &str) -> Result<(), AppError> {
+    if text.chars().count() > MAX_BODY_CHARS {
         return Err(AppError::bad_request(format!(
-            "the summary is longer than {MAX_BODY_CHARS} characters"
+            "{what} is longer than {MAX_BODY_CHARS} characters"
         )));
     }
-    Ok(Some(body))
+    Ok(())
 }
 
 /// The thread a request asks for, if it is well formed: lines for a LINE thread (a range
@@ -405,6 +418,25 @@ impl PrService {
         let token = self.tokens.get(&key.host).await?;
         self.github
             .review_threads(&key.host, &token, &key.owner, &key.repo, key.number)
+            .await
+    }
+
+    /// Markdown as GitHub would show it in a comment in `owner/repo` (see
+    /// [`crate::github::Github::render_markdown`]). Blank text is nothing to render.
+    pub async fn render_markdown(
+        &self,
+        host: &str,
+        owner: &str,
+        repo: &str,
+        text: &str,
+    ) -> Result<String, AppError> {
+        check_preview(text)?;
+        if text.trim().is_empty() {
+            return Ok(String::new());
+        }
+        let token = self.tokens.get(host).await?;
+        self.github
+            .render_markdown(host, &token, owner, repo, text)
             .await
     }
 
@@ -921,6 +953,17 @@ mod tests {
         ] {
             assert_eq!(code(check_body(&bad)), Err(ErrorCode::BadRequest));
         }
+    }
+
+    #[test]
+    fn previews_take_what_a_comment_can_hold() {
+        for ok in [String::new(), " \n".into(), "é".repeat(MAX_BODY_CHARS)] {
+            assert!(check_preview(&ok).is_ok());
+        }
+        assert_eq!(
+            code(check_preview(&"é".repeat(MAX_BODY_CHARS + 1))),
+            Err(ErrorCode::BadRequest)
+        );
     }
 
     fn state(head: &str, pending: bool) -> ReviewState {

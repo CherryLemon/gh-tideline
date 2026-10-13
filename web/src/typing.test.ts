@@ -25,4 +25,12 @@ describe('isTypingTarget', () => {
     expect(isTypingTarget(el(editor('<div class="tl-zone"><div><textarea></textarea></div></div>'), 'textarea'))).toBe(true)
     expect(isTypingTarget(el(editor('<div class="tl-zone"><button>Reply</button></div>'), 'button'))).toBe(false)
   })
+
+  it('counts all of a comment box, in the editor or not', () => {
+    const box = '<div class="tl-card composer"><div role="tablist"><button role="tab">Preview</button></div><div class="md-preview" tabindex="0"><p>x</p></div><button>Cancel</button></div>'
+    for (const selector of ['[role=tab]', '.md-preview', '.md-preview p', 'button:not([role])']) {
+      expect(isTypingTarget(el(box, selector))).toBe(true)
+      expect(isTypingTarget(el(`<div class="monaco-editor"><div class="tl-zone">${box}</div></div>`, selector))).toBe(true)
+    }
+  })
 })

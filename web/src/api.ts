@@ -397,6 +397,16 @@ export function mayHaveLanded(e: unknown): boolean {
   return e instanceof ApiError && (e.code === 'network' || e.status === 502 || e.status === 504)
 }
 
+/** `text` as GitHub would render it in a comment in the repository (HTML to sanitize). */
+export async function renderMarkdown(r: RepoRef, text: string): Promise<string> {
+  const res = await request(`${repoBase(r)}/markdown`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text }),
+  })
+  return ((await res.json()) as { html: string }).html
+}
+
 /** Raw blob response; the caller decides whether to read the body (see Content-Length checks). */
 export function getBlob(r: RepoRef, oid: string, signal?: AbortSignal): Promise<Response> {
   return request(`${repoBase(r)}/blobs/${oid}`, { signal })
