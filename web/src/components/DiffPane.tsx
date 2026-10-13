@@ -6,9 +6,24 @@ import type { ChangedFile, RepoRef, ReviewThread, TreeEntry } from '../api'
 import { errorMessage } from '../api'
 import { SANDY_BEACH_THEME } from '../monaco/theme'
 import { ZoneHost } from '../monaco/zones'
+import { CommentGutter, type PickedLines } from '../monaco/gutter'
 import { LIMITS, isGitlink, shortSha } from '../degrade'
 import { formatBytes, loadFile, loadUnchanged, models, prefetchFile, type LoadedFile, type SideInfo } from '../monaco/files'
-import { placeThreads, type PanelReason, type Placement } from '../threads'
+import {
+  commentableLines,
+  gitLineCount,
+  inSpans,
+  placeDrafts,
+  placeThreads,
+  type DraftPanelReason,
+  type DraftPlacement,
+  type EditorSide,
+  type LineAnchor,
+  type LineDraft,
+  type LineSpan,
+  type PanelReason,
+  type Placement,
+} from '../threads'
 import { isChanged } from '../tree'
 import { ImageDiff, ImageView } from './ImageDiff'
 import { PaneThreads } from './PaneThreads'
@@ -31,9 +46,24 @@ export interface PendingJump {
  */
 export type StepResult = 'moved' | 'none' | 'notReady'
 
+/**
+ * What `c` did:
+ * - opened: a box is open on the lines at the caret or the selection (new, or the open one);
+ * - no-comments: the file takes no comments on lines (see `PaneReview.onComment`);
+ * - no-diff: the file isn't shown as a text diff (or not yet);
+ * - diff-stopped: computing the diff took too long, so the changed lines aren't known;
+ * - deleted: in unified view, a file with lines on the old side only (deleted or emptied),
+ *   which can't be picked there;
+ * - empty-side: the caret is on the side an added or deleted file doesn't have;
+ * - not-commentable: GitHub takes comments only on changed lines and the lines around them.
+ */
+export type CommentAtCursor = 'opened' | 'no-comments' | 'no-diff' | 'diff-stopped' | 'deleted' | 'empty-side' | 'not-commentable'
+
 export interface DiffPaneHandle {
   nextChange(): StepResult
   prevChange(): StepResult
+  /** Opens a box for a comment on the lines at the caret or the selection, on the side focused last. */
+  commentAtCursor(): CommentAtCursor
 }
 
 /** The review threads of the file shown, and how to draw them. */
@@ -48,6 +78,12 @@ export interface PaneReview {
   notice?: React.ReactNode
   /** The open box for a new comment on the file, shown with the listed threads. */
   composer?: React.ReactNode
+  /** Open boxes for new comments on lines of the file. */
+  drafts?: readonly LineDraft[]
+  /** A box of `drafts`; `reason` is set when it is listed above the diff instead of under its lines. */
+  renderDraft?(key: string, reason?: DraftPanelReason): React.ReactNode
+  /** Opens a box for a new comment on lines and returns its key; absent when the file takes none. */
+  onComment?(lines: LineAnchor): string
 }
 
 interface Props {
@@ -80,12 +116,16 @@ type PaneState =
 /** Which editor shows a file: the diff editor, or the plain one for unchanged files. */
 type Attached = 'diff' | 'single' | null
 
-/** Where the threads of `path` went; `diff`: placed against a computed diff. */
+/** Where the threads and boxes of `path` went; `diff`: placed against a computed diff. */
 interface Placed {
   path: string
   diff: boolean
   placement: Placement
+  drafts: DraftPlacement
 }
+
+/** Card keys of boxes, apart from threads' (node ids). */
+const draftCardKey = (key: string) => `draft:${key}`
 
 /** Diff limits for the attached file; a force-loaded file has none. */
 function diffLimits(forced: boolean): Pick<Monaco.editor.IDiffEditorOptions, 'maxComputationTime' | 'maxFileSize'> {
@@ -170,6 +210,13 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
   const [host, setHost] = useState<ZoneHost | null>(null)
   /** Bumped when the diff editor has a new diff, so the cards are placed against it. */
   const [diffTick, setDiffTick] = useState(0)
+  /** The "+" in each editor's glyph margin. */
+  const gutters = useRef<Record<EditorSide, CommentGutter> | null>(null)
+  /** The editor that had focus last: `c` comments there when neither has it now. */
+  const lastSide = useRef<EditorSide>('modified')
+  /** A box just opened from here: brought into view once it has its zone. */
+  const revealDraft = useRef<string | null>(null)
+  const [revealTick, setRevealTick] = useState(0)
 
   const options = useMemo<Monaco.editor.IDiffEditorConstructionOptions>(
     () => ({
@@ -185,6 +232,9 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
       ...EDITOR_OPTIONS,
       renderMarginRevertIcon: false,
       renderGutterMenu: false,
+      // For the "+" that opens a comment box (`CommentGutter`); on the original side the diff
+      // editor shows it in split view only.
+      glyphMargin: true,
     }),
     [sideBySide, ignoreTrimWhitespace, attachedForced],
   )
@@ -276,7 +326,7 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
     [activeSide, changed, file.path, jumpTo, pendingJump, state.kind],
   )
 
-  useImperativeHandle(ref, () => ({ nextChange: () => step(1), prevChange: () => step(-1) }), [step])
+  useImperativeHandle(ref, () => ({ nextChange: () => step(1), prevChange: () => step(-1), commentAtCursor: () => commentRef.current() }), [step])
 
   const handleMount = useCallback(
     (ed: DiffEditorT) => {
@@ -295,6 +345,8 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
       }
       ed.getModifiedEditor().onDidChangeCursorPosition(onCursor)
       ed.getOriginalEditor().onDidChangeCursorPosition(onCursor)
+      ed.getModifiedEditor().onDidFocusEditorText(() => (lastSide.current = 'modified'))
+      ed.getOriginalEditor().onDidFocusEditorText(() => (lastSide.current = 'original'))
       setDiffEditor(ed)
     },
     [],
@@ -308,9 +360,17 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
   useEffect(() => {
     if (!diffEditor) return
     const h = new ZoneHost(diffEditor)
+    const g = {
+      original: new CommentGutter(diffEditor.getOriginalEditor(), (p) => pickRef.current('original', p)),
+      modified: new CommentGutter(diffEditor.getModifiedEditor(), (p) => pickRef.current('modified', p)),
+    }
+    gutters.current = g
     setHost(h)
     return () => {
       h.dispose()
+      g.original.dispose()
+      g.modified.dispose()
+      gutters.current = null
       setHost(null)
     }
   }, [diffEditor])
@@ -450,6 +510,7 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
   // another file loads there are none; while this one reloads (Refresh, retry) they stay put.
   const oldPath = changed?.oldPath !== undefined && changed.oldPath !== changed.path ? changed.oldPath : undefined
   const threads = review?.threads
+  const lineDrafts = review?.drafts
   const headOk = review?.headOk ?? true
   const lastPlaced = useRef<Placed | null>(null)
   const placed = useMemo<Placed | null>(() => {
@@ -460,33 +521,113 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
     const lineChanges = model ? (ed?.getLineChanges() ?? null) : null
     // The new content of a reloaded file is shown before its diff is computed.
     if (model && !lineChanges && lastPlaced.current?.path === file.path && lastPlaced.current.diff) return lastPlaced.current
-    const placement = placeThreads({
-      threads,
-      oldPath,
-      view: model ? (sideBySide ? 'split' : 'unified') : null,
-      lineChanges,
-      lineCounts: { original: model?.original.getLineCount() ?? 0, modified: model?.modified.getLineCount() ?? 0 },
-      headOk,
-    })
-    return { path: file.path, diff: lineChanges !== null, placement }
+    const view = model ? (sideBySide ? 'split' : 'unified') : null
+    const lineCounts = { original: model?.original.getLineCount() ?? 0, modified: model?.modified.getLineCount() ?? 0 }
+    const placement = placeThreads({ threads, oldPath, view, lineChanges, lineCounts, headOk })
+    const drafts = placeDrafts({ drafts: lineDrafts ?? [], view, lineChanges, lineCounts })
+    return { path: file.path, diff: lineChanges !== null, placement, drafts }
     // `diffTick` stands for the editor's diff, read above.
-  }, [threads, file.path, oldPath, state.kind, attached, sideBySide, headOk, diffTick])
+  }, [threads, lineDrafts, file.path, oldPath, state.kind, attached, sideBySide, headOk, diffTick])
   const placement = placed?.placement ?? null
+  const draftPlacement = placed?.drafts ?? null
 
   useLayoutEffect(() => {
     lastPlaced.current = placed
     if (!host) return
-    const specs = (placement?.zones ?? []).map((z) => ({
-      key: z.thread.id,
+    const spec = (key: string, z: { editor: EditorSide; afterLine: number; ordinal: number; reveal: number | null }) => ({
+      key,
       editor: z.editor,
       afterLine: z.afterLine,
       ordinal: z.ordinal,
       reveal: z.reveal,
-    }))
+    })
+    const specs = [
+      ...(placement?.zones ?? []).map((z) => spec(z.thread.id, z)),
+      ...(draftPlacement?.zones ?? []).map((z) => spec(draftCardKey(z.draft.key), z)),
+    ]
     // Unfolding moves the caret; in a file the user hasn't moved in, leave it on the first change.
     const first = editorRef.current?.getLineChanges()?.[0]
     host.sync(specs, fresh.current ? (first ? anchor(first, 'modified') : 1) : 'keep')
-  }, [placed, placement, host])
+  }, [placed, placement, draftPlacement, host])
+
+  // After the zones are synced: a box opened again is already placed, so `revealTick` runs this.
+  useLayoutEffect(() => {
+    const reveal = revealDraft.current
+    if (reveal === null || !host) return
+    if (draftPlacement?.zones.some((z) => z.draft.key === reveal)) {
+      revealDraft.current = null
+      host.revealCard(draftCardKey(reveal))
+    } else if (draftPlacement?.panel.some((d) => d.draft.key === reveal)) revealDraft.current = null
+  }, [draftPlacement, host, revealTick])
+
+  // Lines GitHub takes comments on, per side (none on a side the file doesn't have);
+  // 'stopped': Monaco gave up on the diff and shows the whole file as changed.
+  const spans = useMemo<Record<EditorSide, LineSpan[]> | 'stopped' | null>(() => {
+    const ed = editorRef.current
+    const model = changed && state.kind === 'text' && attached === 'diff' ? ed?.getModel() : null
+    const changes = model ? ed?.getLineChanges() : null
+    if (!changed || !ed || !model || !changes) return null
+    // Monaco's diff editor has it, but 0.57 doesn't declare it.
+    const result = (ed as DiffEditorT & { getDiffComputationResult?(): { quitEarly: boolean } | null }).getDiffComputationResult?.()
+    if (result?.quitEarly) return 'stopped'
+    const lines = (m: Monaco.editor.ITextModel) => gitLineCount(m.getLineCount(), m.getLineLength(m.getLineCount()))
+    return {
+      original: commentableLines(changes, 'original', changed.oldOid ? lines(model.original) : 0),
+      modified: commentableLines(changes, 'modified', changed.newOid ? lines(model.modified) : 0),
+    }
+    // `diffTick` stands for the editor's diff, read above.
+  }, [changed, state.kind, attached, diffTick])
+  const onComment = review?.onComment
+  useEffect(() => {
+    const g = gutters.current
+    if (!g) return
+    const known = spans === 'stopped' ? null : spans
+    const take = (s: LineSpan[] | undefined) => (onComment && s && s.length > 0 ? (line: number) => inSpans(s, line) : null)
+    // In unified view the original editor is hidden; its lines show in the modified one, where
+    // they can't be picked.
+    g.original.setAllowed(sideBySide ? take(known?.original) : null)
+    g.modified.setAllowed(take(known?.modified))
+  }, [spans, sideBySide, onComment, host])
+
+  /** Opens the box for `lines` of `editor`, to be brought into view. */
+  const openBox = (editor: EditorSide, lines: PickedLines) => {
+    const key = onComment?.({
+      side: editor === 'original' ? 'LEFT' : 'RIGHT',
+      line: lines.line,
+      startLine: lines.startLine < lines.line ? lines.startLine : null,
+    })
+    if (key === undefined) return
+    revealDraft.current = key
+    setRevealTick((t) => t + 1)
+  }
+  const pickRef = useRef(openBox)
+  pickRef.current = openBox
+
+  const commentAtCursor = (): CommentAtCursor => {
+    const ed = editorRef.current
+    if (!onComment) return 'no-comments'
+    if (!ed || !spans || state.kind !== 'text') return 'no-diff'
+    if (spans === 'stopped') return 'diff-stopped'
+    if (!sideBySide && spans.modified.length === 0 && spans.original.length > 0) return 'deleted'
+    const focused: EditorSide | null = ed.getOriginalEditor().hasTextFocus() ? 'original' : ed.getModifiedEditor().hasTextFocus() ? 'modified' : null
+    let editor: EditorSide = sideBySide ? (focused ?? lastSide.current) : 'modified'
+    const other: EditorSide = editor === 'original' ? 'modified' : 'original'
+    // The side an added or deleted file doesn't have: unless the caret is there, the other side.
+    if (spans[editor].length === 0 && spans[other].length > 0) {
+      if (focused) return 'empty-side'
+      editor = other
+    }
+    const sel = (editor === 'original' ? ed.getOriginalEditor() : ed.getModifiedEditor()).getSelection()
+    if (!sel) return 'no-diff'
+    const startLine = sel.startLineNumber
+    // A selection that ends at the start of a line doesn't take that line.
+    const line = sel.endLineNumber > startLine && sel.endColumn === 1 ? sel.endLineNumber - 1 : sel.endLineNumber
+    if (!inSpans(spans[editor], startLine) || !inSpans(spans[editor], line)) return 'not-commentable'
+    openBox(editor, { startLine, line })
+    return 'opened'
+  }
+  const commentRef = useRef(commentAtCursor)
+  commentRef.current = commentAtCursor
 
   // Multi-line threads mark their lines.
   const ranges = useRef<{ original: Monaco.editor.IEditorDecorationsCollection; modified: Monaco.editor.IEditorDecorationsCollection } | null>(null)
@@ -506,14 +647,37 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
           options: { isWholeLine: true, className: 'tl-thread-range' },
         })
       }
+      // The lines an open box is about.
+      for (const z of draftPlacement?.zones ?? []) {
+        if (z.editor !== side) continue
+        const from = z.highlight?.from ?? (z.draft.side === 'RIGHT' || sideBySide ? z.draft.line : null)
+        if (from === null) continue
+        marks.push({
+          range: { startLineNumber: from, startColumn: 1, endLineNumber: z.highlight?.to ?? from, endColumn: 1 },
+          options: { isWholeLine: true, className: 'tl-line-pick' },
+        })
+      }
       ranges.current[side].set(marks)
     }
-  }, [placement])
+  }, [placement, draftPlacement, sideBySide])
 
   const cards =
     review && host && placement
       ? placement.zones.map((z) => createPortal(review.renderThread(z.thread), host.node(z.thread.id), z.thread.id))
       : null
+  const renderDraft = review?.renderDraft
+  const boxes =
+    renderDraft && host && draftPlacement
+      ? draftPlacement.zones.map((z) => {
+          const key = draftCardKey(z.draft.key)
+          return createPortal(renderDraft(z.draft.key), host.node(key), key)
+        })
+      : null
+  // Above the diff: the box for the file, then boxes away from their lines.
+  const listedBoxes = [
+    review?.composer,
+    ...(renderDraft ? (draftPlacement?.panel ?? []).map((d) => renderDraft(d.draft.key, d.reason)) : []),
+  ].filter(Boolean)
 
   // The attached content may be stale at the new head of a provisional file: show neither editor.
   const showEditor = !provisional && (state.kind === 'text' || (state.kind === 'loading' && attached === 'diff'))
@@ -531,7 +695,12 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
         actions={headerActions}
       />
       {review && placement && (
-        <PaneThreads items={placement.panel} renderThread={review.renderThread} notice={review.notice} composer={review.composer} />
+        <PaneThreads
+          items={placement.panel}
+          renderThread={review.renderThread}
+          notice={review.notice}
+          composer={listedBoxes.length > 0 ? listedBoxes : undefined}
+        />
       )}
       <div className="diff-body">
         {singleWanted && (
@@ -558,6 +727,7 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
         {overlay}
       </div>
       {cards}
+      {boxes}
     </div>
   )
 })

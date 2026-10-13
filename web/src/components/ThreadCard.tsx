@@ -1,6 +1,6 @@
 import { memo, useId, useState } from 'react'
 import type { DiffSide, ReviewComment, ReviewThread } from '../api'
-import { hunkOf, type PanelReason } from '../threads'
+import { hunkOf, type LineAnchor, type PanelReason } from '../threads'
 import { SafeHtml } from './SafeHtml'
 
 /** Why a thread shows in the panel instead of under its line, as a chip; null: nothing to say. */
@@ -15,6 +15,12 @@ const REASON_CHIPS: Record<PanelReason, { label: string; title: string } | null>
 
 function sideMark(side: DiffSide | null): string {
   return side === 'LEFT' ? '−' : '+'
+}
+
+/** "Line +12", "Lines +10 to +12": the lines a new comment is about. */
+export function anchorLines(a: LineAnchor): string {
+  const end = `${sideMark(a.side)}${a.line}`
+  return a.startLine === null || a.startLine === a.line ? `Line ${end}` : `Lines ${sideMark(a.side)}${a.startLine} to ${end}`
 }
 
 /** "Line +12", "Lines −5 to +8"; outdated threads give their original lines. */

@@ -1,7 +1,20 @@
 import { describe, expect, it } from 'vitest'
 import type { ChangedFile, ReviewThread } from './api'
 import { mkThread } from './test-fixtures'
-import { fileCounts, hunkOf, origToMod, placeThreads, threadsForFile, type LineChange, type PlaceInput } from './threads'
+import {
+  commentableLines,
+  fileCounts,
+  gitLineCount,
+  hunkOf,
+  inSpans,
+  origToMod,
+  placeDrafts,
+  placeThreads,
+  threadsForFile,
+  type LineChange,
+  type LineDraft,
+  type PlaceInput,
+} from './threads'
 
 function change(os: number, oe: number, ms: number, me: number): LineChange {
   return { originalStartLineNumber: os, originalEndLineNumber: oe, modifiedStartLineNumber: ms, modifiedEndLineNumber: me }
@@ -136,6 +149,84 @@ describe('placeThreads', () => {
     const p = place([newer, older])
     expect(p.zones.map((z) => z.thread.id)).toEqual([older.id, newer.id])
     expect(p.zones[0].ordinal).toBeLessThan(p.zones[1].ordinal)
+  })
+})
+
+function draft(side: LineDraft['side'], line: number, startLine: number | null = null): LineDraft {
+  return { key: `lines:${side}:${startLine ?? ''}-${line}:a.ts`, side, line, startLine }
+}
+
+describe('placeDrafts', () => {
+  const base = { view: 'split' as const, lineChanges: CHANGES, lineCounts: { original: 30, modified: 30 } }
+
+  it('puts boxes under their last line, after the threads there', () => {
+    const right = draft('RIGHT', 7, 5)
+    const left = draft('LEFT', 21)
+    const p = placeDrafts({ ...base, drafts: [right, left] })
+    expect(p.panel).toEqual([])
+    expect(p.zones[0]).toMatchObject({ draft: right, editor: 'modified', afterLine: 7, highlight: { from: 5, to: 7 }, reveal: 7 })
+    expect(p.zones[1]).toMatchObject({ draft: left, editor: 'original', afterLine: 21, highlight: null, reveal: 22 })
+    const thread = place([mkThread({ line: 7 })]).zones[0]
+    for (const z of p.zones) {
+      expect(z.ordinal).toBeGreaterThan(thread.ordinal)
+      expect(z.ordinal).toBeLessThan(10000)
+    }
+  })
+
+  it('maps LEFT boxes into the modified editor in unified view, like threads', () => {
+    const p = placeDrafts({ ...base, view: 'unified', drafts: [draft('LEFT', 6, 5)] })
+    expect(p.zones[0]).toMatchObject({ editor: 'modified', afterLine: 8, highlight: null, reveal: 8 })
+  })
+
+  it('lists boxes it cannot place, and waits for the diff', () => {
+    const d = draft('RIGHT', 31)
+    expect(placeDrafts({ ...base, drafts: [d] }).panel).toEqual([{ draft: d, reason: 'out-of-range' }])
+    expect(placeDrafts({ ...base, view: null, drafts: [draft('RIGHT', 3)] }).panel[0].reason).toBe('no-diff')
+    const waiting = placeDrafts({ ...base, lineChanges: null, drafts: [draft('RIGHT', 3)] })
+    expect(waiting).toEqual({ zones: [], panel: [] })
+  })
+})
+
+describe('commentableLines', () => {
+  it('takes the changed lines and 3 lines around them, per side', () => {
+    expect(commentableLines(CHANGES, 'modified', 30)).toEqual([
+      // 5-8 changed; 13 inserted; the deletion sits between 22 and 23.
+      { from: 2, to: 16 },
+      { from: 20, to: 25 },
+    ])
+    expect(commentableLines(CHANGES, 'original', 30)).toEqual([
+      // 5-6 changed; the insertion sits between 10 and 11; 20-22 deleted.
+      { from: 2, to: 13 },
+      { from: 17, to: 25 },
+    ])
+  })
+
+  it('stays within the file', () => {
+    expect(commentableLines([change(0, 0, 1, 2)], 'original', 10)).toEqual([{ from: 1, to: 3 }])
+    expect(commentableLines([change(9, 10, 9, 0)], 'original', 10)).toEqual([{ from: 6, to: 10 }])
+  })
+
+  it('has nothing on a side the file does not have', () => {
+    // An added file: everything on the right, nothing on the left.
+    const added = [change(0, 0, 1, 40)]
+    expect(commentableLines(added, 'original', 0)).toEqual([])
+    expect(commentableLines(added, 'modified', 40)).toEqual([{ from: 1, to: 40 }])
+  })
+
+  it("ends at git's last line, not the empty one after a final newline", () => {
+    // Monaco's diff of an added file of 40 lines ending in a newline: its 41 lines.
+    const added = [change(1, 1, 1, 41)]
+    expect(commentableLines(added, 'modified', gitLineCount(41, 0))).toEqual([{ from: 1, to: 40 }])
+    expect(gitLineCount(41, 0)).toBe(40)
+    expect(gitLineCount(40, 12)).toBe(40)
+    // "" and "\n": none, and one empty line.
+    expect(gitLineCount(1, 0)).toBe(0)
+    expect(gitLineCount(2, 0)).toBe(1)
+  })
+
+  it('tells whether a line is in', () => {
+    const spans = commentableLines(CHANGES, 'modified', 30)
+    expect([1, 2, 16, 17, 19, 20, 25, 26].map((l) => inSpans(spans, l))).toEqual([false, true, true, false, false, true, true, false])
   })
 })
 

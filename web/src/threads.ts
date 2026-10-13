@@ -3,7 +3,7 @@
 // RIGHT lines are lines of the head file (the modified model), LEFT lines of the merge-base
 // file (the original model). The diff itself maps original lines into the modified editor:
 // for unified view, and for unfolding (only the modified editor can unfold regions).
-import type { ChangedFile, ReviewThread } from './api'
+import type { ChangedFile, DiffSide, ReviewThread } from './api'
 
 /** The part of Monaco's `ILineChange` placement needs (pure insertions/deletions use end 0). */
 export interface LineChange {
@@ -21,6 +21,8 @@ export type EditorSide = 'original' | 'modified'
  * modified editor (unified view).
  */
 const ORDINAL_UNDER_LINE = 5000
+/** Boxes for new comments come after the threads on their line. */
+const ORDINAL_DRAFT = 9000
 
 export interface ThreadZone {
   thread: ReviewThread
@@ -108,6 +110,41 @@ function byAge(a: ReviewThread, b: ReviewThread): number {
   return a.id < b.id ? -1 : a.id > b.id ? 1 : 0
 }
 
+/** Lines on one side: a thread's, or those a new comment is about. */
+export interface LineAnchor {
+  side: DiffSide
+  line: number
+  /** First line of a range on the same side; null for one line. */
+  startLine: number | null
+}
+
+/** Where a zone for `anchor` goes in the diff as shown (see `PlaceInput`). */
+interface Spot {
+  editor: EditorSide
+  afterLine: number
+  highlight: { from: number; to: number } | null
+  reveal: number | null
+}
+
+function spotFor(anchor: LineAnchor, view: 'split' | 'unified', lineChanges: readonly LineChange[]): Spot {
+  const { line, side } = anchor
+  const highlight = anchor.startLine === null ? null : { from: anchor.startLine, to: line }
+  if (side === 'RIGHT') return { editor: 'modified', afterLine: line, highlight, reveal: line }
+  const at = origToMod(lineChanges, line)
+  if (view === 'split') return { editor: 'original', afterLine: line, highlight, reveal: at.line > 0 ? at.line : null }
+  // Unified view: the original side lives inside the modified editor. Monaco lines up the
+  // original editor (the old line numbers there) by the line each zone follows, so a card
+  // between the removed lines and the added ones would push the old numbers out of line: a
+  // removed line's card goes after the lines its change adds, or above the removed lines
+  // when it adds none.
+  const after = at.lastAdded ?? at.line
+  return { editor: 'modified', afterLine: after, highlight: null, reveal: after > 0 ? after : null }
+}
+
+function lineCount(counts: PlaceInput['lineCounts'], side: DiffSide): number {
+  return side === 'LEFT' ? counts.original : counts.modified
+}
+
 export function placeThreads(input: PlaceInput): Placement {
   const { view, lineChanges, lineCounts, headOk, oldPath } = input
   const zones: ThreadZone[] = []
@@ -121,37 +158,98 @@ export function placeThreads(input: PlaceInput): Placement {
     if (!headOk) return toPanel('head')
     if (view === null) return toPanel('no-diff')
     if (oldPath !== undefined && thread.path === oldPath && side !== 'LEFT') return toPanel('old-path')
-    const onOriginal = side === 'LEFT'
-    if (line < 1 || line > (onOriginal ? lineCounts.original : lineCounts.modified)) return toPanel('out-of-range')
+    if (line < 1 || line > lineCount(lineCounts, side)) return toPanel('out-of-range')
     if (lineChanges === null) return
-    const start = thread.startLine !== null && (thread.startSide ?? side) === side ? thread.startLine : null
-    const highlight = start === null ? null : { from: start, to: line }
-    if (!onOriginal) {
-      zones.push({ thread, editor: 'modified', afterLine: line, ordinal: ORDINAL_UNDER_LINE + i, highlight, reveal: line })
-      return
-    }
-    const at = origToMod(lineChanges, line)
-    const reveal = at.line > 0 ? at.line : null
-    if (view === 'split') {
-      zones.push({ thread, editor: 'original', afterLine: line, ordinal: ORDINAL_UNDER_LINE + i, highlight, reveal })
-      return
-    }
-    // Unified view: the original side lives inside the modified editor. Monaco lines up the
-    // original editor (the old line numbers there) by the line each zone follows, so a card
-    // between the removed lines and the added ones would push the old numbers out of line: a
-    // removed line's card goes after the lines its change adds, or above the removed lines
-    // when it adds none.
-    const after = at.lastAdded ?? at.line
-    zones.push({
-      thread,
-      editor: 'modified',
-      afterLine: after,
-      ordinal: ORDINAL_UNDER_LINE + i,
-      highlight: null,
-      reveal: after > 0 ? after : null,
-    })
+    const startLine = thread.startLine !== null && (thread.startSide ?? side) === side ? thread.startLine : null
+    zones.push({ thread, ordinal: ORDINAL_UNDER_LINE + i, ...spotFor({ side, line, startLine }, view, lineChanges) })
   })
   return { zones, panel }
+}
+
+/** An open box for a new comment on lines of the file. */
+export interface LineDraft extends LineAnchor {
+  /** Its draft key (`draftKey`). */
+  key: string
+}
+
+export interface DraftZone extends Spot {
+  draft: LineDraft
+  ordinal: number
+}
+
+/**
+ * Why a box is listed above the diff instead of under its lines (the file isn't shown as a
+ * text diff, or the lines are past its end).
+ */
+export type DraftPanelReason = 'no-diff' | 'out-of-range'
+
+export interface DraftPlacement {
+  zones: DraftZone[]
+  panel: { draft: LineDraft; reason: DraftPanelReason }[]
+}
+
+/**
+ * Boxes for new comments go under their last line, after the threads there (and before
+ * Monaco's own zones); like threads, they wait while the diff is computed.
+ */
+export function placeDrafts(input: Omit<PlaceInput, 'threads' | 'oldPath' | 'headOk'> & { drafts: readonly LineDraft[] }): DraftPlacement {
+  const { view, lineChanges, lineCounts } = input
+  const out: DraftPlacement = { zones: [], panel: [] }
+  input.drafts.forEach((draft, i) => {
+    if (view === null) return out.panel.push({ draft, reason: 'no-diff' })
+    const last = lineCount(lineCounts, draft.side)
+    if (draft.line < 1 || draft.line > last || (draft.startLine !== null && draft.startLine < 1)) {
+      return out.panel.push({ draft, reason: 'out-of-range' })
+    }
+    if (lineChanges === null) return
+    out.zones.push({ draft, ordinal: ORDINAL_DRAFT + i, ...spotFor(draft, view, lineChanges) })
+  })
+  return out
+}
+
+/** Lines of context git (and so GitHub) shows around a change. */
+const CONTEXT = 3
+
+/** Lines `from` to `to`, both included. */
+export interface LineSpan {
+  from: number
+  to: number
+}
+
+/**
+ * The lines of one side GitHub takes comments on: those of the diff's hunks, so the changed
+ * lines and 3 lines around them (S12). Worked out from Monaco's diff, which can differ from
+ * GitHub's (and ignores whitespace when asked to): GitHub has the last word. `lineCount` is
+ * 0 for a side the file doesn't have (added or deleted).
+ */
+export function commentableLines(changes: readonly LineChange[], side: EditorSide, lineCount: number): LineSpan[] {
+  const spans: LineSpan[] = []
+  for (const c of changes) {
+    const start = side === 'original' ? c.originalStartLineNumber : c.modifiedStartLineNumber
+    const end = side === 'original' ? c.originalEndLineNumber : c.modifiedEndLineNumber
+    // Nothing on this side: the change sits between `start` and the line after it.
+    const from = end === 0 ? start + 1 - CONTEXT : start - CONTEXT
+    const to = (end === 0 ? start : end) + CONTEXT
+    const span = { from: Math.max(1, from), to: Math.min(lineCount, to) }
+    if (span.from > span.to) continue
+    const prev = spans[spans.length - 1]
+    if (prev && span.from <= prev.to + 1) prev.to = Math.max(prev.to, span.to)
+    else spans.push(span)
+  }
+  return spans
+}
+
+/**
+ * Lines git (and so GitHub) counts in a text Monaco shows as `lineCount` lines, the last
+ * `lastLineLength` long: a final newline ends the last line rather than starting an empty one,
+ * and an empty text has none.
+ */
+export function gitLineCount(lineCount: number, lastLineLength: number): number {
+  return lastLineLength === 0 ? lineCount - 1 : lineCount
+}
+
+export function inSpans(spans: readonly LineSpan[], line: number): boolean {
+  return spans.some((s) => line >= s.from && line <= s.to)
 }
 
 function renamedFrom(file: ChangedFile): string | undefined {

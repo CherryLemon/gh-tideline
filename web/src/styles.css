@@ -1151,6 +1151,36 @@ kbd {
   background: #53c7f01a;
 }
 
+/* Lines being picked for a new comment, or that an open box is about. */
+.monaco-editor .tl-line-pick {
+  background: #53c7f038;
+}
+
+/* The "+" in the glyph margin that opens a box for a comment on the line (`CommentGutter`). */
+.monaco-editor .tl-add-comment {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.monaco-editor .tl-add-comment::before {
+  content: '+';
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 3px;
+  background: var(--accent);
+  color: #fff;
+  font: 600 14px/1 var(--ui-font);
+}
+
+.monaco-editor .tl-add-comment.is-active::before {
+  background: var(--syn-functions);
+}
+
 /* Comments without a line in the diff, above it. */
 .pane-threads {
   display: flex;
@@ -1214,6 +1244,12 @@ kbd {
   flex: none;
   gap: 6px;
   padding: 8px;
+}
+
+.composer-heading {
+  color: var(--fg);
+  font-size: 12px;
+  font-weight: 600;
 }
 
 .composer-input {

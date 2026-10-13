@@ -40,6 +40,8 @@ interface Card {
 const ESTIMATED_HEIGHT = 60
 /** Where a card waits off screen for its zone to report a top. */
 const PARKED_TOP = -100000
+/** Room kept between a card brought into view and the edge of the code area. */
+const REVEAL_MARGIN = 12
 
 /**
  * Events that must not reach Monaco (its keybindings listen on the editor's container, its
@@ -167,6 +169,23 @@ export class ZoneHost {
     this.restoreFocus(focus)
   }
 
+  /**
+   * Scrolls the code so the card `key` shows, or its top when it is taller than the code area.
+   * Works before Monaco has drawn the card: from its zone's place and height.
+   */
+  revealCard(key: string): void {
+    const c = this.cards.get(key)
+    const ed = c?.host
+    if (!c?.spec || !c.zone || !ed) return
+    const { afterLine, ordinal } = c.spec
+    // The zone starts under its line (0: at the top), after the cards there that come first.
+    let top = afterLine > 0 ? ed.getBottomForLineNumber(afterLine) : 0
+    for (const o of this.cards.values()) {
+      if (o !== c && o.host === ed && o.zone && o.spec?.afterLine === afterLine && o.spec.ordinal < ordinal) top += o.zone.heightInPx ?? 0
+    }
+    this.scrollToShow(ed, top, top + (c.zone.heightInPx ?? 0))
+  }
+
   dispose(): void {
     for (const c of [...this.cards.values()]) this.drop(c)
     this.observer.disconnect()
@@ -218,6 +237,13 @@ export class ZoneHost {
     outer.addEventListener('focusout', (e) => {
       if (!outer.contains(e.relatedTarget as Node | null)) setTimeout(() => this.cards.get(key) === card && this.place(card, card.top))
     })
+    // What the page would do for a field it scrolls: keep the focused field (and a growing
+    // text box) in view. Not for a button pressed with the mouse: scrolling under the pointer
+    // would move the button away before its click.
+    outer.addEventListener('focusin', (e) => {
+      if (e.target instanceof Element && e.target.matches(':focus-visible')) this.keepInView(card, e.target, 'top')
+    })
+    outer.addEventListener('input', (e) => this.keepInView(card, e.target, 'bottom'))
     this.cards.set(key, c)
     this.byOuter.set(outer, c)
     return c
@@ -320,6 +346,34 @@ export class ZoneHost {
     if (!c.host) return
     c.outer.style.left = `${c.host.getLayoutInfo().contentLeft}px`
     c.outer.style.width = `${Math.max(0, codeWidth(c.host))}px`
+  }
+
+  /**
+   * Scrolls `ed` as little as needed to show `top`..`bottom` (content offsets); when they don't
+   * fit, `wins` shows.
+   */
+  private scrollToShow(ed: CodeEditorT, top: number, bottom: number, wins: 'top' | 'bottom' = 'top'): void {
+    const info = ed.getLayoutInfo()
+    const height = info.height - info.horizontalScrollbarHeight
+    const scroll = ed.getScrollTop()
+    const showBottom = (from: number) => (bottom > from + height - REVEAL_MARGIN ? bottom - height + REVEAL_MARGIN : from)
+    const showTop = (from: number) => (top < from + REVEAL_MARGIN ? top - REVEAL_MARGIN : from)
+    const next = Math.max(0, wins === 'top' ? showTop(showBottom(scroll)) : showBottom(showTop(scroll)))
+    if (next !== scroll) ed.setScrollTop(next)
+  }
+
+  /**
+   * Brings `target`, in card `c`, into view when it is shown (not parked) and partly hidden;
+   * `wins` when it doesn't fit (the end of a text box being typed in).
+   */
+  private keepInView(c: Card, target: EventTarget | null, wins: 'top' | 'bottom'): void {
+    const ed = c.host
+    const box = ed?.getDomNode()
+    if (!ed || !box || !(target instanceof HTMLElement) || c.top <= PARKED_TOP) return
+    const view = box.getBoundingClientRect()
+    const r = target.getBoundingClientRect()
+    const scroll = ed.getScrollTop()
+    this.scrollToShow(ed, scroll + r.top - view.top, scroll + r.bottom - view.top, wins)
   }
 
   /** The wheel scrolls the code under the card, unless something in the card can scroll. */

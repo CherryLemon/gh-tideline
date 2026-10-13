@@ -32,7 +32,7 @@ import {
 } from '../tree'
 import { usePersistentState } from '../storage'
 import { ViewedSync, isTypingTarget, nextUnviewed, viewedMap } from '../viewed'
-import { fileCounts, threadsForFile, type PanelReason } from '../threads'
+import { fileCounts, threadsForFile, type DraftPanelReason, type LineAnchor, type LineDraft, type PanelReason } from '../threads'
 import { useReview, type ReviewRead } from '../useReview'
 import { draftKey, draftStoreFor, type DraftTarget } from '../drafts'
 import { postThread, threadRequest } from '../compose'
@@ -40,7 +40,7 @@ import { DiffPane, type ChangeInfo, type DiffPaneHandle, type PaneReview, type P
 import { FileTree, type ListingState, type TreeScope } from './FileTree'
 import { FileFinder } from './FileFinder'
 import { Toast, type ToastMessage } from './Toast'
-import { ThreadCard } from './ThreadCard'
+import { ThreadCard, anchorLines } from './ThreadCard'
 import { Composer } from './Composer'
 
 interface Props {
@@ -67,13 +67,13 @@ const LISTING_TIMEOUT_MS = 60_000
 const LISTING_TIMEOUT = `Listing the project files timed out after ${LISTING_TIMEOUT_MS / 1000} s`
 
 /**
- * `v`, also with Caps Lock on or a non-Latin layout (then by physical key). Not while an
- * IME composes (`Process`, keyCode 229): that `v` is input.
+ * The key for `letter` (lower case), also with Caps Lock on or a non-Latin layout (then by
+ * physical key). Not while an IME composes (`Process`, keyCode 229): that letter is input.
  */
-function isVKey(e: KeyboardEvent): boolean {
+function isLetterKey(e: KeyboardEvent, letter: string): boolean {
   if (e.isComposing || e.keyCode === 229) return false
-  if (e.key === 'v' || e.key === 'V') return true
-  return e.key.length === 1 && !/^[a-z]$/i.test(e.key) && e.code === 'KeyV'
+  if (e.key.toLowerCase() === letter) return true
+  return e.key.length === 1 && !/^[a-z]$/i.test(e.key) && e.code === `Key${letter.toUpperCase()}`
 }
 
 export function PrPage({ route, search }: Props) {
@@ -373,6 +373,63 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
   const commentOnFile = useCallback(() => fileTarget && drafts.open(fileTarget, head), [drafts, fileTarget, head])
   const pendingReview = snapshot?.pendingReview != null
   const locked = snapshot?.locked ?? false
+  /** Open boxes for comments on lines of the current file. */
+  // The same list while the same boxes are open (a key names the lines): a new one moves every
+  // card in the diff, and the drafts change with any send or any other box.
+  const lastLineDrafts = useRef<LineDraft[]>([])
+  const lineDrafts = useMemo<LineDraft[]>(() => {
+    const out: LineDraft[] = []
+    for (const [key, d] of draftViews) {
+      const t = d.target
+      if (t.kind === 'lines' && t.path === commentPath) out.push({ key, side: t.side, line: t.line, startLine: t.startLine })
+    }
+    const last = lastLineDrafts.current
+    if (out.length === last.length && out.every((d, i) => d.key === last[i].key)) return last
+    lastLineDrafts.current = out
+    return out
+  }, [draftViews, commentPath])
+  const onComment = useCallback(
+    (lines: LineAnchor) => (commentPath === null ? '' : drafts.open({ kind: 'lines', path: commentPath, ...lines }, head)),
+    [drafts, commentPath, head],
+  )
+  const renderDraft = useCallback(
+    (key: string, reason?: DraftPanelReason) => {
+      const view = draftViews.get(key)
+      if (!view || view.target.kind !== 'lines' || commentPath === null) return null
+      const lines = anchorLines(view.target)
+      // Not right under its line: a range, or an old line in unified view (after the change).
+      const away = (view.target.startLine !== null && view.target.startLine < view.target.line) || (!sideBySide && view.target.side === 'LEFT')
+      return (
+        <Composer
+          key={key}
+          drafts={drafts}
+          draftKey={key}
+          view={view}
+          pendingReview={pendingReview}
+          locked={locked}
+          label={`Comment on ${lines.toLowerCase()} of ${commentPath}`}
+          heading={
+            reason || away ? (
+              <>
+                Comment on {lines.toLowerCase()}
+                {reason === 'out-of-range' && (
+                  <>
+                    {' '}
+                    <span className="chip" title="The line is past the end of the file as shown">
+                      Not in file
+                    </span>
+                  </>
+                )}
+              </>
+            ) : undefined
+          }
+          onKeepLines={view.head !== head ? () => drafts.setHead(key, head) : undefined}
+          onSend={(mode) => sendThread(key, mode)}
+        />
+      )
+    },
+    [draftViews, drafts, commentPath, pendingReview, locked, head, sideBySide, sendThread],
+  )
   const fileComposer = useMemo(
     () =>
       fileKey && fileDraft && commentPath !== null ? (
@@ -398,6 +455,9 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
       headOk,
       renderThread,
       composer: fileComposer,
+      drafts: lineDrafts,
+      renderDraft,
+      onComment: commentPath === null ? undefined : onComment,
       notice: stale ? (
         <div className="pane-threads-notice">
           <span>These comments are from another version of the pull request, so they're listed here.</span>
@@ -407,7 +467,7 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
         </div>
       ) : undefined,
     }
-  }, [fileThreads, headOk, settling, renderThread, fileComposer, onRefresh])
+  }, [fileThreads, headOk, settling, renderThread, fileComposer, lineDrafts, renderDraft, commentPath, onComment, onRefresh])
 
   // Without a valid ?file=, show the first file (replace, so Back leaves the PR).
   useEffect(() => {
@@ -479,16 +539,37 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
     if (next !== null) openFile(order[next].path)
   }
 
+  /** `c`: a box for a comment on the lines at the caret or the selection. */
+  const commentHere = () => {
+    if (!changedCurrent) return showToast('Comments go on files the pull request changes')
+    if (!snapshot) return showToast("The review comments haven't loaded yet")
+    if (commentPath === null) return showToast("GitHub's file list doesn't have this path, so it takes no comments")
+    switch (pane.current?.commentAtCursor() ?? 'no-diff') {
+      case 'no-diff':
+        return showToast('Only the lines of a text diff take comments: "Comment on file" takes one on the whole file')
+      case 'diff-stopped':
+        return showToast('Computing this diff took too long, so its changed lines aren\'t known: "Comment on file" takes one on the whole file')
+      case 'empty-side':
+        return showToast('This side of the file has no lines: comment on the other side')
+      case 'deleted':
+        return showToast("This file's old lines can be picked in split view", { label: 'Split', run: () => setSideBySide(true) })
+      case 'not-commentable':
+        return showToast('GitHub takes comments only on changed lines and the 3 lines around them')
+      case 'no-comments':
+        return showToast("This file doesn't take comments on lines")
+    }
+  }
+
   // Keep the latest navigation state for the window-level key handler.
-  const nav = useRef({ neighbor, openFile, finderOpen, toggleCurrentViewed })
+  const nav = useRef({ neighbor, openFile, finderOpen, toggleCurrentViewed, commentHere })
   useLayoutEffect(() => {
-    nav.current = { neighbor, openFile, finderOpen, toggleCurrentViewed }
+    nav.current = { neighbor, openFile, finderOpen, toggleCurrentViewed, commentHere }
   })
 
   useEffect(() => {
     let lastShift = 0
     const onKeyDown = (e: KeyboardEvent) => {
-      const { neighbor, openFile, finderOpen, toggleCurrentViewed } = nav.current
+      const { neighbor, openFile, finderOpen, toggleCurrentViewed, commentHere } = nav.current
       // In a comment box (or any text field) keys are text, but Ctrl+P (the box keeps its draft).
       const typing = isTypingTarget(e.target)
       if (e.key === 'Shift') {
@@ -538,9 +619,14 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
         if (target) openFile(target.path)
         return
       }
-      if (plain && !e.shiftKey && isVKey(e) && !e.repeat && !e.isComposing) {
+      if (plain && !e.shiftKey && isLetterKey(e, 'v') && !e.repeat) {
         consume()
         toggleCurrentViewed()
+        return
+      }
+      if (plain && !e.shiftKey && isLetterKey(e, 'c') && !e.repeat) {
+        consume()
+        commentHere()
       }
     }
     window.addEventListener('keydown', onKeyDown, true)
@@ -680,6 +766,7 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
         <span className="hint"><kbd>Alt+↓</kbd>/<kbd>Alt+↑</kbd> next/previous file</span>
         <span className="hint"><kbd>Shift Shift</kbd>/<kbd>Ctrl+P</kbd> find file</span>
         <span className="hint"><kbd>v</kbd> viewed</span>
+        <span className="hint"><kbd>c</kbd> comment</span>
       </footer>
 
       {finderOpen && (
