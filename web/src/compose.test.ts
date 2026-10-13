@@ -10,8 +10,22 @@ import {
   type ReviewComment,
   type ReviewThread,
   type ReviewThreads,
+  type SubmitRequest,
+  type SubmittedReview,
 } from './api'
-import { postDelete, postReply, postThread, threadRequest, type DeleteDeps, type PostDeps, type ReplyDeps } from './compose'
+import {
+  postDelete,
+  postDiscard,
+  postReply,
+  postSubmit,
+  postThread,
+  threadRequest,
+  type DeleteDeps,
+  type DiscardDeps,
+  type PostDeps,
+  type ReplyDeps,
+  type SubmitDeps,
+} from './compose'
 import { ReviewStore } from './review'
 import { mkThread } from './test-fixtures'
 
@@ -26,7 +40,7 @@ function mine(body: string, over: Partial<ReviewThread> = {}): ReviewThread {
 
 function setup(create: (req: NewThreadRequest) => Promise<CreatedThread>, reads: (() => Promise<ReviewThreads>)[] = []) {
   const old = mine('Nit: rename')
-  const store = new ReviewStore({ head: HEAD, locked: false, pendingReview: null, threads: [old] }, () => new Promise(() => {}), () => {})
+  const store = new ReviewStore({ head: HEAD, locked: false, latestReview: null, pendingReview: null, threads: [old] }, () => new Promise(() => {}), () => {})
   let rereads = 0
   const settles: number[] = []
   const deps: PostDeps = {
@@ -72,7 +86,7 @@ describe('postThread', () => {
     const landed = mine('Nit: rename ')
     const { store, deps, old } = setup(
       () => Promise.reject(new ApiError(502, 'github_error', 'timed out')),
-      [async () => ({ head: HEAD, locked: false, pendingReview: REVIEW, threads: [old, landed] })],
+      [async () => ({ head: HEAD, locked: false, latestReview: null, pendingReview: REVIEW, threads: [old, landed] })],
     )
     expect(await postThread(deps, REQ)).toEqual({})
     expect(store.getSnapshot().threads.map((t) => t.id)).toEqual([old.id, landed.id])
@@ -83,15 +97,15 @@ describe('postThread', () => {
     // Not there (the same text from before doesn't count), twice.
     const reads: (() => Promise<ReviewThreads>)[] = []
     const { deps, settles, old } = setup(() => Promise.reject(new ApiError(0, 'network', 'Failed to fetch')), reads)
-    const empty = async () => ({ head: HEAD, locked: false, pendingReview: null, threads: [old] })
+    const empty = async () => ({ head: HEAD, locked: false, latestReview: null, pendingReview: null, threads: [old] })
     reads.push(empty, empty)
     await expect(postThread(deps, REQ)).rejects.toThrow(/wasn't found on GitHub, so it most likely wasn't posted: you can send it again/)
     expect(settles).toEqual([0, 1])
     // There on the second look.
     const late = mine('Nit: rename')
     const second = setup(() => Promise.reject(new ApiError(502, 'github_error', 'timed out')), [
-      async () => ({ head: HEAD, locked: false, pendingReview: null, threads: [] }),
-      async () => ({ head: HEAD, locked: false, pendingReview: REVIEW, threads: [late] }),
+      async () => ({ head: HEAD, locked: false, latestReview: null, pendingReview: null, threads: [] }),
+      async () => ({ head: HEAD, locked: false, latestReview: null, pendingReview: REVIEW, threads: [late] }),
     ])
     expect(await postThread(second.deps, REQ)).toEqual({})
     expect(second.store.getSnapshot().threads.map((t) => t.id)).toEqual([late.id])
@@ -107,7 +121,7 @@ describe('postThread', () => {
     const stuck = mine('Nit: rename')
     const { deps, old } = setup(
       () => Promise.reject(new ApiError(502, 'github_error', 'timed out')),
-      [async () => ({ head: HEAD, locked: false, pendingReview: REVIEW, threads: [old, stuck] })],
+      [async () => ({ head: HEAD, locked: false, latestReview: null, pendingReview: REVIEW, threads: [old, stuck] })],
     )
     const posted = await postThread(deps, { ...REQ, mode: 'single' })
     expect(posted.submitError).toMatch(/timed out/)
@@ -118,8 +132,8 @@ describe('postThread', () => {
     const elsewhere = mine('Nit: rename', { subjectType: 'LINE', side: 'RIGHT', line: 8 })
     const there = mine('Nit: rename', { subjectType: 'LINE', side: 'RIGHT', line: 7 })
     const { deps, old } = setup(() => Promise.reject(new ApiError(502, 'github_error', 'timed out')), [
-      async () => ({ head: HEAD, locked: false, pendingReview: REVIEW, threads: [old, elsewhere] }),
-      async () => ({ head: HEAD, locked: false, pendingReview: REVIEW, threads: [old, elsewhere, there] }),
+      async () => ({ head: HEAD, locked: false, latestReview: null, pendingReview: REVIEW, threads: [old, elsewhere] }),
+      async () => ({ head: HEAD, locked: false, latestReview: null, pendingReview: REVIEW, threads: [old, elsewhere, there] }),
     ])
     expect(await postThread(deps, req)).toEqual({})
   })
@@ -134,7 +148,7 @@ describe('postReply', () => {
 
   function setupReply(reply: ReplyDeps['reply'], reads: (() => Promise<ReviewThreads>)[] = [], pendingReview: PendingReview | null = null) {
     const thread = mkThread()
-    const store = new ReviewStore({ head: HEAD, locked: false, pendingReview, threads: [thread] }, () => new Promise(() => {}), () => {})
+    const store = new ReviewStore({ head: HEAD, locked: false, latestReview: null, pendingReview, threads: [thread] }, () => new Promise(() => {}), () => {})
     let rereads = 0
     const deps: ReplyDeps = {
       store,
@@ -196,7 +210,7 @@ describe('postReply', () => {
     const landed = { ...thread, comments: [...thread.comments, replyTo(thread, 'Agreed ')] }
     const { store, deps } = setupReply(
       () => Promise.reject(new ApiError(0, 'network', 'Failed to fetch')),
-      [async () => ({ head: HEAD, locked: false, pendingReview: REVIEW, threads: [landed] })],
+      [async () => ({ head: HEAD, locked: false, latestReview: null, pendingReview: REVIEW, threads: [landed] })],
     )
     // The store's thread is another one than `landed`: only the read's counts.
     await postReply(deps, landed.id, ASK)
@@ -206,8 +220,8 @@ describe('postReply', () => {
     const other = mkThread()
     const elsewhere = { ...other, comments: [...other.comments, replyTo(other, 'Agreed')] }
     const missed = setupReply(() => Promise.reject(new ApiError(502, 'github_error', 'timed out')), [
-      async () => ({ head: HEAD, locked: false, pendingReview: null, threads: [elsewhere] }),
-      async () => ({ head: HEAD, locked: false, pendingReview: null, threads: [elsewhere] }),
+      async () => ({ head: HEAD, locked: false, latestReview: null, pendingReview: null, threads: [elsewhere] }),
+      async () => ({ head: HEAD, locked: false, latestReview: null, pendingReview: null, threads: [elsewhere] }),
     ])
     await expect(postReply(missed.deps, missed.thread.id, ASK)).rejects.toThrow(/wasn't found on GitHub/)
   })
@@ -225,7 +239,8 @@ describe('postDelete', () => {
     const thread = mkThread()
     const reply = { ...thread.comments[0], id: `${thread.id}-2`, viewerDidAuthor: true, state: 'PENDING' as const }
     const two = { ...thread, comments: [thread.comments[0], reply] }
-    const store = new ReviewStore({ head: HEAD, locked: false, pendingReview: REVIEW, threads: [two] }, () => new Promise(() => {}), () => {})
+    const initial: ReviewThreads = { head: HEAD, locked: false, latestReview: null, pendingReview: REVIEW, threads: [two] }
+    const store = new ReviewStore(initial, () => new Promise(() => {}), () => {})
     const settles: number[] = []
     const gone: [boolean, number][] = []
     const deps: DeleteDeps = {
@@ -261,7 +276,7 @@ describe('postDelete', () => {
   })
 
   it('reads whether a delete whose answer was lost landed', async () => {
-    const read = (threads: ReviewThread[]) => async () => ({ head: HEAD, locked: false, pendingReview: null, threads })
+    const read = (threads: ReviewThread[]) => async () => ({ head: HEAD, locked: false, latestReview: null, pendingReview: null, threads })
     const lost = new ApiError(502, 'github_error', 'the comment was deleted, but reading its thread back failed: timed out')
     const gone = setupDelete(() => Promise.reject(lost), [read([])])
     expect(await postDelete(gone.deps, gone.thread.id, gone.reply.id)).toEqual({ threadGone: true })
@@ -302,6 +317,162 @@ describe('postDelete', () => {
     const { deps, thread, reply, settles } = setupDelete(() => Promise.reject(refused))
     await expect(postDelete(deps, thread.id, reply.id)).rejects.toBe(refused)
     expect(settles).toEqual([])
+  })
+})
+
+/** A store with one thread of a submitted and a pending comment, and the pending review. */
+function reviewSetup(latestReview: SubmittedReview | null = null) {
+  const thread = mkThread()
+  const pending = { ...thread.comments[0], id: `${thread.id}-2`, viewerDidAuthor: true, state: 'PENDING' as const, reviewId: REVIEW.id }
+  const two = { ...thread, comments: [thread.comments[0], pending] }
+  const store = new ReviewStore({ head: HEAD, locked: false, latestReview, pendingReview: REVIEW, threads: [two] }, () => new Promise(() => {}), () => {})
+  const reads: (() => Promise<ReviewThreads>)[] = []
+  const settles: number[] = []
+  let rereads = 0
+  const read: SubmitDeps['read'] = () => {
+    const next = reads.shift()
+    if (!next) throw new Error('unexpected read')
+    return next()
+  }
+  const settle = (attempt: number) => {
+    settles.push(attempt)
+    return Promise.resolve()
+  }
+  const answer = (over: Partial<ReviewThreads>) => async (): Promise<ReviewThreads> => ({
+    head: HEAD,
+    locked: false,
+    latestReview,
+    pendingReview: REVIEW,
+    threads: [two],
+    ...over,
+  })
+  return { store, thread, two, reads, settles, read, settle, answer, rereads: () => rereads, reread: () => rereads++ }
+}
+
+describe('postSubmit', () => {
+  const SUBMITTED: SubmittedReview = { id: REVIEW.id, state: 'APPROVED', url: 'u', body: 'LGTM' }
+  const WITH_REVIEW: SubmitRequest = { head: HEAD, reviewId: REVIEW.id, event: 'APPROVE', body: 'LGTM' }
+  const SUMMARY_ONLY: SubmitRequest = { head: HEAD, reviewId: null, event: 'REQUEST_CHANGES', body: 'Please split this\r\n' }
+  const lost = new ApiError(502, 'github_error', 'GraphQL request to github.com failed: operation timed out')
+
+  function setupSubmit(submit: SubmitDeps['submit'], latest: SubmittedReview | null = null) {
+    const r = reviewSetup(latest)
+    const deps: SubmitDeps = { store: r.store, submit, read: r.read, reread: r.reread, settle: r.settle }
+    return { ...r, deps }
+  }
+
+  it('takes the submitted review and reads the rest again', async () => {
+    const { store, deps, rereads } = setupSubmit(async () => SUBMITTED)
+    expect(await postSubmit(deps, WITH_REVIEW)).toEqual(SUBMITTED)
+    const s = store.getSnapshot()
+    expect([s.pendingReview, s.pendingCount, s.latestReview]).toEqual([null, 0, SUBMITTED])
+    expect(rereads()).toBe(1)
+  })
+
+  it('passes refusals on without reading', async () => {
+    const refused = new ApiError(422, 'rejected', 'Can not approve your own pull request')
+    const { store, deps, settles } = setupSubmit(() => Promise.reject(refused))
+    await expect(postSubmit(deps, WITH_REVIEW)).rejects.toBe(refused)
+    expect(settles).toEqual([])
+    expect(store.getSnapshot().pendingCount).toBe(1)
+  })
+
+  it('finds a pending review submitted although the answer was lost, by its id', async () => {
+    const { store, deps, reads, answer, settles } = setupSubmit(() => Promise.reject(lost))
+    // Not yet on the first look; on the second, whatever its state.
+    reads.push(answer({}), answer({ pendingReview: null, latestReview: { ...SUBMITTED, state: 'COMMENTED', body: '' } }))
+    expect((await postSubmit(deps, WITH_REVIEW))?.id).toBe(REVIEW.id)
+    expect(settles).toEqual([0, 1])
+    expect(store.getSnapshot().pendingCount).toBe(0)
+  })
+
+  it('finds a summary submitted on its own by its state and text, not by a new id alone', async () => {
+    const before: SubmittedReview = { id: 'R0', state: 'CHANGES_REQUESTED', url: 'u0', body: 'Please split this' }
+    // A single comment posted meanwhile made a review too.
+    const single: SubmittedReview = { id: 'R1', state: 'COMMENTED', url: 'u1', body: '' }
+    const mine: SubmittedReview = { id: 'R2', state: 'CHANGES_REQUESTED', url: 'u2', body: 'Please split this' }
+    const found = setupSubmit(() => Promise.reject(lost), before)
+    found.reads.push(found.answer({ latestReview: before }), found.answer({ latestReview: mine }))
+    expect(await postSubmit(found.deps, SUMMARY_ONLY)).toEqual(mine)
+    expect(found.store.getSnapshot().latestReview).toEqual(mine)
+    const not = setupSubmit(() => Promise.reject(lost), before)
+    not.reads.push(not.answer({ latestReview: single }), not.answer({ latestReview: single }))
+    await expect(postSubmit(not.deps, SUMMARY_ONLY)).rejects.toThrow(/wasn't found on GitHub, so it most likely wasn't submitted/)
+    expect(not.store.getSnapshot().pendingCount).toBe(1)
+    const unknown = setupSubmit(() => Promise.reject(lost))
+    unknown.reads.push(() => Promise.reject(new ApiError(0, 'network', 'Failed to fetch')))
+    await expect(postSubmit(unknown.deps, WITH_REVIEW)).rejects.toThrow(/may have been submitted all the same/)
+  })
+
+  it('finds a pending review submitted by its comments, when it is not the latest review', async () => {
+    const { store, deps, reads, answer, two, rereads } = setupSubmit(() => Promise.reject(lost))
+    const later: SubmittedReview = { id: 'R9', state: 'COMMENTED', url: 'u9', body: '' }
+    const submitted = { ...two, comments: two.comments.map((c) => ({ ...c, state: 'SUBMITTED' as const })) }
+    reads.push(answer({ pendingReview: null, latestReview: later, threads: [submitted] }))
+    expect(await postSubmit(deps, WITH_REVIEW)).toBeNull()
+    expect([store.getSnapshot().pendingCount, store.getSnapshot().pendingReview, rereads()]).toEqual([0, null, 1])
+  })
+
+  it('says a pending review gone but not found submitted is no longer pending', async () => {
+    const { store, deps, reads, answer, thread } = setupSubmit(() => Promise.reject(lost))
+    reads.push(answer({ pendingReview: null, threads: [thread] }), answer({ pendingReview: null, threads: [thread] }))
+    await expect(postSubmit(deps, WITH_REVIEW)).rejects.toThrow(/no longer pending on GitHub: refresh to see whether it was submitted/)
+    expect(store.getSnapshot().pendingReview).toBeNull()
+  })
+})
+
+describe('postDiscard', () => {
+  const lost = new ApiError(502, 'github_error', 'GraphQL request to github.com failed: operation timed out')
+
+  function setupDiscard(discard: DiscardDeps['discard']) {
+    const r = reviewSetup()
+    const gone: [string[], number][] = []
+    const deps: DiscardDeps = {
+      store: r.store,
+      discard,
+      // With how many comments the store had then: before it drops them.
+      gone: (what) => gone.push([what.commentIds, r.store.getSnapshot().threads[0]?.comments.length ?? 0]),
+      read: r.read,
+      reread: r.reread,
+      settle: r.settle,
+    }
+    return { ...r, deps, gone }
+  }
+
+  it('drops the pending comments once GitHub has discarded them, and reads the rest again', async () => {
+    const { store, deps, gone, two, rereads } = setupDiscard(async () => {})
+    await postDiscard(deps, REVIEW.id)
+    expect(gone).toEqual([[[two.comments[1].id], 2]])
+    const s = store.getSnapshot()
+    expect([s.pendingReview, s.pendingCount, s.threads[0].comments.length, rereads()]).toEqual([null, 0, 1, 1])
+  })
+
+  it('keeps a pending review started after the discard, whose answer came first', async () => {
+    const { store, deps } = setupDiscard(async () => {})
+    const next: PendingReview = { ...REVIEW, id: 'R2' }
+    const t = mkThread()
+    store.applyThread(t.id, { ...t, comments: [{ ...t.comments[0], state: 'PENDING', reviewId: next.id }] })
+    store.applyPendingReview(next)
+    await postDiscard(deps, REVIEW.id)
+    const s = store.getSnapshot()
+    expect([s.pendingReview, s.pendingCount, s.threads.map((th) => th.id)]).toEqual([next, 1, [s.threads[0].id, t.id]])
+  })
+
+  it('reads whether a discard whose answer was lost landed', async () => {
+    const done = setupDiscard(() => Promise.reject(lost))
+    done.reads.push(done.answer({}), done.answer({ pendingReview: null, threads: [done.thread] }))
+    await postDiscard(done.deps, REVIEW.id)
+    expect(done.settles).toEqual([0, 1])
+    expect(done.gone).toEqual([[[done.two.comments[1].id], 2]])
+    expect([done.store.getSnapshot().pendingCount, done.rereads()]).toEqual([0, 0])
+    const kept = setupDiscard(() => Promise.reject(lost))
+    kept.reads.push(kept.answer({}), kept.answer({}))
+    await expect(postDiscard(kept.deps, REVIEW.id)).rejects.toThrow(/timed out\. It's still on GitHub: you can discard it again/)
+    expect(kept.gone).toEqual([])
+    expect(kept.store.getSnapshot().pendingCount).toBe(1)
+    const refused = setupDiscard(() => Promise.reject(new ApiError(409, 'review_changed', 'not the one shown')))
+    await expect(postDiscard(refused.deps, REVIEW.id)).rejects.toThrow(/changed on GitHub/)
+    expect(refused.settles).toEqual([])
   })
 })
 

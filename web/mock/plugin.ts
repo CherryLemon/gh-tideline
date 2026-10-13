@@ -47,13 +47,21 @@ export function mockApi(): Plugin {
         if (!url.pathname.startsWith('/api/')) return next()
 
         if (url.pathname === '/api/health') return json(res, 200, { app: 'tideline', version: '0.1.0-mock' })
-        // Test hook: the review state back to its fixtures (`{"pending": false}`: no pending review).
+        // Test hook: the review state (and the head) back to the fixtures (`{"pending": false}`: no
+        // pending review; `{"staleReview": true}`: the pending review on a commit before the head).
         if (url.pathname === '/api/__mock/reset' && req.method === 'POST') {
           void readJson(req).then((body) => {
-            review.resetReview({ pending: (body as { pending?: unknown } | null)?.pending !== false })
+            const o = body as { pending?: unknown; staleReview?: unknown } | null
+            data.setHead(null)
+            review.resetReview({ pending: o?.pending !== false, staleReview: o?.staleReview === true })
             json(res, 200, { ok: true })
           })
           return
+        }
+        // Test hook: new commits (the same files) on the pull request.
+        if (url.pathname === '/api/__mock/push' && req.method === 'POST') {
+          data.setHead('e'.repeat(40))
+          return json(res, 200, { ok: true })
         }
         if (url.pathname === '/api/__mock/fail-next' && req.method === 'POST') {
           void readJson(req).then((body) => {
@@ -123,6 +131,12 @@ export function mockApi(): Plugin {
                 r = review.deleteComment(pr.head.sha, threadId, commentId)
               }
               if (r) return json(res, r.status, r.body)
+            }
+            if (sub === 'review' && parts.length === 6 && req.method === 'POST') {
+              const body = await readJson(req)
+              await delay(600)
+              const r = review.submitReview(pr.head.sha, pr.author === pr.viewer, body)
+              return json(res, r.status, r.body)
             }
             if (sub === 'review' && parts.length === 6 && req.method === 'DELETE') {
               const body = await readJson(req)

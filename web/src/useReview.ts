@@ -3,11 +3,11 @@
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import type { ReviewThreads } from './api'
 import { ApiError, errorMessage, mayHaveLanded } from './api'
-import { ReviewStore, type ReviewSnapshot, type SendResolved } from './review'
+import { ReviewStore, stamp, type ReviewSnapshot, type SendResolved } from './review'
 
 export interface ReviewRead {
   promise: Promise<ReviewThreads>
-  /** `performance.now()` when it was sent. */
+  /** `stamp()` when it was sent. */
   requestedAt: number
 }
 
@@ -82,7 +82,7 @@ export function useReview(
                 // GitHub may have made the change before the answer was lost, or the thread is
                 // gone: show what it has.
                 if (mayHaveLanded(e) || (e instanceof ApiError && e.code === 'not_found')) {
-                  take({ promise: callbacks.current.read(), requestedAt: performance.now() }, true)
+                  take({ promise: callbacks.current.read(), requestedAt: stamp() }, true)
                 }
               },
             )
@@ -106,7 +106,7 @@ export function useReview(
   }, [latest, take])
 
   const retry = useCallback(() => {
-    if (live.current) take({ promise: callbacks.current.read(), requestedAt: performance.now() })
+    if (live.current) take({ promise: callbacks.current.read(), requestedAt: stamp() })
   }, [take])
 
   const snapshot = useSyncExternalStore(store?.subscribe ?? noSubscribe, store?.getSnapshot ?? noSnapshot)

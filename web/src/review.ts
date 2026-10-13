@@ -1,6 +1,6 @@
 // Review threads as the page shows them: the last read from GitHub, plus what our own writes
 // returned since, plus optimistic resolve/unresolve. Read with `useSyncExternalStore`.
-import type { DiffSide, PendingReview, ReviewComment, ReviewThread, ReviewThreads } from './api'
+import type { DiffSide, PendingReview, ReviewComment, ReviewThread, ReviewThreads, SubmittedReview } from './api'
 
 export type SendResolved = (threadId: string, resolved: boolean) => Promise<ReviewThread>
 
@@ -9,6 +9,7 @@ export interface ReviewSnapshot {
   head: string
   locked: boolean
   pendingReview: PendingReview | null
+  latestReview: SubmittedReview | null
   /** Resolve intents applied. */
   threads: readonly ReviewThread[]
   /** Comments in the viewer's pending review. */
@@ -17,8 +18,24 @@ export interface ReviewSnapshot {
   busy: ReadonlySet<string>
 }
 
-/** Pending review ids are kept apart from thread ids in `settled`. */
+/** The pending and the latest review are kept apart from thread ids in `settled`. */
 const PENDING_KEY = ' pending'
+const LATEST_KEY = ' latest'
+
+let lastStamp = -Infinity
+
+/**
+ * When a read was sent or a write settled, for `ReviewStore.rebase`: `performance.now()`, but
+ * strictly increasing. Browsers coarsen it (to 100 µs, or 1 ms), and a read sent right after a
+ * write settled must still count as the newer one.
+ */
+export function stamp(): number {
+  lastStamp = Math.max(performance.now(), lastStamp + 1e-3)
+  return lastStamp
+}
+
+/** A comment of the viewer's pending review `reviewId`. */
+const inReview = (c: ReviewComment, reviewId: string) => c.state === 'PENDING' && c.reviewId === reviewId
 
 /**
  * One instance lives as long as the page; reads of every head go through `rebase`. Writes
@@ -31,7 +48,7 @@ export class ReviewStore {
   private data: ReviewThreads
   private readonly intent = new Map<string, boolean>()
   private readonly inflight = new Set<string>()
-  /** When a write last settled for a thread id (or the pending review), `performance.now()`. */
+  /** When a write last settled for a thread id (or the pending review), `stamp()`. */
   private readonly settled = new Map<string, number>()
   private rebasedAt = -Infinity
   private readonly listeners = new Set<() => void>()
@@ -66,6 +83,7 @@ export class ReviewStore {
         head: this.data.head,
         locked: this.data.locked,
         pendingReview: this.data.pendingReview,
+        latestReview: this.data.latestReview,
         threads,
         pendingCount,
         busy: new Set([...this.inflight, ...this.intent.keys()]),
@@ -75,7 +93,7 @@ export class ReviewStore {
   }
 
   /**
-   * Takes a full read requested at `requestedAt` (`performance.now()`). Threads (and the
+   * Takes a full read requested at `requestedAt` (`stamp()`). Threads (and the
    * pending review) that a write changed after the read was sent keep their local version:
    * the read may predate the write. Resolve intents stay on top of the read's version (its
    * lines may be for a new head). A read requested before one already taken is ignored.
@@ -100,6 +118,7 @@ export class ReviewStore {
       head: next.head,
       locked: next.locked,
       pendingReview: newer(PENDING_KEY) ? this.data.pendingReview : next.pendingReview,
+      latestReview: newer(LATEST_KEY) ? this.data.latestReview : next.latestReview,
       threads,
     }
     this.changed()
@@ -108,7 +127,7 @@ export class ReviewStore {
   /** A thread as a write returned it (created, or changed); null removes it (deleted). */
   applyThread(id: string, thread: ReviewThread | null): void {
     if (this.disposed) return
-    this.settled.set(id, performance.now())
+    this.settled.set(id, stamp())
     const threads = this.data.threads.filter((t) => t.id !== id)
     const at = this.data.threads.findIndex((t) => t.id === id)
     if (thread) threads.splice(at < 0 ? threads.length : at, 0, thread)
@@ -145,8 +164,52 @@ export class ReviewStore {
   /** The viewer's pending review after a write (null: none any more). */
   applyPendingReview(review: PendingReview | null): void {
     if (this.disposed) return
-    this.settled.set(PENDING_KEY, performance.now())
+    this.settled.set(PENDING_KEY, stamp())
     this.data = { ...this.data, pendingReview: review }
+    this.changed()
+  }
+
+  /**
+   * A review submitted: the comments of the viewer's pending review `reviewId` (null: a review
+   * of just a summary) are no longer pending (the next read brings the rest), and `review` is
+   * the latest one (null: GitHub didn't send it back).
+   */
+  applySubmitted(review: SubmittedReview | null, reviewId: string | null): void {
+    if (this.disposed) return
+    const now = stamp()
+    let { threads, pendingReview } = this.data
+    if (reviewId !== null) {
+      threads = threads.map((t) => {
+        if (!t.comments.some((c) => inReview(c, reviewId))) return t
+        this.settled.set(t.id, now)
+        return { ...t, comments: t.comments.map((c): ReviewComment => (inReview(c, reviewId) ? { ...c, state: 'SUBMITTED' } : c)) }
+      })
+      // Not another pending review a read brought meanwhile.
+      if (pendingReview?.id === reviewId) pendingReview = null
+      this.settled.set(PENDING_KEY, now)
+    }
+    if (review) this.settled.set(LATEST_KEY, now)
+    this.data = { ...this.data, threads, pendingReview, latestReview: review ?? this.data.latestReview }
+    this.changed()
+  }
+
+  /** The viewer's pending review `reviewId` discarded: its comments go, and the threads left without any. */
+  applyDiscard(reviewId: string): void {
+    if (this.disposed) return
+    const now = stamp()
+    const { threadIds } = discarded(this.data.threads, reviewId)
+    const threads: ReviewThread[] = []
+    for (const t of this.data.threads) {
+      if (!t.comments.some((c) => inReview(c, reviewId))) {
+        threads.push(t)
+        continue
+      }
+      this.settled.set(t.id, now)
+      if (!threadIds.includes(t.id)) threads.push({ ...t, comments: t.comments.filter((c) => !inReview(c, reviewId)) })
+    }
+    this.settled.set(PENDING_KEY, now)
+    const pendingReview = this.data.pendingReview?.id === reviewId ? null : this.data.pendingReview
+    this.data = { ...this.data, threads, pendingReview }
     this.changed()
   }
 
@@ -183,7 +246,7 @@ export class ReviewStore {
     this.sendResolved(id, want).then(
       (thread) => {
         this.inflight.delete(id)
-        this.settled.set(id, performance.now())
+        this.settled.set(id, stamp())
         // Unless a refresh dropped the thread meanwhile.
         if (this.data.threads.some((t) => t.id === id)) {
           this.data = { ...this.data, threads: this.data.threads.map((t) => (t.id === id ? thread : t)) }
@@ -202,6 +265,18 @@ export class ReviewStore {
       },
     )
   }
+}
+
+/** What discarding the viewer's pending review `reviewId` takes: its comments, and the threads left without any. */
+export function discarded(threads: readonly ReviewThread[], reviewId: string): { commentIds: string[]; threadIds: string[] } {
+  const commentIds: string[] = []
+  const threadIds: string[] = []
+  for (const t of threads) {
+    const pending = t.comments.filter((c) => inReview(c, reviewId))
+    commentIds.push(...pending.map((c) => c.id))
+    if (pending.length > 0 && pending.length === t.comments.length) threadIds.push(t.id)
+  }
+  return { commentIds, threadIds }
 }
 
 /** Ids of the viewer's own comments, taken before a create so its result can be told apart. */

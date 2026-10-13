@@ -900,6 +900,98 @@ kbd {
   padding: 8px 12px;
 }
 
+/* Dialogs --------------------------------------------------------------------------- */
+
+.dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding-top: 12vh;
+  background: #8884771a;
+}
+
+.dialog {
+  display: flex;
+  flex-direction: column;
+  width: min(640px, calc(100vw - 32px));
+  max-height: 76vh;
+  border: 1px solid var(--selection-bg);
+  border-radius: 6px;
+  background: var(--bg);
+  box-shadow: 0 8px 28px #8a6d4033;
+  overflow: hidden;
+}
+
+.dialog:focus {
+  outline: none;
+}
+
+.dialog-title {
+  padding: 6px 10px;
+  background: var(--second-bg);
+  border-bottom: 1px solid var(--line);
+  color: var(--fg);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.dialog-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+  padding: 10px;
+  overflow: auto;
+}
+
+.dialog-actions {
+  padding: 8px 10px;
+  border-top: 1px solid var(--line);
+}
+
+.review-dialog .composer-input {
+  flex: none;
+  min-height: 120px;
+}
+
+.review-events {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.review-event {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  cursor: pointer;
+}
+
+.review-event.is-disabled {
+  cursor: default;
+}
+
+.review-event-label {
+  flex: none;
+  min-width: 110px;
+  font-weight: 600;
+}
+
+.review-event.is-disabled .review-event-label {
+  color: var(--disabled);
+}
+
+.review-event .muted {
+  font-size: 12px;
+}
+
 /* Home + page messages ----------------------------------------------------------------- */
 
 .home,

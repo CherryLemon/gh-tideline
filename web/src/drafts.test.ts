@@ -110,6 +110,10 @@ describe('DraftStore', () => {
     expect(await sending).toBe(false)
     expect(store.getSnapshot().get(key)).toMatchObject({ sending: false, error: 'GitHub refused the change' })
     expect(store.text(key)).toBe('Nit')
+    // What the error said no longer holds: the box stays, without it.
+    store.clearError(key)
+    expect(store.getSnapshot().get(key)).toMatchObject({ sending: false, error: null })
+    expect(store.text(key)).toBe('Nit')
 
     expect(await store.send(key, async () => {})).toBe(true)
     expect(sent).toEqual(['Nit'])

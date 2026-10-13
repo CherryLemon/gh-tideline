@@ -4,6 +4,7 @@ import {
   STALE_HEAD_MESSAGE,
   createThread,
   deleteComment,
+  discardReview,
   editComment,
   getPr,
   getPrFiles,
@@ -13,13 +14,16 @@ import {
   replyToThread,
   setThreadResolved,
   setViewed,
+  submitReview,
   type ChangedFile,
   type CommentMode,
   type PrSummary,
   type RepoRef,
   type ReplyRequest,
   type ReviewComment,
+  type ReviewEvent,
   type ReviewThread,
+  type SubmittedReview,
   type TreeEntry,
   type ViewedState,
 } from '../api'
@@ -40,14 +44,15 @@ import { ViewedSync, isTypingTarget, nextUnviewed, viewedMap } from '../viewed'
 import { fileCounts, threadsForFile, type DraftPanelReason, type LineAnchor, type LineDraft, type PanelReason } from '../threads'
 import { useReview, type ReviewRead } from '../useReview'
 import { boxText, draftKey, draftStoreFor, editKey, lostDrafts, replyKey, type DraftTarget, type DraftView } from '../drafts'
-import { postDelete, postReply, postThread, threadRequest, type ReadDeps } from '../compose'
-import type { ReviewStore } from '../review'
+import { postDelete, postDiscard, postReply, postSubmit, postThread, threadRequest, type ReadDeps } from '../compose'
+import { stamp, type ReviewStore } from '../review'
 import { DiffPane, type ChangeInfo, type DiffPaneHandle, type PaneReview, type PendingJump } from './DiffPane'
 import { FileTree, type ListingState, type TreeScope } from './FileTree'
 import { FileFinder } from './FileFinder'
 import { Toast, type ToastMessage } from './Toast'
 import { ThreadActionsContext, ThreadCard, anchorLines, type ThreadActions } from './ThreadCard'
 import { Composer } from './Composer'
+import { REVIEW_KEY, ReviewDialog } from './ReviewDialog'
 
 interface Props {
   route: PrRoute
@@ -56,7 +61,8 @@ interface Props {
 
 /**
  * `requestedAt`: `performance.now()` when the requests were sent (see `ViewedSync.rebase`).
- * `threads`: read alongside, but the page doesn't wait for it (nor fail with it).
+ * `threads`: read alongside, but the page doesn't wait for it (nor fail with it); its
+ * `requestedAt` is a `stamp()`, like the review store's.
  */
 type Data = { pr: PrSummary; files: ChangedFile[]; requestedAt: number; threads: ReviewRead }
 
@@ -94,11 +100,12 @@ export function PrPage({ route, search }: Props) {
   const load = useCallback(
     async (refresh: boolean): Promise<Data> => {
       const requestedAt = performance.now()
+      const threadsAt = stamp()
       const threads = getThreads(repo, route.number)
       // Handled by the page once it shows; not if loading the pull request fails.
       threads.catch(() => {})
       const [pr, files] = await Promise.all([getPr(repo, route.number, refresh), getPrFiles(repo, route.number, refresh)])
-      return { pr, files, requestedAt, threads: { promise: threads, requestedAt } }
+      return { pr, files, requestedAt, threads: { promise: threads, requestedAt: threadsAt } }
     },
     [repo, route.number],
   )
@@ -243,6 +250,7 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
   const [sideBySide, setSideBySide] = usePersistentState('dr.sideBySide', true)
   const [ignoreWs, setIgnoreWs] = usePersistentState('dr.ignoreTrimWhitespace', false)
   const [finderOpen, setFinderOpen] = useState(false)
+  const [reviewOpen, setReviewOpen] = useState(false)
   const [changeInfo, setChangeInfo] = useState<ChangeInfo | null>(null)
   const [treeWidth, setTreeWidth] = usePersistentState('dr.treeWidth', 320)
 
@@ -315,11 +323,12 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
   )
   /**
    * Sends the draft `key` with `post` (given the page's head), keeping the box with the error
-   * when it fails; a refusal that says the page is out of date says how to catch up.
+   * when it fails; a refusal that says the page is out of date says how to catch up. Whether
+   * it was sent.
    */
   const sendDraft = useCallback(
-    (key: string, post: (body: string, draft: DraftView, deps: ReadDeps, head: string) => Promise<void>) => {
-      void drafts.send(key, async (body, draft) => {
+    (key: string, post: (body: string, draft: DraftView, deps: ReadDeps, head: string) => Promise<void>) =>
+      drafts.send(key, async (body, draft) => {
         const { store, retry, head } = writing.current
         if (!store) throw new Error("The review comments haven't loaded yet")
         try {
@@ -331,8 +340,7 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
           if (e instanceof ApiError && (e.code === 'pending_review_exists' || e.code === 'review_changed' || e.code === 'not_found')) retry()
           throw e
         }
-      })
-    },
+      }),
     [drafts, readDeps, showToast, onRefresh],
   )
   /** Sends the draft `key` of a new thread. */
@@ -387,6 +395,69 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
     },
     [drafts, readDeps, repo, pr.number, showToast],
   )
+  const openReview = useCallback(() => {
+    drafts.open({ kind: 'review' }, head)
+    setFinderOpen(false)
+    setReviewOpen(true)
+  }, [drafts, head])
+  /** Closes the review dialog; a summary typed stays for next time. */
+  const closeReview = useCallback(() => {
+    setReviewOpen(false)
+    if (!drafts.getSnapshot().get(REVIEW_KEY)?.sending && drafts.text(REVIEW_KEY).trim() === '') drafts.close(REVIEW_KEY)
+  }, [drafts])
+  /** The last submit was refused for new commits: once they show, what it said no longer holds. */
+  const submitStale = useRef(false)
+  const sendReview = useCallback(
+    (event: ReviewEvent) => {
+      const done: { review: SubmittedReview | null } = { review: null }
+      void sendDraft(REVIEW_KEY, async (body, _draft, deps, head) => {
+        const reviewId = deps.store.getSnapshot().pendingReview?.id ?? null
+        submitStale.current = false
+        try {
+          done.review = await postSubmit({ ...deps, submit: (req) => submitReview(repo, pr.number, req) }, { head, reviewId, event, body })
+        } catch (e) {
+          submitStale.current = e instanceof ApiError && e.code === 'stale_head'
+          throw e
+        }
+      }).then((sent) => {
+        if (!sent) return
+        setReviewOpen(false)
+        const url = done.review?.url
+        const what = event === 'APPROVE' ? 'You approved the pull request' : event === 'REQUEST_CHANGES' ? 'You requested changes' : 'Your review was submitted'
+        showToast(
+          what,
+          url && /^https:\/\//i.test(url) ? { label: 'Open on GitHub', run: () => window.open(url, '_blank', 'noopener,noreferrer') } : undefined,
+        )
+      })
+    },
+    [sendDraft, repo, pr.number, showToast],
+  )
+  const discardPending = useCallback(async (): Promise<string | null> => {
+    const { store, retry } = writing.current
+    const reviewId = store?.getSnapshot().pendingReview?.id
+    if (!store || !reviewId) return "You don't have a pending review"
+    // Boxes editing its comments go with them; a reply box on a thread that goes stays if it has
+    // text, and a toast says where (one on its way, once it fails).
+    let kept = false
+    const gone = ({ commentIds, threadIds }: { commentIds: string[]; threadIds: string[] }) => {
+      for (const c of commentIds) drafts.close(editKey(c))
+      for (const t of threadIds) {
+        const key = replyKey(t)
+        if (drafts.getSnapshot().get(key)?.sending !== false) continue
+        if (drafts.text(key).trim() === '') drafts.close(key)
+        else kept = true
+      }
+    }
+    try {
+      await postDiscard({ ...readDeps(store, retry), discard: (id) => discardReview(repo, pr.number, id), gone }, reviewId)
+    } catch (e) {
+      if (e instanceof ApiError && e.code === 'review_changed') retry()
+      return errorMessage(e)
+    }
+    closeReview()
+    if (!kept) showToast('Your pending review was discarded')
+    return null
+  }, [drafts, readDeps, repo, pr.number, closeReview, showToast])
   // Leaving while a comment is sent would hide whether it was posted.
   const sendingAny = [...draftViews.values()].some((d) => d.sending)
   useEffect(() => {
@@ -427,6 +498,27 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
   const fileTarget = useMemo<DraftTarget | null>(() => (commentPath === null ? null : { kind: 'file', path: commentPath }), [commentPath])
   const fileKey = fileTarget ? draftKey(fileTarget) : null
   const fileDraft = fileKey ? draftViews.get(fileKey) : undefined
+  const reviewView = draftViews.get(REVIEW_KEY)
+  // Shown while its summary box is open: a submit that worked closes the box, and the dialog with
+  // it, in the same render that makes the page usable again (focus goes back to the button).
+  const reviewShown = reviewOpen && reviewView !== undefined && snapshot !== null
+  // Global shortcuts stay off while one is open.
+  const dialogOpen = finderOpen || reviewShown
+  // New commits shown behind the dialog (its toast's Refresh): look at them before submitting. A
+  // submit on its way first ends (refused at the old head, it leaves the dialog open).
+  const reviewSending = reviewView?.sending ?? false
+  const reviewHead = useRef(head)
+  useEffect(() => {
+    if (reviewHead.current === head || reviewSending) return
+    reviewHead.current = head
+    // "Refresh to see them" is done; other errors (it may have been submitted) still hold.
+    if (submitStale.current) drafts.clearError(REVIEW_KEY)
+    submitStale.current = false
+    if (!reviewShown) return
+    const kept = drafts.text(REVIEW_KEY).trim() !== ''
+    closeReview()
+    showToast(`The pull request has new commits: look at them before you submit your review.${kept ? ' Your summary is kept.' : ''}`)
+  }, [head, reviewShown, reviewSending, drafts, closeReview, showToast])
   const commentOnFile = useCallback(() => fileTarget && drafts.open(fileTarget, head), [drafts, fileTarget, head])
   const pendingReview = snapshot?.pendingReview != null
   const locked = snapshot?.locked ?? false
@@ -680,15 +772,15 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
   }
 
   // Keep the latest navigation state for the window-level key handler.
-  const nav = useRef({ neighbor, openFile, finderOpen, toggleCurrentViewed, commentHere })
+  const nav = useRef({ neighbor, openFile, dialogOpen, toggleCurrentViewed, commentHere })
   useLayoutEffect(() => {
-    nav.current = { neighbor, openFile, finderOpen, toggleCurrentViewed, commentHere }
+    nav.current = { neighbor, openFile, dialogOpen, toggleCurrentViewed, commentHere }
   })
 
   useEffect(() => {
     let lastShift = 0
     const onKeyDown = (e: KeyboardEvent) => {
-      const { neighbor, openFile, finderOpen, toggleCurrentViewed, commentHere } = nav.current
+      const { neighbor, openFile, dialogOpen, toggleCurrentViewed, commentHere } = nav.current
       // In a comment box (or any text field) keys are text, but Ctrl+P (the box keeps its draft).
       const typing = isTypingTarget(e.target)
       if (e.key === 'Shift') {
@@ -698,21 +790,26 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
           return
         }
         const now = performance.now()
-        if (!finderOpen && now - lastShift < DOUBLE_SHIFT_MS) {
+        if (!dialogOpen && now - lastShift < DOUBLE_SHIFT_MS) {
           lastShift = 0
           setFinderOpen(true)
         } else lastShift = now
         return
       }
       lastShift = 0
-      if (finderOpen) return
+      const plain = !e.altKey && !e.ctrlKey && !e.metaKey
+      const ctrlP = (e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'p'
+      if (dialogOpen) {
+        // Nor the browser's print dialog, or caret browsing, over it.
+        if (ctrlP || (e.key === 'F7' && plain)) e.preventDefault()
+        return
+      }
 
       const consume = () => {
         e.preventDefault()
         e.stopPropagation()
       }
-      const plain = !e.altKey && !e.ctrlKey && !e.metaKey
-      if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'p') {
+      if (ctrlP) {
         consume()
         setFinderOpen(true)
         return
@@ -772,7 +869,7 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
 
   return (
     <div className="app" style={{ '--tree-width': `${treeWidth}px` } as React.CSSProperties}>
-      <header className="topbar">
+      <header className="topbar" inert={reviewShown}>
         <a className="home-link" href="/" title="Home">
           Tideline
         </a>
@@ -805,12 +902,21 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
           <input type="checkbox" checked={ignoreWs} onChange={(e) => setIgnoreWs(e.target.checked)} />
           Ignore whitespace
         </label>
+        <button
+          className="btn btn-primary"
+          onClick={openReview}
+          disabled={!snapshot}
+          aria-haspopup="dialog"
+          title={snapshot ? 'Submit your review: comment, approve or request changes' : "The review comments haven't loaded yet"}
+        >
+          {snapshot && snapshot.pendingCount > 0 ? `Review (${snapshot.pendingCount})` : 'Review'}
+        </button>
         <button className="btn btn-icon" onClick={onRefresh} disabled={refreshing} title="Fetch the pull request again from GitHub">
           {refreshing ? 'Refreshing…' : 'Refresh'}
         </button>
       </header>
 
-      <div className="main">
+      <div className="main" inert={reviewShown}>
         <aside className="sidebar">
           <FileTree
             rows={rows}
@@ -870,7 +976,7 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
         </section>
       </div>
 
-      <footer className="statusbar">
+      <footer className="statusbar" inert={reviewShown}>
         <span className="status-item" data-testid="change-info">
           {changeInfo
             ? changeInfo.total === 0
@@ -898,6 +1004,20 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
             setFinderOpen(false)
             openFile(path)
           }}
+        />
+      )}
+      {reviewShown && (
+        <ReviewDialog
+          drafts={drafts}
+          view={reviewView}
+          pendingReview={snapshot.pendingReview}
+          pendingCount={snapshot.pendingCount}
+          head={head}
+          own={pr.author.toLowerCase() === pr.viewer.toLowerCase()}
+          locked={snapshot.locked}
+          onSubmit={sendReview}
+          onDiscard={discardPending}
+          onClose={closeReview}
         />
       )}
       {toast && <Toast toast={toast} onDismiss={dismissToast} />}

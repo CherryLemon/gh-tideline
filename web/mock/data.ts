@@ -573,6 +573,14 @@ export function filesWithViewed(): MockChangedFile[] {
   })
 }
 
+const HEAD = 'b'.repeat(40)
+let head = HEAD
+
+/** Test hook: new commits on the pull request (`null`: back to the fixtures' head). */
+export function setHead(sha: string | null): void {
+  head = sha ?? HEAD
+}
+
 export function prSummary(host: string, owner: string, repo: string, n: number): MockPr {
   return {
     host,
@@ -580,11 +588,12 @@ export function prSummary(host: string, owner: string, repo: string, n: number):
     repo,
     number: n,
     title: 'Add slug redirects, idle timeout and renamed Button component',
-    author: 'octocat',
+    // PR 43 is the viewer's own: GitHub refuses approving it or requesting changes on it.
+    author: n === 43 ? 'mock-reviewer' : 'octocat',
     state: 'OPEN',
     url: `https://${host}/${owner}/${repo}/pull/${n}`,
     base: { ref: 'main', sha: 'a'.repeat(40) },
-    head: { ref: 'feat/slug-redirects', sha: 'b'.repeat(40) },
+    head: { ref: 'feat/slug-redirects', sha: head },
     mergeBase: 'c'.repeat(40),
     nodeId: 'PR_kwDOMOCK',
     viewer: 'mock-reviewer',

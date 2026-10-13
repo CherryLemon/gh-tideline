@@ -1,6 +1,6 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import type { ReviewThread, ReviewThreads } from './api'
-import { ReviewStore, findCreated, ownCommentIds } from './review'
+import { ReviewStore, discarded, findCreated, ownCommentIds, stamp } from './review'
 import { mkThread } from './test-fixtures'
 
 interface Call {
@@ -14,7 +14,7 @@ function setup(threads: ReviewThread[]) {
   const calls: Call[] = []
   const errors: string[] = []
   let notified = 0
-  const initial: ReviewThreads = { head: 'h1', locked: false, pendingReview: null, threads }
+  const initial: ReviewThreads = { head: 'h1', locked: false, latestReview: null, pendingReview: null, threads }
   const store = new ReviewStore(
     initial,
     (id, resolved) => new Promise<ReviewThread>((resolve, reject) => calls.push({ id, resolved, resolve, reject })),
@@ -97,7 +97,7 @@ describe('ReviewStore rebase and writes', () => {
     const a = mkThread()
     const { store } = setup([a])
     const b = mkThread()
-    store.rebase({ head: 'h2', locked: true, pendingReview: null, threads: [b] }, performance.now())
+    store.rebase({ head: 'h2', locked: true, latestReview: null, pendingReview: null, threads: [b] }, stamp())
     const s = store.getSnapshot()
     expect(s.threads.map((t) => t.id)).toEqual([b.id])
     expect([s.head, s.locked]).toEqual(['h2', true])
@@ -107,30 +107,120 @@ describe('ReviewStore rebase and writes', () => {
     const a = mkThread()
     const gone = mkThread()
     const { store } = setup([a, gone])
-    const requestedAt = performance.now()
+    const requestedAt = stamp()
     const created = mkThread()
     store.applyThread(created.id, created)
     store.applyComment(a.id, { ...a.comments[0], id: 'reply', body: 'r' })
     store.applyThread(gone.id, null)
     store.applyPendingReview({ id: 'P', body: '', commit: 'h1', createdAt: 'c', url: 'u' })
     // The read started before those writes reached GitHub.
-    store.rebase({ head: 'h1', locked: false, pendingReview: null, threads: [a, gone] }, requestedAt)
+    store.rebase({ head: 'h1', locked: false, latestReview: null, pendingReview: null, threads: [a, gone] }, requestedAt)
     const s = store.getSnapshot()
     expect(s.threads.map((t) => t.id)).toEqual([a.id, created.id])
     expect(s.threads[0].comments.map((c) => c.id)).toEqual([a.comments[0].id, 'reply'])
     expect(s.pendingReview?.id).toBe('P')
     // A read sent after the writes is taken as is.
-    store.rebase({ head: 'h1', locked: false, pendingReview: null, threads: [a] }, performance.now())
+    store.rebase({ head: 'h1', locked: false, latestReview: null, pendingReview: null, threads: [a] }, stamp())
     expect(store.getSnapshot().threads.map((t) => t.id)).toEqual([a.id])
     expect(store.getSnapshot().pendingReview).toBeNull()
+  })
+
+  it('takes a submitted review: no comment pending, no pending review, the latest review', () => {
+    const mixed = mkThread()
+    const pending = { ...mixed.comments[0], id: 'p1', state: 'PENDING' as const, viewerDidAuthor: true, reviewId: 'P' }
+    const t = { ...mixed, comments: [mixed.comments[0], pending] }
+    const other = mkThread()
+    const { store } = setup([t, other])
+    store.applyPendingReview({ id: 'P', body: '', commit: 'h1', createdAt: 'c', url: 'u' })
+    expect(store.getSnapshot().pendingCount).toBe(1)
+    // A review of just a summary leaves the pending one alone.
+    const summary = { id: 'S', state: 'COMMENTED', url: 'u', body: 'Looks fine' }
+    store.applySubmitted(summary, null)
+    expect([store.getSnapshot().pendingCount, store.getSnapshot().pendingReview?.id, store.getSnapshot().latestReview]).toEqual([1, 'P', summary])
+    const requestedAt = stamp()
+    const latest = { id: 'P', state: 'APPROVED', url: 'u', body: 'LGTM' }
+    store.applySubmitted(latest, 'P')
+    let s = store.getSnapshot()
+    expect(s.pendingCount).toBe(0)
+    expect(s.pendingReview).toBeNull()
+    expect(s.latestReview).toEqual(latest)
+    expect(s.threads[0].comments.map((c) => c.state)).toEqual(['SUBMITTED', 'SUBMITTED'])
+    expect(s.threads[1]).toBe(other)
+    // A read sent before the submit landed still has it pending.
+    const stale = { head: 'h1', locked: false, latestReview: null, pendingReview: { id: 'P', body: '', commit: 'h1', createdAt: 'c', url: 'u' } }
+    store.rebase({ ...stale, threads: [t, other] }, requestedAt)
+    s = store.getSnapshot()
+    expect([s.pendingCount, s.pendingReview, s.latestReview]).toEqual([0, null, latest])
+    // No answer: the latest review read stays.
+    store.applySubmitted(null, 'P')
+    expect(store.getSnapshot().latestReview).toEqual(latest)
+  })
+
+  it('submits or discards only the comments of the review given', () => {
+    const t = mkThread()
+    const mine = { ...t, comments: [{ ...t.comments[0], state: 'PENDING' as const, reviewId: 'P' }] }
+    const u = mkThread()
+    const next = { ...u, comments: [{ ...u.comments[0], state: 'PENDING' as const, reviewId: 'P2' }] }
+    const P2 = { id: 'P2', body: '', commit: 'h1', createdAt: 'c', url: 'u' }
+    // A comment's answer, in review P2 started after P was discarded, came first.
+    const discarding = setup([mine, next]).store
+    discarding.applyPendingReview(P2)
+    discarding.applyDiscard('P')
+    let s = discarding.getSnapshot()
+    expect([s.threads.map((th) => th.id), s.pendingCount, s.pendingReview]).toEqual([[next.id], 1, P2])
+    const submitting = setup([mine, next]).store
+    submitting.applyPendingReview(P2)
+    submitting.applySubmitted(null, 'P')
+    s = submitting.getSnapshot()
+    expect([s.threads.map((th) => th.comments[0].state), s.pendingReview]).toEqual([['SUBMITTED', 'PENDING'], P2])
+  })
+
+  it('takes a read sent right after a write, on a coarse clock too', () => {
+    const t = mkThread()
+    const { store, thread } = setup([t])
+    const now = performance.now()
+    const clock = vi.spyOn(performance, 'now').mockReturnValue(now)
+    try {
+      store.applyThread(t.id, { ...t, viewerCanResolve: false })
+      // The read after a submit brings what the write's answer didn't have.
+      store.rebase({ head: 'h1', locked: false, latestReview: null, pendingReview: null, threads: [{ ...t, viewerCanResolve: true }] }, stamp())
+      expect(thread(t.id)!.viewerCanResolve).toBe(true)
+    } finally {
+      clock.mockRestore()
+    }
+  })
+
+  it('drops a discarded review: its comments, and threads left without any', () => {
+    const mixed = mkThread()
+    const pending = { ...mixed.comments[0], id: 'p1', state: 'PENDING' as const, viewerDidAuthor: true, reviewId: 'P' }
+    const t = { ...mixed, comments: [mixed.comments[0], pending] }
+    const only = mkThread()
+    const alone = { ...only, comments: [{ ...only.comments[0], state: 'PENDING' as const, reviewId: 'P' }] }
+    const other = mkThread()
+    const { store } = setup([t, alone, other])
+    expect(discarded(store.getSnapshot().threads, 'P')).toEqual({ commentIds: ['p1', alone.comments[0].id], threadIds: [alone.id] })
+    expect(discarded(store.getSnapshot().threads, 'P2')).toEqual({ commentIds: [], threadIds: [] })
+    store.applyPendingReview({ id: 'P', body: '', commit: 'h1', createdAt: 'c', url: 'u' })
+    const requestedAt = stamp()
+    store.applyDiscard('P')
+    let s = store.getSnapshot()
+    expect(s.threads.map((th) => th.id)).toEqual([t.id, other.id])
+    expect(s.threads[0].comments.map((c) => c.id)).toEqual([mixed.comments[0].id])
+    expect([s.pendingCount, s.pendingReview]).toEqual([0, null])
+    // A read sent before the discard landed doesn't bring them back.
+    const stale = { head: 'h1', locked: false, latestReview: null, pendingReview: { id: 'P', body: '', commit: 'h1', createdAt: 'c', url: 'u' } }
+    store.rebase({ ...stale, threads: [t, alone, other] }, requestedAt)
+    s = store.getSnapshot()
+    expect(s.threads.map((th) => th.id)).toEqual([t.id, other.id])
+    expect([s.pendingCount, s.pendingReview]).toEqual([0, null])
   })
 
   it('ignores a read requested before one already taken', () => {
     const a = mkThread()
     const { store } = setup([a])
-    const early = performance.now()
-    store.rebase({ head: 'h2', locked: false, pendingReview: null, threads: [a] }, performance.now())
-    store.rebase({ head: 'h0', locked: false, pendingReview: null, threads: [] }, early)
+    const early = stamp()
+    store.rebase({ head: 'h2', locked: false, latestReview: null, pendingReview: null, threads: [a] }, stamp())
+    store.rebase({ head: 'h0', locked: false, latestReview: null, pendingReview: null, threads: [] }, early)
     expect(store.getSnapshot().head).toBe('h2')
   })
 
@@ -138,7 +228,7 @@ describe('ReviewStore rebase and writes', () => {
     const t = mkThread()
     const { store, calls, thread, settle } = setup([t])
     store.setResolved(t.id, true)
-    store.rebase({ head: 'h1', locked: false, pendingReview: null, threads: [{ ...t, isResolved: false }] }, performance.now())
+    store.rebase({ head: 'h1', locked: false, latestReview: null, pendingReview: null, threads: [{ ...t, isResolved: false }] }, stamp())
     expect(thread(t.id)!.isResolved).toBe(true)
     calls[0].resolve({ ...t, isResolved: true })
     await settle()
@@ -149,7 +239,7 @@ describe('ReviewStore rebase and writes', () => {
     const t = mkThread({ line: 12 })
     const { store, thread } = setup([t])
     store.setResolved(t.id, true)
-    store.rebase({ head: 'h2', locked: false, pendingReview: null, threads: [{ ...t, line: 20 }] }, performance.now())
+    store.rebase({ head: 'h2', locked: false, latestReview: null, pendingReview: null, threads: [{ ...t, line: 20 }] }, stamp())
     expect(thread(t.id)).toMatchObject({ line: 20, isResolved: true })
   })
 
@@ -157,10 +247,10 @@ describe('ReviewStore rebase and writes', () => {
     const t = mkThread({ line: 12 })
     const { store, calls, thread, settle } = setup([t])
     store.setResolved(t.id, true)
-    const sentAt = performance.now()
+    const sentAt = stamp()
     calls[0].reject(new Error('nope'))
     await settle()
-    store.rebase({ head: 'h2', locked: false, pendingReview: null, threads: [{ ...t, line: 20 }] }, sentAt)
+    store.rebase({ head: 'h2', locked: false, latestReview: null, pendingReview: null, threads: [{ ...t, line: 20 }] }, sentAt)
     expect(thread(t.id)).toMatchObject({ line: 20, isResolved: false })
   })
 

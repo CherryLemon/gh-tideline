@@ -234,6 +234,11 @@ export class DraftStore {
     return !failed
   }
 
+  /** Drops the error the box shows: what it said no longer holds. */
+  clearError(key: string): void {
+    if (this.errors.delete(key)) this.changed()
+  }
+
   /** Moves the draft to `head` (the user checked its lines there). */
   setHead(key: string, head: string, now = Date.now()): void {
     const d = this.drafts.get(key)

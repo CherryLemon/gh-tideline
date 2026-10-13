@@ -54,6 +54,13 @@ export interface MockPendingReview {
   url: string
 }
 
+export interface MockSubmittedReview {
+  id: string
+  state: 'COMMENTED' | 'APPROVED' | 'CHANGES_REQUESTED'
+  url: string
+  body: string
+}
+
 export const VIEWER = 'mock-reviewer'
 const PR_URL = 'https://github.com/acme/demo-app/pull/42'
 
@@ -78,6 +85,8 @@ export function renderBody(body: string): string {
 export interface MockState {
   threads: MockThread[]
   pendingReview: MockPendingReview | null
+  /** The viewer's latest submitted review (a single comment makes one too). */
+  latestReview: MockSubmittedReview | null
   nextId: number
 }
 
@@ -96,10 +105,13 @@ interface CommentSpec {
   edited?: boolean
 }
 
-function initialState(head: string, withPending: boolean): MockState {
+/** A commit before the head: where `resetReview({ staleReview: true })` started the pending review. */
+const OLD_COMMIT = 'd'.repeat(40)
+
+function initialState(head: string, withPending: boolean, staleReview: boolean): MockState {
   minute = 0
   let n = 0
-  const st: MockState = { threads: [], pendingReview: null, nextId: 1000 }
+  const st: MockState = { threads: [], pendingReview: null, latestReview: null, nextId: 1000 }
   const comment = (threadUrl: string, c: CommentSpec, replyTo: string | null): MockComment => {
     const id = `PRRC_mock_${++n}`
     const login = c.author === undefined ? 'octocat' : c.author
@@ -271,7 +283,7 @@ function initialState(head: string, withPending: boolean): MockState {
     st.pendingReview = {
       id: 'PRR_mock_pending',
       body: '',
-      commit: head,
+      commit: staleReview ? OLD_COMMIT : head,
       createdAt: at(),
       url: `${PR_URL}#pullrequestreview-1`,
     }
@@ -290,25 +302,31 @@ function dropPending(st: MockState): void {
 
 let state: MockState | null = null
 let startPending = true
+let startStale = false
 /** Test hook: the next resolve, edit or delete fails with this status (`after`: once it is done). */
 let failNext: { status: number; after: boolean } | null = null
 
 /** The review state, built on first use (the pending review starts on `head`). */
 export function reviewState(head: string): MockState {
-  state ??= initialState(head, startPending)
+  state ??= initialState(head, startPending, startStale)
   return state
 }
 
-/** Back to the fixtures; `pending: false` starts without the viewer's pending review. */
-export function resetReview(opts: { pending?: boolean } = {}): void {
+/**
+ * Back to the fixtures; `pending: false` starts without the viewer's pending review,
+ * `staleReview` with it on a commit before the head.
+ */
+export function resetReview(opts: { pending?: boolean; staleReview?: boolean } = {}): void {
   state = null
   startPending = opts.pending ?? true
+  startStale = opts.staleReview ?? false
   failNext = null
 }
 
 /**
- * `POST /api/__mock/fail-next {status, after?}`: the next resolve, edit or delete fails that
- * way (422 rejected, 404 not_found, others GitHub failing: 502), with `after` once it is done.
+ * `POST /api/__mock/fail-next {status, after?}`: the next resolve, edit, delete, submit or
+ * discard fails that way (422 rejected, 404 not_found, others GitHub failing: 502), with
+ * `after` once it is done.
  */
 export function failNextWrite(status: number, after = false): void {
   failNext = { status, after }
@@ -334,10 +352,11 @@ export function threadsResponse(head: string): {
   head: string
   locked: boolean
   pendingReview: MockPendingReview | null
+  latestReview: MockSubmittedReview | null
   threads: MockThread[]
 } {
   const st = reviewState(head)
-  return { head, locked: false, pendingReview: st.pendingReview, threads: st.threads }
+  return { head, locked: false, pendingReview: st.pendingReview, latestReview: st.latestReview, threads: st.threads }
 }
 
 export interface MockResult {
@@ -378,6 +397,13 @@ function newComment(st: MockState, body: string, reviewId: string, pending: bool
     viewerCanDelete: true,
     viewerDidAuthor: true,
   }
+}
+
+/** A review submitted with a single comment: no summary, COMMENTED. */
+function singleReview(st: MockState): string {
+  const n = st.nextId++
+  st.latestReview = { id: `PRR_mock_new${n}`, state: 'COMMENTED', url: `${PR_URL}#pullrequestreview-${n}`, body: '' }
+  return st.latestReview.id
 }
 
 function startReview(st: MockState, head: string): MockPendingReview {
@@ -430,7 +456,7 @@ export function createThread(head: string, listed: (path: string) => boolean, ra
   const stuck = how === 'submit' && mode === 'single' && subjectType === 'FILE'
   const pending = mode === 'review' || stuck
   const review = pending ? (st.pendingReview ?? startReview(st, head)) : null
-  const comment = newComment(st, body, review?.id ?? `PRR_mock_new${st.nextId++}`, pending)
+  const comment = newComment(st, body, review?.id ?? singleReview(st), pending)
   const lines = subjectType === 'LINE'
   const thread: MockThread = {
     id: `PRRT_mock_new${st.nextId++}`,
@@ -472,9 +498,79 @@ export function discardReview(head: string, raw: unknown): MockResult {
   if (st.pendingReview && st.pendingReview.id !== id) {
     return fail(409, 'review_changed', 'your pending review on GitHub is not the one shown; refresh to see it')
   }
+  const failed = takeFailNext()
+  if (failed.before) return failed.before
   st.pendingReview = null
   dropPending(st)
-  return { status: 200, body: { pendingReview: null } }
+  return failed.after ?? { status: 200, body: { pendingReview: null } }
+}
+
+const SUBMIT_FIELDS = new Set(['head', 'reviewId', 'event', 'body'])
+const SUBMITTED_STATE = { COMMENT: 'COMMENTED', APPROVE: 'APPROVED', REQUEST_CHANGES: 'CHANGES_REQUESTED' } as const
+/** GitHub's words (live, 2026-10-13), for a pending review submitted, and for a review of just a summary. */
+const OWN_PR = {
+  APPROVE: 'Could not approve for pull request review. Can not approve your own pull request',
+  REQUEST_CHANGES: 'Could not request_changes for pull request review. Can not request changes on your own pull request',
+} as const
+const OWN_PR_SUMMARY = {
+  APPROVE: 'Review Can not approve your own pull request',
+  // Not seen live: by analogy.
+  REQUEST_CHANGES: 'Review Can not request changes on your own pull request',
+} as const
+
+/**
+ * `POST /review {head, reviewId, event, body}`, checked like the server does (the head, the
+ * review shown, a summary where GitHub needs one). `own`: the viewer's own pull request, which
+ * GitHub doesn't let them approve or request changes on. `/fail 409|422|502|502-after` in the
+ * summary, or `fail-next`.
+ */
+export function submitReview(head: string, own: boolean, raw: unknown): MockResult {
+  if (!raw || typeof raw !== 'object') return fail(400, 'bad_request', 'invalid request body')
+  const req = raw as Record<string, unknown>
+  const unknown = Object.keys(req).find((k) => !SUBMIT_FIELDS.has(k))
+  if (unknown) return fail(400, 'bad_request', `invalid request body: unknown field \`${unknown}\``)
+  const { reviewId, event, body } = req
+  if (typeof req.head !== 'string' || !/^[0-9a-f]{40}$/.test(req.head)) return fail(400, 'bad_request', 'head must be 40 lowercase hex characters')
+  if (reviewId !== null && (typeof reviewId !== 'string' || !/^[A-Za-z0-9_=+/-]{1,128}$/.test(reviewId))) return fail(400, 'bad_request', 'invalid id')
+  if (typeof body !== 'string' || (event !== 'COMMENT' && event !== 'APPROVE' && event !== 'REQUEST_CHANGES')) {
+    return fail(400, 'bad_request', 'invalid request body')
+  }
+  if ([...body].length > 65536) return fail(400, 'bad_request', 'the summary is longer than 65536 characters')
+
+  const st = reviewState(head)
+  const how = injected(body)
+  if (how === '409' || req.head !== head) return fail(409, 'stale_head', 'the pull request has new commits; refresh to see them before submitting')
+  const pending = st.pendingReview
+  if (pending === null && reviewId !== null) {
+    return fail(409, 'review_changed', 'your pending review is no longer pending (submitted or discarded); refresh to see it')
+  }
+  if (pending !== null && pending.id !== reviewId) {
+    return fail(409, 'review_changed', 'your pending review on GitHub is not the one shown; refresh to see it')
+  }
+  const comments = st.threads.reduce((n, t) => n + t.comments.filter((c) => c.state === 'PENDING').length, 0)
+  if (comments === 0 && body.trim() === '' && event !== 'APPROVE') return fail(400, 'bad_request', 'write a summary: a review with no comments needs one')
+  if (own && event !== 'COMMENT') return fail(422, 'rejected', (pending ? OWN_PR : OWN_PR_SUMMARY)[event])
+  if (how === '422') return fail(422, 'rejected', 'GitHub refused the review')
+  if (how === '502') return fail(502, 'github_error', TIMED_OUT)
+  const failed = takeFailNext()
+  if (failed.before) return failed.before
+
+  const n = st.nextId++
+  const review: MockSubmittedReview = {
+    id: pending?.id ?? `PRR_mock_new${n}`,
+    state: SUBMITTED_STATE[event],
+    url: pending?.url ?? `${PR_URL}#pullrequestreview-${n}`,
+    body: body.trim() === '' ? '' : body,
+  }
+  for (const t of st.threads) {
+    if (!t.comments.some((c) => c.state === 'PENDING')) continue
+    t.comments = t.comments.map((c) => (c.state === 'PENDING' ? { ...c, state: 'SUBMITTED' } : c))
+    t.viewerCanResolve = !t.isResolved
+  }
+  st.pendingReview = null
+  st.latestReview = review
+  if (how === '502-after') return fail(502, 'github_error', TIMED_OUT)
+  return failed.after ?? { status: 200, body: { review } }
 }
 
 const REPLY_FIELDS = new Set(['head', 'body', 'mode'])
@@ -516,7 +612,7 @@ export function reply(head: string, threadId: string, raw: unknown): MockResult 
 
   const pending = mode === 'review'
   const review = pending ? (st.pendingReview ?? startReview(st, head)) : null
-  const comment = { ...newComment(st, text, review?.id ?? `PRR_mock_new${st.nextId++}`, pending), replyTo: thread.comments[0]?.id ?? null }
+  const comment = { ...newComment(st, text, review?.id ?? singleReview(st), pending), replyTo: thread.comments[0]?.id ?? null }
   thread.comments.push(comment)
   if (how === '502-after') return fail(502, 'github_error', TIMED_OUT)
   return { status: 200, body: { comment, pendingReview: st.pendingReview } }
