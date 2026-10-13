@@ -56,6 +56,21 @@ const MAX_AGE_MS = 14 * 24 * 3600 * 1000
 export const INTERRUPTED =
   'The page was reloaded while this was being sent, so it may have been posted: check before sending it again'
 
+const stores = new Map<string, DraftStore>()
+
+/**
+ * The page's store for `scope`: one per pull request for the page's life, so a send on its way
+ * still reports to the store a page shown again uses, and two stores never write one key.
+ */
+export function draftStoreFor(scope: string, storage: () => DraftStorage | null = sessionDraftStorage): DraftStore {
+  let s = stores.get(scope)
+  if (!s) {
+    s = new DraftStore(scope, storage())
+    stores.set(scope, s)
+  }
+  return s
+}
+
 /** sessionStorage, or null where it can't be used (then drafts last as long as the page). */
 export function sessionDraftStorage(): DraftStorage | null {
   try {
@@ -155,6 +170,8 @@ export class DraftStore {
 
   close(key: string): void {
     if (!this.drafts.delete(key)) return
+    // A send still on its way finishes for nothing: a box opened again on the target is new.
+    this.sending.delete(key)
     this.errors.delete(key)
     if (this.focusKey === key) this.focusKey = null
     this.save()
@@ -173,26 +190,37 @@ export class DraftStore {
     d.sentAt = now
     this.save()
     this.changed()
+    let failure: unknown = null
+    let failed = false
     try {
       await post(d.text, { target: d.target, head: d.head, sending: true, error: null })
     } catch (e) {
-      this.sending.delete(key)
-      // Unless it was closed meanwhile.
-      const still = this.drafts.get(key)
-      if (still) {
-        delete still.sentAt
-        this.errors.set(key, errorMessage(e))
-        this.save()
-      }
-      this.changed()
-      return false
+      failure = e
+      failed = true
     }
+    // Closed meanwhile (and maybe opened again): that box isn't this one.
+    if (this.drafts.get(key) !== d) return !failed
     this.sending.delete(key)
-    this.drafts.delete(key)
-    this.errors.delete(key)
+    if (failed) {
+      delete d.sentAt
+      this.errors.set(key, errorMessage(failure))
+    } else {
+      this.drafts.delete(key)
+      this.errors.delete(key)
+    }
     this.save()
     this.changed()
-    return true
+    return !failed
+  }
+
+  /** Moves the draft to `head` (the user checked its lines there). */
+  setHead(key: string, head: string, now = Date.now()): void {
+    const d = this.drafts.get(key)
+    if (!d || d.head === head || this.sending.has(key)) return
+    d.head = head
+    d.updatedAt = now
+    this.save()
+    this.changed()
   }
 
   /** Whether the box `key` should take focus now (once per `open`). */
@@ -221,7 +249,8 @@ export class DraftStore {
     } catch {
       return
     }
-    const entries = (parsed as { drafts?: unknown } | null)?.drafts
+    if ((parsed as { v?: unknown } | null)?.v !== 1) return
+    const entries = (parsed as { drafts?: unknown }).drafts
     if (!entries || typeof entries !== 'object') return
     for (const [key, value] of Object.entries(entries as Record<string, unknown>)) {
       const d = value as Partial<Stored> | null

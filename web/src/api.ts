@@ -288,7 +288,12 @@ export async function createThread(r: RepoRef, n: number, req: NewThreadRequest)
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(req),
   })
-  return (await res.json()) as CreatedThread
+  try {
+    return (await res.json()) as CreatedThread
+  } catch (e) {
+    // The answer was cut short after the server did the write: like a lost connection.
+    throw new ApiError(0, 'network', errorMessage(e))
+  }
 }
 
 /** Deletes the pending review `reviewId` (the one shown) with all its comments. */

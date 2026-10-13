@@ -41,6 +41,16 @@ export function FileFinder({ files, onPick, onClose }: Props) {
   const [query, setQuery] = useState('')
   const [active, setActive] = useState(0)
   const listRef = useRef<HTMLDivElement>(null)
+  // Read while rendering, before the input takes focus: focus goes back there on closing (a
+  // comment box, the editor).
+  const [opener] = useState(() => document.activeElement)
+  useEffect(
+    () => () => {
+      const lost = document.activeElement === null || document.activeElement === document.body
+      if (lost && opener instanceof HTMLElement && opener !== document.body && opener.isConnected) opener.focus({ preventScroll: true })
+    },
+    [opener],
+  )
   // Matching a whole project tree takes a while: keep typing responsive.
   const deferredQuery = useDeferredValue(query)
 

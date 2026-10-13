@@ -188,12 +188,15 @@ describe('findCreated', () => {
     const before = ownCommentIds([mine])
     expect([...before]).toEqual(['old'])
     const after = { ...mine, comments: [...mine.comments, { ...mine.comments[0], id: 'new', body: ' same\n' }] }
-    expect(findCreated([after], before, 'same', { path: 'src/x.ts' })?.comment.id).toBe('new')
+    const at = { path: 'src/x.ts', subjectType: 'LINE', side: mine.side!, line: mine.line! } as const
+    expect(findCreated([after], before, 'same', at)?.comment.id).toBe('new')
     expect(findCreated([after], before, 'same', { threadId: mine.id })?.comment.id).toBe('new')
-    expect(findCreated([after], before, 'same', { path: 'src/y.ts' })).toBeNull()
-    expect(findCreated([after], before, 'other', { path: 'src/x.ts' })).toBeNull()
+    expect(findCreated([after], before, 'same', { ...at, path: 'src/y.ts' })).toBeNull()
+    expect(findCreated([after], before, 'same', { ...at, line: at.line + 1 })).toBeNull()
+    expect(findCreated([after], before, 'same', { path: 'src/x.ts', subjectType: 'FILE' })).toBeNull()
+    expect(findCreated([after], before, 'other', at)).toBeNull()
     // Someone else's comment with the same text is not ours.
     const theirs = { ...mine, comments: [{ ...mine.comments[0], id: 'x', body: 'same', viewerDidAuthor: false }] }
-    expect(findCreated([theirs], before, 'same', { path: 'src/x.ts' })).toBeNull()
+    expect(findCreated([theirs], before, 'same', at)).toBeNull()
   })
 })

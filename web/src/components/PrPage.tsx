@@ -12,7 +12,6 @@ import {
   setViewed,
   type ChangedFile,
   type CommentMode,
-  type NewThreadTarget,
   type PrSummary,
   type RepoRef,
   type ReviewThread,
@@ -35,8 +34,8 @@ import { usePersistentState } from '../storage'
 import { ViewedSync, isTypingTarget, nextUnviewed, viewedMap } from '../viewed'
 import { fileCounts, threadsForFile, type PanelReason } from '../threads'
 import { useReview, type ReviewRead } from '../useReview'
-import { DraftStore, draftKey, sessionDraftStorage, type DraftTarget } from '../drafts'
-import { postThread } from '../compose'
+import { draftKey, draftStoreFor, type DraftTarget } from '../drafts'
+import { postThread, threadRequest } from '../compose'
 import { DiffPane, type ChangeInfo, type DiffPaneHandle, type PaneReview, type PendingJump } from './DiffPane'
 import { FileTree, type ListingState, type TreeScope } from './FileTree'
 import { FileFinder } from './FileFinder'
@@ -292,38 +291,53 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
   }, [review.error, retryReview, showToast])
 
   // Open comment boxes, per pull request; a box's text survives file switches and reloads.
-  const drafts = useMemo(() => new DraftStore(`${repo.host}/${repo.owner}/${repo.repo}#${pr.number}`, sessionDraftStorage()), [repo, pr.number])
+  const drafts = useMemo(() => draftStoreFor(`${repo.host}/${repo.owner}/${repo.repo}#${pr.number}`), [repo, pr.number])
   const draftViews = useSyncExternalStore(drafts.subscribe, drafts.getSnapshot)
   const writing = useRef({ store: review.store, retry: retryReview, head })
-  writing.current = { store: review.store, retry: retryReview, head }
-  /** Sends the draft `key` as a new thread on `target`, at the head the page shows. */
+  useLayoutEffect(() => {
+    writing.current = { store: review.store, retry: retryReview, head }
+  })
+  /** Sends the draft `key` of a new thread. */
   const sendThread = useCallback(
-    (key: string, target: NewThreadTarget & { path: string }, mode: CommentMode) => {
-      void drafts.send(key, async (body) => {
+    (key: string, mode: CommentMode) => {
+      void drafts.send(key, async (body, draft) => {
         const { store, retry, head } = writing.current
         if (!store) throw new Error("The review comments haven't loaded yet")
+        const req = threadRequest(draft, head, body, mode)
+        if (!req) throw new Error('This box does not start a thread')
         try {
           const posted = await postThread(
             {
               store,
-              create: (req) => createThread(repo, pr.number, req),
+              create: (r) => createThread(repo, pr.number, r),
               read: () => getThreads(repo, pr.number),
               reread: retry,
-              settle: () => new Promise((r) => setTimeout(r, 1000)),
+              settle: (attempt) => new Promise((r) => setTimeout(r, attempt === 0 ? 1000 : 3000)),
             },
-            { ...target, head, body, mode },
+            req,
           )
           if (posted.submitError) {
             showToast(`Your comment was added to a pending review, but posting the review failed: ${posted.submitError}`)
           }
         } catch (e) {
           if (e instanceof ApiError && e.code === 'stale_head') showToast(e.message, { label: 'Refresh', run: onRefresh })
+          // The page's idea of the pending review is out of date: read it again, so the box
+          // offers what GitHub takes.
+          if (e instanceof ApiError && (e.code === 'pending_review_exists' || e.code === 'review_changed')) retry()
           throw e
         }
       })
     },
     [drafts, repo, pr.number, showToast, onRefresh],
   )
+  // Leaving while a comment is sent would hide whether it was posted.
+  const sendingAny = [...draftViews.values()].some((d) => d.sending)
+  useEffect(() => {
+    if (!sendingAny) return
+    const warn = (e: BeforeUnloadEvent) => e.preventDefault()
+    window.addEventListener('beforeunload', warn)
+    return () => window.removeEventListener('beforeunload', warn)
+  }, [sendingAny])
 
   const currentIndex = changedCurrent ? order.indexOf(changedCurrent) : -1
   /** A changed file, or an unchanged file of the head tree. */
@@ -370,7 +384,7 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
           pendingReview={pendingReview}
           locked={locked}
           label={`Comment on ${commentPath}`}
-          onSend={(mode) => sendThread(fileKey, { subjectType: 'FILE', path: commentPath }, mode)}
+          onSend={(mode) => sendThread(fileKey, mode)}
         />
       ) : undefined,
     [drafts, fileKey, fileDraft, commentPath, pendingReview, locked, sendThread],
@@ -503,7 +517,11 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
         setFinderOpen(true)
         return
       }
-      if (typing) return
+      if (typing) {
+        // Neither Monaco's accessible diff viewer (from its find box) nor Chrome's caret browsing.
+        if (e.key === 'F7' && plain) consume()
+        return
+      }
       if (e.key === 'F7' && plain) {
         // Captured on window before Monaco sees it: overrides its accessible-diff-viewer binding.
         consume()

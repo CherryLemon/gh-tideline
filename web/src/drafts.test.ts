@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { DraftStore, INTERRUPTED, draftKey, type DraftStorage, type DraftTarget } from './drafts'
+import { DraftStore, INTERRUPTED, draftKey, draftStoreFor, type DraftStorage, type DraftTarget } from './drafts'
 
 class FakeStorage implements DraftStorage {
   readonly items = new Map<string, string>()
@@ -105,6 +105,48 @@ describe('DraftStore', () => {
     expect(store.getSnapshot().has(key)).toBe(false)
   })
 
+  it('keeps a send that ends after its box was closed away from a box opened again', async () => {
+    for (const outcome of ['posted', 'failed'] as const) {
+      const storage = new FakeStorage()
+      const store = new DraftStore('s', storage)
+      const key = store.open(FILE, HEAD)
+      store.setText(key, 'Old')
+      const out = deferred()
+      const sending = store.send(key, () => out.promise)
+      store.close(key)
+      expect(store.getSnapshot().has(key)).toBe(false)
+      store.open(FILE, HEAD)
+      expect(store.getSnapshot().get(key)).toEqual({ target: FILE, head: HEAD, sending: false, error: null })
+      expect(store.text(key)).toBe('')
+      store.setText(key, 'New')
+      if (outcome === 'posted') out.resolve()
+      else out.reject(new Error('nope'))
+      expect(await sending).toBe(outcome === 'posted')
+      expect(store.getSnapshot().get(key)).toEqual({ target: FILE, head: HEAD, sending: false, error: null })
+      expect(store.text(key)).toBe('New')
+      expect(new DraftStore('s', storage).text(key)).toBe('New')
+    }
+  })
+
+  it('moves a draft to another head, not while it is sent', () => {
+    const store = new DraftStore('s', new FakeStorage())
+    const key = store.open(LINES, HEAD)
+    const next = 'b'.repeat(40)
+    const before = store.getSnapshot()
+    store.setHead(key, next)
+    expect(store.getSnapshot()).not.toBe(before)
+    expect(store.getSnapshot().get(key)?.head).toBe(next)
+    void store.send(key, () => new Promise(() => {}))
+    store.setHead(key, HEAD)
+    expect(store.getSnapshot().get(key)?.head).toBe(next)
+  })
+
+  it('has one store per scope for the page', () => {
+    const storage = () => new FakeStorage()
+    expect(draftStoreFor('x#1', storage)).toBe(draftStoreFor('x#1', storage))
+    expect(draftStoreFor('x#2', storage)).not.toBe(draftStoreFor('x#1', storage))
+  })
+
   it('says a send cut short by a reload may have been posted', () => {
     const storage = new FakeStorage()
     const store = new DraftStore('s', storage)
@@ -138,6 +180,8 @@ describe('DraftStore', () => {
     expect([...store.getSnapshot().keys()]).toEqual([draftKey(FILE)])
     storage.setItem('tl.drafts:t', '{not json')
     expect(new DraftStore('t', storage, now).getSnapshot().size).toBe(0)
+    storage.setItem('tl.drafts:u', JSON.stringify({ v: 2, drafts: { [draftKey(FILE)]: ok } }))
+    expect(new DraftStore('u', storage, now).getSnapshot().size).toBe(0)
   })
 
   it('works without storage, or when writes fail', () => {

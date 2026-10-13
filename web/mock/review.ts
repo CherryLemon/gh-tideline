@@ -385,7 +385,7 @@ export function createThread(head: string, listed: (path: string) => boolean, ra
   } else {
     return fail(400, 'bad_request', 'invalid request body')
   }
-  if (!listed(path)) return fail(400, 'bad_request', `${path} is not part of the pull request`)
+  if (!listed(path)) return fail(400, 'bad_request', `${JSON.stringify(path)} is not a file of this pull request`)
 
   const st = reviewState(head)
   if (mode === 'single' && st.pendingReview) {
@@ -398,8 +398,10 @@ export function createThread(head: string, listed: (path: string) => boolean, ra
   if (how === '422') return fail(422, 'rejected', subjectType === 'FILE' ? 'GitHub did not take a comment on this file' : LINE_REJECTED)
   if (how === '502') return fail(502, 'github_error', 'GraphQL request to github.com failed: operation timed out')
 
-  // A single comment on a file waits in a review that `/fail submit` leaves pending.
-  const pending = mode === 'review' || how === 'submit'
+  // A single comment on a file is added to a review and then submitted (comments on lines go in
+  // one call): `/fail submit` leaves that review pending.
+  const stuck = how === 'submit' && mode === 'single' && subjectType === 'FILE'
+  const pending = mode === 'review' || stuck
   const review = pending ? (st.pendingReview ?? startReview(st, head)) : null
   const comment = newComment(st, body, review?.id ?? `PRR_mock_new${st.nextId++}`, pending)
   const lines = subjectType === 'LINE'
@@ -430,7 +432,7 @@ export function createThread(head: string, listed: (path: string) => boolean, ra
     body: {
       thread,
       pendingReview: st.pendingReview,
-      ...(how === 'submit' ? { submitError: 'Something went wrong while executing your query.' } : {}),
+      ...(stuck ? { submitError: 'Something went wrong while executing your query.' } : {}),
     },
   }
 }

@@ -1,6 +1,6 @@
 // Review threads as the page shows them: the last read from GitHub, plus what our own writes
 // returned since, plus optimistic resolve/unresolve. Read with `useSyncExternalStore`.
-import type { PendingReview, ReviewComment, ReviewThread, ReviewThreads } from './api'
+import type { DiffSide, PendingReview, ReviewComment, ReviewThread, ReviewThreads } from './api'
 
 export type SendResolved = (threadId: string, resolved: boolean) => Promise<ReviewThread>
 
@@ -198,15 +198,27 @@ export function ownCommentIds(threads: readonly ReviewThread[]): Set<string> {
  * the viewer's comment with the same body that wasn't there before, from a fresh read.
  * Creates are never retried blindly, so this is how a duplicate is avoided.
  */
+/** Where a comment was posted: in a thread, or as a new thread on a file or on lines. */
+export type CreatedWhere =
+  | { threadId: string }
+  | { path: string; subjectType: 'FILE' }
+  | { path: string; subjectType: 'LINE'; side: DiffSide; line: number }
+
+function isWhere(t: ReviewThread, where: CreatedWhere): boolean {
+  if ('threadId' in where) return t.id === where.threadId
+  if (t.path !== where.path || t.subjectType !== where.subjectType) return false
+  return where.subjectType === 'FILE' || (t.side === where.side && t.line === where.line)
+}
+
 export function findCreated(
   threads: readonly ReviewThread[],
   before: ReadonlySet<string>,
   body: string,
-  where: { threadId: string } | { path: string },
+  where: CreatedWhere,
 ): { thread: ReviewThread; comment: ReviewComment } | null {
   const want = body.trim()
   for (const thread of threads) {
-    if ('threadId' in where ? thread.id !== where.threadId : thread.path !== where.path) continue
+    if (!isWhere(thread, where)) continue
     for (const comment of thread.comments) {
       if (comment.viewerDidAuthor && !before.has(comment.id) && comment.body.trim() === want) return { thread, comment }
     }
