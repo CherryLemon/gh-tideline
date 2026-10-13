@@ -3,6 +3,7 @@
 // whose GitHub HTML carries script (must stay inert). Line numbers are looked up in the
 // fixture files so they follow edits to data.ts.
 import { fileLines } from './data.ts'
+import { XSS_BODY_HTML } from './xss.ts'
 
 type Side = 'LEFT' | 'RIGHT'
 
@@ -223,14 +224,7 @@ function initialState(head: string): MockState {
     {
       author: 'mallory',
       body: 'Looks fine <script>alert(1)</script>',
-      html:
-        '<p dir="auto">Looks fine</p><script>window.__xss = (window.__xss || 0) + 1</script>' +
-        '<img src="x" onerror="window.__xss = (window.__xss || 0) + 1">' +
-        '<a href="javascript:window.__xss=1">click</a> <a href="https://example.com/ok">ok link</a>' +
-        '<style>body { display: none }</style><form action="https://evil.example"><input name="q"></form>' +
-        '<iframe src="https://evil.example"></iframe><svg><script>window.__xss=1</script></svg>' +
-        '<p style="position:fixed;inset:0;background:red">overlay</p>' +
-        '<img src="data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=" alt="data image">',
+      html: XSS_BODY_HTML,
     },
   ])
 
