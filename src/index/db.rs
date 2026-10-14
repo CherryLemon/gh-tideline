@@ -93,9 +93,10 @@ pub enum BlobStatus {
     TooLarge,
     /// Could not be read.
     Unreadable,
-    /// Stored by a newer version under a status this one does not know. The blob is held, so it is not done again, but
-    /// nothing is known of its tags, so it is neither fetched for the lines of its references nor read for its header.
-    /// This version never writes it.
+    /// Stored by a newer version under a status this one does not know. The blob is held: a build lists it and does not
+    /// parse it again, but nothing is known of its tags, so a build does not prefetch it for the lines of its references
+    /// nor read it for its header. A lookup that finds a reference in it fetches it for the line as for any other blob,
+    /// and a request for its outline parses it, since the row is never replaced. This version never writes it.
     Held,
 }
 

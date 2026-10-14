@@ -114,8 +114,8 @@ fn select_files(entries: &[TreeEntry], max_files: usize) -> Result<Vec<TreeEntry
 }
 
 /// The grammar under which the index holds a blob for `path`, if it does: the one the extension names. A `.h` file
-/// has no such grammar, since it depends on the content, which is not at hand: any grammar of the C family will do, one
-/// whose row has tags before one that is `unreadable` (a stale one), and C before C++.
+/// has no such grammar, since it depends on the content, which is not at hand: any grammar of the C family will do, the
+/// one whose row says the most about the tags of the blob (see `rank`), and C before C++ among rows that say as much.
 fn held_grammar(path: &str, stored: &[(Grammar, BlobStatus)]) -> Option<Grammar> {
     match Grammar::for_path_only(path) {
         Some(grammar) => stored
@@ -125,9 +125,19 @@ fn held_grammar(path: &str, stored: &[(Grammar, BlobStatus)]) -> Option<Grammar>
         None => stored
             .iter()
             .filter(|(grammar, _)| grammar.family() == Family::C)
-            .map(|&(grammar, status)| (status == BlobStatus::Unreadable, grammar))
+            .map(|&(grammar, status)| (rank(status), grammar))
             .min()
             .map(|(_, grammar)| grammar),
+    }
+}
+
+/// How much the row of a blob says about its tags, the best first: `parsed` has them; `too_large` has none to be had,
+/// and `held` none that this version knows of; `unreadable` is a stale failure, which a build tries again.
+fn rank(status: BlobStatus) -> u8 {
+    match status {
+        BlobStatus::Parsed => 0,
+        BlobStatus::TooLarge | BlobStatus::Held => 1,
+        BlobStatus::Unreadable => 2,
     }
 }
 
@@ -177,7 +187,9 @@ fn without_unreadable(stored: &Stored) -> Stored {
 /// The blobs among `oids` that the repo lacks (`missing`) and a build fetches, in two lists: those it has to parse
 /// (`pending`), and those the index holds with their tags. A repo needs the latter for the lines of the references it
 /// finds in them, and a second clone of a repository, or one made anew, lacks what the index holds from the first. A
-/// blob too large to be parsed has no tags, so no references to read lines for.
+/// blob too large to be parsed has no tags, so no references to read lines for, and one that is held under a status
+/// this version does not know is not known to have any: a build leaves it, and a lookup that finds a reference in it
+/// fetches it for the line.
 fn to_fetch(
     oids: &[String],
     pending: &[Pending],
@@ -489,11 +501,11 @@ impl Build {
     }
 
     /// A `.h` file is C or C++ by its content, but the index only knows which grammars its blob is stored under, and
-    /// `settle` takes the first of the C family. Where there is a choice (the same content is parsed as C and as C++,
-    /// because it has other names) the content decides, if the grammar it names has the tags. The blobs are read a group
-    /// at a time, and only those that are local (`missing` lists the objects that are not, since the remote may not have
-    /// given a blob, or the fetch of a blob the index holds may have failed), whose size the index knows, and which are no
-    /// larger than it parses.
+    /// `settle` takes the one of the C family whose row says the most (see `held_grammar`). Where there is a choice (the
+    /// same content is parsed as C and as C++, because it has other names) the content decides, if the grammar it names
+    /// has the tags. The blobs are read a group at a time, and only those that are local (`missing` lists the objects
+    /// that are not, since the remote may not have given a blob, or the fetch of a blob the index holds may have
+    /// failed), whose size the index knows, and which are no larger than it parses.
     async fn headers_by_content(
         &self,
         listing: &mut Listing,
@@ -804,6 +816,53 @@ mod tests {
             held_grammar("a.c", &[unreadable_c, parsed_cpp]),
             Some(Grammar::C)
         );
+    }
+
+    #[test]
+    fn a_header_is_held_under_the_grammar_whose_row_has_the_tags_whatever_the_other_rows_say() {
+        let parsed_c = (Grammar::C, BlobStatus::Parsed);
+        let parsed_cpp = (Grammar::Cpp, BlobStatus::Parsed);
+        // A row without tags that are known (one a newer version stored under a status this one does not know, one that
+        // says the blob is too large, a stale `unreadable` one) must not take a header from the grammar it was parsed
+        // under, whichever of the two that is and in whatever order the rows come.
+        for other in [
+            BlobStatus::Held,
+            BlobStatus::TooLarge,
+            BlobStatus::Unreadable,
+        ] {
+            let (c, cpp) = ((Grammar::C, other), (Grammar::Cpp, other));
+            for rows in [[c, parsed_cpp], [parsed_cpp, c]] {
+                assert_eq!(held_grammar("a.h", &rows), Some(Grammar::Cpp), "{rows:?}");
+            }
+            for rows in [[parsed_c, cpp], [cpp, parsed_c]] {
+                assert_eq!(held_grammar("a.h", &rows), Some(Grammar::C), "{rows:?}");
+            }
+        }
+        // Between rows that have no tags, those of a stale failure come last; otherwise C comes first.
+        let held = |grammar| (grammar, BlobStatus::Held);
+        let too_large = |grammar| (grammar, BlobStatus::TooLarge);
+        let unreadable = |grammar| (grammar, BlobStatus::Unreadable);
+        let cases = [
+            ([held(Grammar::Cpp), held(Grammar::C)], Grammar::C),
+            ([held(Grammar::Cpp), too_large(Grammar::C)], Grammar::C),
+            ([too_large(Grammar::Cpp), held(Grammar::C)], Grammar::C),
+            ([unreadable(Grammar::C), held(Grammar::Cpp)], Grammar::Cpp),
+            (
+                [unreadable(Grammar::C), too_large(Grammar::Cpp)],
+                Grammar::Cpp,
+            ),
+        ];
+        for (rows, want) in cases {
+            assert_eq!(held_grammar("a.h", &rows), Some(want), "{rows:?}");
+        }
+
+        // So a build lists such a header where its tags are, and the content has no choice to make.
+        let files = vec![file("a.h", 1)];
+        let stored = stored_as(&[(1, &[(Grammar::C, BlobStatus::Held), parsed_cpp])]);
+        let (listing, pending_blobs) = settle(&files, &stored);
+        assert_eq!(listing, [("a.h".to_string(), oid(1), Grammar::Cpp)]);
+        assert!(pending_blobs.is_empty());
+        assert!(header_choices(&listing, &stored).is_empty());
     }
 
     #[test]

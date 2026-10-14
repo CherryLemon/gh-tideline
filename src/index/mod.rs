@@ -272,6 +272,11 @@ impl Indexer {
     /// Starts building the index of `commit`, unless it is complete already, or a job builds it (a second tab joins
     /// the first one's). A job that failed or was cancelled is replaced, and so is one that is being cancelled: the new
     /// job waits for its turn, which the old one gives up when it stops. `auth` is for fetching blobs.
+    ///
+    /// A commit that is complete is ready at once, without a job, so nothing lists it: the OIDs of its files are not
+    /// noted for the blob endpoint (see `Repo::remember_oids`), as a job notes them when it lists the commit. That is
+    /// no gap in what a page can ask for: the OIDs it has come with the listings that note them, the files of the pull
+    /// request and the tree of its head.
     pub async fn start(
         &self,
         repo: Arc<Repo>,

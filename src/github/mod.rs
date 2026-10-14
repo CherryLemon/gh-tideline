@@ -3,6 +3,8 @@
 mod review;
 
 use std::collections::HashMap;
+#[cfg(test)]
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use serde::de::DeserializeOwned;
@@ -22,10 +24,22 @@ const TOKEN_TTL: Duration = Duration::from_secs(600);
 #[derive(Default)]
 pub struct Tokens {
     cache: std::sync::Mutex<HashMap<String, (Instant, String)>>,
+    /// The hosts that `get` finds no token for, whatever the environment and `gh` hold.
+    #[cfg(test)]
+    denied: std::sync::Mutex<HashSet<String>>,
 }
 
 impl Tokens {
     pub async fn get(&self, host: &str) -> Result<String, AppError> {
+        #[cfg(test)]
+        if self
+            .denied
+            .lock()
+            .expect("token cache poisoned")
+            .contains(host)
+        {
+            return Err(no_token(host));
+        }
         if let Some((at, token)) = self.cache.lock().expect("token cache poisoned").get(host)
             && at.elapsed() < TOKEN_TTL
         {
@@ -47,6 +61,23 @@ impl Tokens {
             .expect("token cache poisoned")
             .insert(host.to_string(), (Instant::now(), token.to_string()));
     }
+
+    /// Makes `get` fail with `NoToken` for `host`, so that tests need neither `gh` without a login nor an environment
+    /// without `GH_ENTERPRISE_TOKEN` and `GITHUB_ENTERPRISE_TOKEN`.
+    #[cfg(test)]
+    pub(crate) fn deny(&self, host: &str) {
+        self.denied
+            .lock()
+            .expect("token cache poisoned")
+            .insert(host.to_string());
+    }
+}
+
+fn no_token(host: &str) -> AppError {
+    AppError::new(
+        ErrorCode::NoToken,
+        format!("no GitHub token for {host}; run `gh auth login --hostname {host}`"),
+    )
 }
 
 async fn resolve_token(host: &str) -> Result<String, AppError> {
@@ -62,22 +93,16 @@ async fn resolve_token(host: &str) -> Result<String, AppError> {
             return Ok(v.trim().to_string());
         }
     }
-    let no_token = || {
-        AppError::new(
-            ErrorCode::NoToken,
-            format!("no GitHub token for {host}; run `gh auth login --hostname {host}`"),
-        )
-    };
     let out = tokio::process::Command::new("gh")
         .args(["auth", "token", "--hostname", host])
         .stdin(std::process::Stdio::null())
         .kill_on_drop(true)
         .output()
         .await
-        .map_err(|_| no_token())?;
+        .map_err(|_| no_token(host))?;
     let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if !out.status.success() || token.is_empty() {
-        return Err(no_token());
+        return Err(no_token(host));
     }
     Ok(token)
 }

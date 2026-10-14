@@ -161,9 +161,9 @@ pub struct PrService {
     index: Option<Indexer>,
     /// The files whose parse timed out lately, so that they are not parsed again at once (see [`PrService::symbols`]).
     slow_parses: nav::SlowParses,
-    /// The blobs whose fetch for the lines of references failed lately, so that no lookup asks for them again at once
-    /// (see [`PrService::references`]).
-    fetch_failures: nav::FetchFailures,
+    /// The blobs that are being fetched for the lines of references, so that no other lookup asks for them, and those
+    /// whose fetch failed lately, so that none asks for them again at once (see [`PrService::references`]).
+    snippet_fetches: nav::SnippetFetches,
     /// How long a lookup waits for the blobs it fetches for those lines (see [`PrService::references`]).
     snippet_fetch_wait: Duration,
     cache: Mutex<HashMap<PrKey, CacheSlot>>,
@@ -186,7 +186,7 @@ impl PrService {
             state,
             index: index.map(|db| Indexer::new(db, Limits::default())),
             slow_parses: Default::default(),
-            fetch_failures: Default::default(),
+            snippet_fetches: Default::default(),
             snippet_fetch_wait: nav::SNIPPET_FETCH_WAIT,
             cache: Default::default(),
             bookkeeping: Default::default(),
@@ -568,13 +568,14 @@ impl PrService {
         }
     }
 
-    /// Tells the index builds to stop, waits for detached bookkeeping, then for the builds, then for
-    /// in-flight git work (see [`Repos::drain`]). The builds are told first: one that waits for the
-    /// repo lock that bookkeeping holds should not start fetching when it gets it. Bookkeeping still
-    /// running at the deadline is cancelled, so it cannot start git work that the repo drain no
-    /// longer waits for.
+    /// Tells the index builds and the fetches for the lines of references to stop, waits for detached
+    /// bookkeeping, then for the builds, then for in-flight git work (see [`Repos::drain`]). They are
+    /// told first: a build or a fetch that waits for the repo lock that bookkeeping holds should not
+    /// start fetching when it gets it. Bookkeeping still running at the deadline is cancelled, so it
+    /// cannot start git work that the repo drain no longer waits for.
     pub async fn drain(&self, timeout: Duration) {
         let deadline = tokio::time::Instant::now() + timeout;
+        self.snippet_fetches.shut_down();
         if let Some(index) = &self.index {
             index.shut_down();
         }

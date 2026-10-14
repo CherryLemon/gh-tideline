@@ -282,6 +282,28 @@ pub fn is_unfetched_object_error(stderr: &str) -> bool {
     })
 }
 
+/// The objects that the stderr of a failed `git fetch` says the remote refuses to give, in the order it names them and
+/// without repeats: `fatal: remote error: upload-pack: not our ref <oid>` (protocol v2, which stops at the first object
+/// it refuses) or `error: Server does not allow request for unadvertised object <oid>` (protocol v0, a line for each).
+pub fn refused_oids(stderr: &str) -> Vec<String> {
+    const MARKERS: [&str; 2] = [
+        "not our ref ",
+        "Server does not allow request for unadvertised object ",
+    ];
+    let mut refused: Vec<String> = Vec::new();
+    for line in stderr.lines() {
+        for marker in MARKERS {
+            let oid = line.rsplit_once(marker).map(|(_, oid)| oid.trim_end());
+            if let Some(oid) = oid.filter(|oid| is_oid(oid))
+                && !refused.iter().any(|seen| seen == oid)
+            {
+                refused.push(oid.to_string());
+            }
+        }
+    }
+    refused
+}
+
 /// The entries of `oids` that `listing` names, in the order of `oids` and with their repeats.
 /// `listing` is `git cat-file --batch-check=%(objectname) --batch-all-objects` output: one OID
 /// per line, in any order, repeats allowed.
@@ -814,6 +836,39 @@ mod tests {
             "fatal: could not fetch",
         ] {
             assert!(!is_unfetched_object_error(other), "{other:?}");
+        }
+    }
+
+    #[test]
+    fn the_objects_a_remote_refuses_are_named_in_the_stderr_of_a_fetch() {
+        // Captured from `git fetch --stdin` (git 2.43) for an object that a local remote lacks, under protocol v2: the
+        // server names the first object it refuses, once for itself and once as the client relays it; `run_git` trims
+        // the final newline.
+        let v2 = "fatal: git upload-pack: not our ref 1234567890123456789012345678901234567891\nfatal: remote error: upload-pack: not our ref 1234567890123456789012345678901234567891";
+        assert_eq!(
+            refused_oids(v2),
+            ["1234567890123456789012345678901234567891"]
+        );
+        // Captured under protocol v0 against a remote that allows no object that is not a tip: the client names them all.
+        let v0 = format!(
+            "error: Server does not allow request for unadvertised object {B}\nerror: Server does not allow request for unadvertised object {A}\nerror: Server does not allow request for unadvertised object {B}\n"
+        );
+        assert_eq!(refused_oids(&v0), [B, A]);
+        // Whatever precedes the message does not matter.
+        assert_eq!(
+            refused_oids(&format!("remote: error: upload-pack: not our ref {C} \n")),
+            [C]
+        );
+        for other in [
+            "",
+            "fatal: unable to access 'https://github.com/o/r.git/': Could not resolve host: github.com",
+            "fatal: remote error: upload-pack: not our ref HEAD",
+            "fatal: remote error: upload-pack: not our ref",
+            "fatal: remote error: upload-pack: not our ref 12345",
+            "fatal: remote error: upload-pack: not our ref 1234567890123456789012345678901234567891 and so on",
+            "fatal: could not fetch 1234567890123456789012345678901234567891 from promisor remote",
+        ] {
+            assert!(refused_oids(other).is_empty(), "{other:?}");
         }
     }
 

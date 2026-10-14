@@ -2,12 +2,14 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::AppError;
+use crate::git::parse::refused_oids;
 use crate::git::{GitAuth, Repo, STALL_INDEX};
 use crate::index::build::groups;
 use crate::index::db::{BlobStatus, Hit, IndexDb, NewBlob};
@@ -129,40 +131,128 @@ const FETCH_FAILURE_TTL: Duration = Duration::from_secs(120);
 /// How many such blobs are remembered at most; the oldest are forgotten first.
 const FETCH_FAILURES_KEPT: usize = 4096;
 
-/// When the fetch of a blob of a cache repo (by its git dir) for the lines of references last failed. Shared with the
-/// tasks that fetch, which outlive the lookups.
-#[derive(Clone, Default)]
-pub(super) struct FetchFailures(Arc<Mutex<HashMap<(PathBuf, String), Instant>>>);
+/// How many times the task of a lookup asks the remote when it refuses some of the blobs. A remote that speaks protocol
+/// v2 names the first blob it refuses and stops there, so the blobs it names are noted, and the others asked for again.
+const FETCH_ATTEMPTS: usize = 3;
 
-impl FetchFailures {
-    /// The blobs among `oids` of the repo at `git_dir` whose fetch did not fail less than `FETCH_FAILURE_TTL` before
-    /// `now`.
-    fn unfailed(&self, git_dir: &Path, oids: Vec<String>, now: Instant) -> Vec<String> {
-        let failed = self.0.lock().expect("fetch failures poisoned");
-        oids.into_iter()
+/// What the fetch of a blob for the lines of references has come to.
+enum Fetch {
+    /// A task fetches the blob, or waits for the repo lock to.
+    InFlight,
+    /// The fetch failed at that time.
+    Failed(Instant),
+}
+
+/// The blobs of the cache repos (by git dir) that tasks fetch for the lines of references, and those whose fetch failed
+/// lately. A blob is fetched by one task at a time, so lookups that want the same blobs do not queue a fetch each for the
+/// repo lock, which a build or a pull request that is loading may hold for long, ahead of the loads that come after.
+/// Shared with the tasks, which outlive the lookups that start them.
+#[derive(Clone, Default)]
+pub(super) struct SnippetFetches {
+    blobs: Arc<Mutex<HashMap<(PathBuf, String), Fetch>>>,
+    /// Set when the service shuts down (see [`PrService::drain`]): the tasks that have waited for the repo lock then
+    /// leave it without fetching.
+    shut_down: Arc<AtomicBool>,
+}
+
+impl SnippetFetches {
+    fn lock(&self) -> MutexGuard<'_, HashMap<(PathBuf, String), Fetch>> {
+        // A claim gives its blobs back when it is dropped, which a panic does too: the lock must not panic again then. A
+        // panic while it was held leaves nothing half done.
+        self.blobs.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Claims the blobs among `oids` of the repo at `git_dir` for a task to fetch: those that no task fetches and whose
+    /// fetch did not fail less than `FETCH_FAILURE_TTL` before `now`.
+    fn claim(&self, git_dir: &Path, oids: Vec<String>, now: Instant) -> Claim {
+        let mut blobs = self.lock();
+        let oids = oids
+            .into_iter()
             .filter(|oid| {
-                let at = failed.get(&(git_dir.to_path_buf(), oid.clone()));
-                at.is_none_or(|&at| now.saturating_duration_since(at) >= FETCH_FAILURE_TTL)
+                let key = (git_dir.to_path_buf(), oid.clone());
+                let free = match blobs.get(&key) {
+                    None => true,
+                    Some(Fetch::InFlight) => false,
+                    Some(&Fetch::Failed(at)) => {
+                        now.saturating_duration_since(at) >= FETCH_FAILURE_TTL
+                    }
+                };
+                if free {
+                    blobs.insert(key, Fetch::InFlight);
+                }
+                free
             })
-            .collect()
+            .collect();
+        Claim {
+            fetches: self.clone(),
+            git_dir: git_dir.to_path_buf(),
+            oids,
+        }
     }
 
     /// Notes that the fetch of the blobs of the repo at `git_dir` failed at `now`. The notes that have expired are
-    /// dropped, and when more than `FETCH_FAILURES_KEPT` are left, the oldest of them too.
+    /// dropped, and when more than `FETCH_FAILURES_KEPT` are left, the oldest of them too. The blobs that are being
+    /// fetched are not notes, and stay.
     fn note(&self, git_dir: &Path, oids: &[String], now: Instant) {
-        let mut failed = self.0.lock().expect("fetch failures poisoned");
-        failed.retain(|_, at| now.saturating_duration_since(*at) < FETCH_FAILURE_TTL);
+        let mut blobs = self.lock();
+        blobs.retain(|_, fetch| match fetch {
+            Fetch::InFlight => true,
+            Fetch::Failed(at) => now.saturating_duration_since(*at) < FETCH_FAILURE_TTL,
+        });
         for oid in oids {
-            failed.insert((git_dir.to_path_buf(), oid.clone()), now);
+            blobs.insert((git_dir.to_path_buf(), oid.clone()), Fetch::Failed(now));
         }
-        if failed.len() > FETCH_FAILURES_KEPT {
-            let mut by_age: Vec<(Instant, (PathBuf, String))> =
-                failed.iter().map(|(key, &at)| (at, key.clone())).collect();
+        let noted = blobs
+            .values()
+            .filter(|fetch| matches!(fetch, Fetch::Failed(_)))
+            .count();
+        if noted > FETCH_FAILURES_KEPT {
+            let mut by_age: Vec<(Instant, (PathBuf, String))> = blobs
+                .iter()
+                .filter_map(|(key, fetch)| match fetch {
+                    Fetch::Failed(at) => Some((*at, key.clone())),
+                    Fetch::InFlight => None,
+                })
+                .collect();
             by_age.sort();
-            let surplus = failed.len() - FETCH_FAILURES_KEPT;
-            for (_, key) in by_age.into_iter().take(surplus) {
-                failed.remove(&key);
+            for (_, key) in by_age.into_iter().take(noted - FETCH_FAILURES_KEPT) {
+                blobs.remove(&key);
             }
+        }
+    }
+
+    /// From now on the tasks that fetch do not start git (see [`PrService::drain`]).
+    pub(super) fn shut_down(&self) {
+        self.shut_down.store(true, Ordering::SeqCst);
+    }
+
+    fn is_shut_down(&self) -> bool {
+        self.shut_down.load(Ordering::SeqCst)
+    }
+}
+
+/// The blobs that one task fetches. Dropping the claim, whichever way the task ends (a lookup that is dropped before
+/// it spawned the task, a panic, no repo lock to be had), gives back the ones it still holds.
+struct Claim {
+    fetches: SnippetFetches,
+    git_dir: PathBuf,
+    /// The blobs that the task has not given up.
+    oids: Vec<String>,
+}
+
+impl Claim {
+    /// Gives up the blobs among `failed`, and notes that their fetch failed at `now`.
+    fn fail(&mut self, failed: &[String], now: Instant) {
+        self.oids.retain(|oid| !failed.contains(oid));
+        self.fetches.note(&self.git_dir, failed, now);
+    }
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        let mut blobs = self.fetches.lock();
+        for oid in &self.oids {
+            blobs.remove(&(self.git_dir.clone(), oid.clone()));
         }
     }
 }
@@ -275,7 +365,11 @@ impl PrService {
                     return Ok(outline(Vec::new()));
                 }
                 // Not stored yet, or left unreadable by a build that could not fetch the blob or parse it in time (a
-                // parse that works now replaces such a row), or held by a newer version, whose tags are not known.
+                // parse that works now replaces such a row). Or held by a newer version, whose tags are not known, so
+                // not served: the row stays as it is (see `IndexDb::insert_blobs`), and every request for the outline
+                // parses the blob again. That costs a parse of at most `MAX_BLOB_BYTES` each, for a blob that a newer
+                // version of the server stored in the database they share; one that takes too long is not tried again
+                // at once (see `SLOW_PARSE_TTL`).
                 _ => {}
             }
         }
@@ -549,8 +643,10 @@ impl PrService {
             .cloned()
             .collect();
         if !lacking.is_empty() {
-            // A fetch gives all the blobs it asks for or fails, so the others stay missing: those it was not made for,
-            // because their fetch failed lately, or that did not come in time.
+            // A git fetch of blobs by their OIDs gives all it asks for or fails, so the blobs a task reports it fetched
+            // are local and need no second listing of the objects the repo lacks (a build lists them again, since it goes
+            // on after a fetch of blobs that failed). The others stay missing: those no task fetched for this lookup,
+            // because another one has them in flight or their fetch failed lately, and those that did not come in time.
             for oid in self.fetch_for_snippets(key, lacking).await {
                 missing.remove(&oid);
             }
@@ -619,16 +715,18 @@ impl PrService {
     /// Fetches blobs the cache repo lacks, for the snippets of a lookup, and returns those it fetched in time. It is best
     /// effort: a lookup without lines is better than none, so no token, a remote that cannot be reached or one that does
     /// not give the blobs only costs the lines (and is told on stderr), and so does a blob whose fetch failed lately (see
-    /// `FETCH_FAILURE_TTL`). The lookup waits `snippet_fetch_wait` at most: the fetch is made by a task of its own, which
-    /// goes on after that, so that a later lookup finds the blobs. It needs the repo lock, which a build or a pull request
-    /// that is loading may hold for long, and gives up on a transfer that stays under 1 kB/s for `STALL_INDEX`.
+    /// `FETCH_FAILURE_TTL`) or that another lookup is fetching: one task fetches a blob at a time, and the lookups that
+    /// come meanwhile answer without its lines. The lookup waits `snippet_fetch_wait` at most: the fetch is made by a
+    /// task of its own, which goes on after that, so that a later lookup finds the blobs. It needs the repo lock, which a
+    /// build or a pull request that is loading may hold for long, and gives up on a transfer that stays under 1 kB/s for
+    /// `STALL_INDEX`.
     async fn fetch_for_snippets(&self, key: &PrKey, oids: Vec<String>) -> Vec<String> {
         let repo = self.repos.repo(&key.host, &key.owner, &key.repo);
-        let oids = self
-            .fetch_failures
-            .unfailed(&repo.git_dir, oids, Instant::now());
-        if oids.is_empty() {
-            return oids;
+        let claim = self
+            .snippet_fetches
+            .claim(&repo.git_dir, oids, Instant::now());
+        if claim.oids.is_empty() {
+            return Vec::new();
         }
         let token = match self.tokens.get(&key.host).await {
             Ok(token) => token,
@@ -643,8 +741,7 @@ impl PrService {
             host: key.host.clone(),
             token,
         };
-        let failures = self.fetch_failures.clone();
-        let task = tokio::spawn(fetch_under_lock(repo, auth, oids, failures));
+        let task = tokio::spawn(fetch_under_lock(repo, auth, claim));
         match tokio::time::timeout(self.snippet_fetch_wait, task).await {
             Ok(Ok(fetched)) => fetched,
             Ok(Err(e)) => {
@@ -664,15 +761,11 @@ impl PrService {
     }
 }
 
-/// The task that fetches the blobs for `PrService::fetch_for_snippets`, and returns the ones it fetched. It owns the repo
-/// lock, so that a lookup that is dropped, or has stopped waiting, does not leave git running without it. A blob whose
-/// fetch failed while the task waited for the lock is not asked for, and one whose fetch fails now is noted.
-async fn fetch_under_lock(
-    repo: Repo,
-    auth: GitAuth,
-    oids: Vec<String>,
-    failures: FetchFailures,
-) -> Vec<String> {
+/// The task that fetches the blobs of a claim for `PrService::fetch_for_snippets`, and returns the ones it fetched. It
+/// owns the repo lock, so that a lookup that is dropped, or has stopped waiting, does not leave git running without it.
+/// When the fetch fails, the blobs that the remote names as refused are noted, and the others are asked for again; if it
+/// names none, they are all noted. The claim gives back the blobs that are not noted when the task ends.
+async fn fetch_under_lock(repo: Repo, auth: GitAuth, mut claim: Claim) -> Vec<String> {
     let guard = match repo.lock().await {
         Ok(guard) => guard,
         Err(e) => {
@@ -682,18 +775,38 @@ async fn fetch_under_lock(
             return Vec::new();
         }
     };
-    let oids = failures.unfailed(&repo.git_dir, oids, Instant::now());
-    if oids.is_empty() {
-        return oids;
+    // The lock may have been held for a long time, by a build or a pull request that was loading, and the service may
+    // be shutting down by now: like a chunk of a build (see `Build::fetch_chunk`), the task does not start git then.
+    if claim.fetches.is_shut_down() {
+        return Vec::new();
     }
-    match repo.fetch_blobs(&guard, &auth, &oids, STALL_INDEX).await {
-        Ok(()) => oids,
-        Err(e) => {
-            eprintln!("gh-tideline: fetching the blobs for the snippets of references failed: {e}");
-            failures.note(&repo.git_dir, &oids, Instant::now());
-            Vec::new()
+    for _ in 0..FETCH_ATTEMPTS {
+        let failure = match repo
+            .fetch_blobs(&guard, &auth, &claim.oids, STALL_INDEX)
+            .await
+        {
+            Ok(()) => return claim.oids.clone(),
+            Err(failure) => failure,
+        };
+        eprintln!(
+            "gh-tideline: fetching the blobs for the snippets of references failed: {failure}"
+        );
+        let refused: Vec<String> = refused_oids(&failure.stderr)
+            .into_iter()
+            .filter(|oid| claim.oids.contains(oid))
+            .collect();
+        // A remote that does not say which blobs it refuses gives no blob that is known to be fine.
+        let failed = if refused.is_empty() {
+            claim.oids.clone()
+        } else {
+            refused
+        };
+        claim.fail(&failed, Instant::now());
+        if claim.oids.is_empty() {
+            return Vec::new();
         }
     }
+    Vec::new()
 }
 
 #[cfg(test)]
@@ -2133,6 +2246,16 @@ pub fn twice() {
         ]
     }
 
+    /// How many blobs are being fetched, and how many have a note of a fetch that failed.
+    fn in_flight_and_failed(fetches: &SnippetFetches) -> (usize, usize) {
+        let blobs = fetches.lock();
+        let in_flight = blobs
+            .values()
+            .filter(|fetch| matches!(fetch, Fetch::InFlight))
+            .count();
+        (in_flight, blobs.len() - in_flight)
+    }
+
     #[tokio::test]
     async fn a_lookup_that_cannot_fetch_the_blobs_answers_without_lines_and_does_not_try_again_for_a_while()
      {
@@ -2150,10 +2273,11 @@ pub fn twice() {
         let git_dir = &p.clone.repo.git_dir;
         git_in(git_dir, &["config", "remote.origin.url", &gone]).await;
         let got = p.references(Side::Head, "a.rs", "target").await.unwrap();
-        // Not an error: the references are where the index says, without their lines.
+        // Not an error: the references are where the index says, without their lines. A remote that does not name the
+        // blobs it refuses (this one is not there at all) leaves none of them known to be fine.
         assert_eq!(got.hits, target_hits(false));
         assert_eq!(p.clone.repo.missing_objects(&head).await.unwrap(), before);
-        assert_eq!(p.service.fetch_failures.0.lock().unwrap().len(), 2);
+        assert_eq!(in_flight_and_failed(&p.service.snippet_fetches), (0, 2));
 
         // The failure is remembered: with the remote back, the next lookup does not ask for the blobs again, so it does
         // not hold the repo for a fetch that most likely fails again.
@@ -2167,62 +2291,136 @@ pub fn twice() {
         assert_eq!(p.clone.repo.missing_objects(&head).await.unwrap(), before);
 
         // When the notes have expired, the next lookup tries again, and has the lines.
-        p.service.fetch_failures.0.lock().unwrap().clear();
+        p.service.snippet_fetches.lock().clear();
         let got = p.references(Side::Head, "a.rs", "target").await.unwrap();
         assert_eq!(got.hits, target_hits(true));
-        assert!(p.service.fetch_failures.0.lock().unwrap().is_empty());
+        assert_eq!(in_flight_and_failed(&p.service.snippet_fetches), (0, 0));
     }
 
     #[test]
     fn the_notes_of_failed_fetches_expire_and_are_capped() {
-        let failures = FetchFailures::default();
+        let fetches = SnippetFetches::default();
         let (repo, other) = (Path::new("/cache/a.git"), Path::new("/cache/b.git"));
         let oid = |n: usize| format!("{n:040x}");
-        let failed = |repo: &Path, n: usize, at: Instant| {
-            failures.unfailed(repo, vec![oid(n)], at).is_empty()
+        // Whether a task can claim the blob at `at`, which it cannot while its fetch has failed lately. The claim is
+        // dropped at once, so that a blob that was free stays so.
+        let free = |repo: &Path, n: usize, at: Instant| {
+            !fetches.claim(repo, vec![oid(n)], at).oids.is_empty()
         };
-        let len = || failures.0.lock().unwrap().len();
+        let len = || fetches.lock().len();
         let now = Instant::now();
-        failures.note(repo, &[oid(1), oid(2)], now);
-        assert!(failed(repo, 1, now) && failed(repo, 2, now));
+        fetches.note(repo, &[oid(1), oid(2)], now);
+        assert!(!free(repo, 1, now) && !free(repo, 2, now));
         // Another blob has not failed, and neither has the same blob of another repo.
-        assert!(!failed(repo, 3, now));
-        assert!(!failed(other, 1, now));
+        assert!(free(repo, 3, now));
+        assert!(free(other, 1, now));
         assert_eq!(
-            failures.unfailed(repo, vec![oid(3), oid(1), oid(4)], now),
+            fetches.claim(repo, vec![oid(3), oid(1), oid(4)], now).oids,
             [oid(3), oid(4)]
         );
+        assert_eq!(len(), 2);
         // The note holds for `FETCH_FAILURE_TTL`.
         let almost = now + FETCH_FAILURE_TTL - Duration::from_secs(1);
-        assert!(failed(repo, 1, almost));
+        assert!(!free(repo, 1, almost));
         let expired = now + FETCH_FAILURE_TTL;
-        assert!(!failed(repo, 1, expired));
+        assert!(free(repo, 1, expired));
 
         // Noting another blob drops the notes that have expired.
-        failures.note(repo, &[oid(3)], expired);
+        fetches.note(repo, &[oid(3)], expired);
         assert_eq!(len(), 1);
 
         // At most `FETCH_FAILURES_KEPT` are kept, and the oldest go first, whichever repo they are of.
         let at = |n: usize| expired + Duration::from_millis(n as u64);
         for n in 0..FETCH_FAILURES_KEPT + 10 {
-            failures.note(other, &[oid(100 + n)], at(n));
+            fetches.note(other, &[oid(100 + n)], at(n));
         }
         assert_eq!(len(), FETCH_FAILURES_KEPT);
         let last = FETCH_FAILURES_KEPT + 9;
-        assert!(!failed(repo, 3, at(last)));
-        assert!(!failed(other, 100, at(last)));
-        assert!(failed(other, 110, at(last)));
-        assert!(failed(other, 100 + last, at(last)));
+        assert!(free(repo, 3, at(last)));
+        assert!(free(other, 100, at(last)));
+        assert!(!free(other, 110, at(last)));
+        assert!(!free(other, 100 + last, at(last)));
 
         // Noting a blob again only renews its note: nothing else goes. And the blobs of one fetch are capped together.
-        failures.note(other, &[oid(110)], at(last + 1));
+        fetches.note(other, &[oid(110)], at(last + 1));
         assert_eq!(len(), FETCH_FAILURES_KEPT);
-        assert!(failed(other, 111, at(last + 1)));
+        assert!(!free(other, 111, at(last + 1)));
         let batch: Vec<String> = (0..FETCH_FAILURES_KEPT + 10)
             .map(|n| oid(10_000 + n))
             .collect();
-        failures.note(other, &batch, at(last + 2));
+        fetches.note(other, &batch, at(last + 2));
         assert_eq!(len(), FETCH_FAILURES_KEPT);
+    }
+
+    #[test]
+    fn a_blob_is_claimed_by_one_task_at_a_time_and_given_back_when_the_claim_ends() {
+        let fetches = SnippetFetches::default();
+        let (repo, other) = (Path::new("/cache/a.git"), Path::new("/cache/b.git"));
+        let oid = |n: usize| format!("{n:040x}");
+        let now = Instant::now();
+
+        let mut first = fetches.claim(repo, vec![oid(1), oid(2)], now);
+        assert_eq!(first.oids, [oid(1), oid(2)]);
+        // What a task fetches is left to it: another claim gets the blobs that are not in flight, once each. The same
+        // blob of another repo is another blob.
+        let second = fetches.claim(repo, vec![oid(2), oid(3), oid(3)], now);
+        assert_eq!(second.oids, [oid(3)]);
+        let third = fetches.claim(other, vec![oid(1)], now);
+        assert_eq!(third.oids, [oid(1)]);
+        assert_eq!(in_flight_and_failed(&fetches), (4, 0));
+        assert!(fetches.claim(repo, vec![oid(1)], now).oids.is_empty());
+
+        // A claim gives its blobs back when it is dropped, whatever became of them.
+        drop(second);
+        assert_eq!(in_flight_and_failed(&fetches), (3, 0));
+        assert_eq!(fetches.claim(repo, vec![oid(3)], now).oids, [oid(3)]);
+
+        // A blob the task gave up because its fetch failed is a note, and stays one when the claim ends.
+        first.fail(&[oid(1)], now);
+        assert_eq!(first.oids, [oid(2)]);
+        assert_eq!(in_flight_and_failed(&fetches), (2, 1));
+        drop(first);
+        assert_eq!(in_flight_and_failed(&fetches), (1, 1));
+        assert!(fetches.claim(repo, vec![oid(1)], now).oids.is_empty());
+
+        // The blobs in flight are not notes: they neither expire nor count against the cap, and are not forgotten when
+        // notes are.
+        let later = now + FETCH_FAILURE_TTL;
+        let batch: Vec<String> = (0..FETCH_FAILURES_KEPT + 10)
+            .map(|n| oid(10_000 + n))
+            .collect();
+        fetches.note(repo, &batch, later);
+        assert_eq!(
+            in_flight_and_failed(&fetches),
+            (1, FETCH_FAILURES_KEPT),
+            "the note of blob 1 has expired, and the blob in flight stays"
+        );
+        assert!(fetches.claim(other, vec![oid(1)], later).oids.is_empty());
+        drop(third);
+        assert_eq!(in_flight_and_failed(&fetches), (0, FETCH_FAILURES_KEPT));
+    }
+
+    #[test]
+    fn a_task_that_panics_gives_back_its_blobs_even_when_it_poisoned_the_lock() {
+        let fetches = SnippetFetches::default();
+        let repo = Path::new("/cache/a.git");
+        let oid = |n: usize| format!("{n:040x}");
+        let now = Instant::now();
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _claim = fetches.claim(repo, vec![oid(1), oid(2)], now);
+            assert_eq!(in_flight_and_failed(&fetches), (2, 0));
+            // The panic comes while the lock is held, which poisons it; the claim is dropped while it unwinds, and
+            // must not panic in turn.
+            let _blobs = fetches.lock();
+            panic!("the task panics");
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(in_flight_and_failed(&fetches), (0, 0));
+        assert_eq!(
+            fetches.claim(repo, vec![oid(1), oid(2)], now).oids,
+            [oid(1), oid(2)]
+        );
     }
 
     #[tokio::test]
@@ -2247,26 +2445,133 @@ pub fn twice() {
             .unwrap();
         assert_eq!(got.hits, target_hits(false));
         assert_eq!(p.clone.repo.missing_objects(&head).await.unwrap(), before);
-        // A fetch that has not come yet has not failed.
-        assert!(p.service.fetch_failures.0.lock().unwrap().is_empty());
+        // A fetch that has not come yet has not failed: the blobs are in flight, and noted as nothing else.
+        assert_eq!(in_flight_and_failed(&p.service.snippet_fetches), (2, 0));
 
         // The task of the lookup goes on: when the repo is free, it gets the blobs for a later lookup.
         drop(guard);
         drop(repo.lock().await.unwrap());
         let after = p.clone.repo.missing_objects(&head).await.unwrap();
         assert!(files.iter().all(|(_, oid, _)| !after.contains(oid)));
+        assert_eq!(in_flight_and_failed(&p.service.snippet_fetches), (0, 0));
         let got = p.references(Side::Head, "a.rs", "target").await.unwrap();
         assert_eq!(got.hits, target_hits(true));
     }
 
     #[tokio::test]
-    async fn a_fetch_that_waited_for_the_repo_leaves_out_the_blobs_that_failed_meanwhile() {
+    async fn lookups_for_blobs_that_are_in_flight_start_no_second_fetch_for_the_repo_lock() {
         let sources = TARGET_SOURCES;
         let mut p =
-            Pull::with_files("nav-fetch-skips", &[("old.rs", "fn old() {}\n")], &sources).await;
+            Pull::with_files("nav-fetch-merged", &[("old.rs", "fn old() {}\n")], &sources).await;
         let head = p.clone.head.clone();
         let files = stored_by_another_clone(&p, &sources).await;
         p.db.save_commit(&head, &files).unwrap();
+        Arc::get_mut(&mut p.service).unwrap().snippet_fetch_wait = Duration::from_millis(100);
+        let tasks = || {
+            tokio::runtime::Handle::current()
+                .metrics()
+                .num_alive_tasks()
+        };
+        let fetches = &p.service.snippet_fetches;
+
+        // A pull request that is loading holds the repo, and the fetch of the first lookup waits for it. The lookup
+        // stops waiting for it: the task that fetches is alive and queued for the lock.
+        let repo = p.service.repos.repo("github.com", "o", "r");
+        let guard = repo.lock().await.unwrap();
+        let idle = tasks();
+        let got = p.references(Side::Head, "a.rs", "target").await.unwrap();
+        assert_eq!(got.hits, target_hits(false));
+        assert_eq!(tasks(), idle + 1);
+        assert_eq!(in_flight_and_failed(fetches), (2, 0));
+
+        // The lookups that come meanwhile find the blobs in flight, and answer without their lines at once. They queue
+        // no fetch of their own, which would wait for the same lock ahead of the loads that come after.
+        let (second, third) = tokio::join!(
+            p.references(Side::Head, "a.rs", "target"),
+            p.references(Side::Head, "a.rs", "target"),
+        );
+        assert_eq!(second.unwrap().hits, target_hits(false));
+        assert_eq!(third.unwrap().hits, target_hits(false));
+        assert_eq!(tasks(), idle + 1);
+        assert_eq!(in_flight_and_failed(fetches), (2, 0));
+
+        // The one fetch gets both blobs when the repo is free, and the blobs are not in flight any more.
+        drop(guard);
+        drop(repo.lock().await.unwrap());
+        let after = p.clone.repo.missing_objects(&head).await.unwrap();
+        assert!(files.iter().all(|(_, oid, _)| !after.contains(oid)));
+        assert_eq!(tasks(), idle);
+        assert_eq!(in_flight_and_failed(fetches), (0, 0));
+        let got = p.references(Side::Head, "a.rs", "target").await.unwrap();
+        assert_eq!(got.hits, target_hits(true));
+    }
+
+    #[tokio::test]
+    async fn a_blob_the_remote_refuses_is_noted_alone_and_the_others_are_fetched() {
+        let sources = TARGET_SOURCES;
+        let p = Pull::with_files(
+            "nav-fetch-refused",
+            &[("old.rs", "fn old() {}\n")],
+            &sources,
+        )
+        .await;
+        let head = p.clone.head.clone();
+        let files = stored_by_another_clone(&p, &sources).await;
+        p.db.save_commit(&head, &files).unwrap();
+        let (a_rs, b_rs) = (files[0].1.clone(), files[1].1.clone());
+        let fetches = &p.service.snippet_fetches;
+        let git_dir = &p.clone.repo.git_dir;
+
+        // The source repo lost the blob of a.rs, a loose object, and says so when a fetch asks for it.
+        let loose = (p.clone.origin.join(".git/objects"))
+            .join(&a_rs[..2])
+            .join(&a_rs[2..]);
+        let lost = std::fs::read(&loose).unwrap();
+        std::fs::remove_file(&loose).unwrap();
+
+        // Only b.rs has its line: the fetch for both blobs fails, and the lookup does not give up on the other blob,
+        // which it asks for again.
+        let [from_a, mut from_b] = target_hits(false);
+        from_b.snippet = "target();".to_string();
+        from_b.snippet_column = 1;
+        let without_a = [from_a, from_b];
+        let got = p.references(Side::Head, "a.rs", "target").await.unwrap();
+        assert_eq!(got.hits, without_a);
+        let after = p.clone.repo.missing_objects(&head).await.unwrap();
+        assert_eq!(after, HashSet::from([a_rs.clone()]));
+        // The blob that was refused is the only one noted.
+        assert_eq!(in_flight_and_failed(fetches), (0, 1));
+        let claim = fetches.claim(git_dir, vec![a_rs.clone(), b_rs.clone()], Instant::now());
+        assert_eq!(claim.oids, [b_rs]);
+        drop(claim);
+
+        // The note holds: with the blob back, the next lookup does not ask for it.
+        std::fs::write(&loose, lost).unwrap();
+        let got = p.references(Side::Head, "a.rs", "target").await.unwrap();
+        assert_eq!(got.hits, without_a);
+        assert_eq!(p.clone.repo.missing_objects(&head).await.unwrap(), after);
+
+        // When the note has expired, it does.
+        fetches.lock().clear();
+        let got = p.references(Side::Head, "a.rs", "target").await.unwrap();
+        assert_eq!(got.hits, target_hits(true));
+        assert_eq!(in_flight_and_failed(fetches), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn a_fetch_that_waited_for_the_repo_does_not_start_git_once_the_service_shuts_down() {
+        let sources = TARGET_SOURCES;
+        let mut p = Pull::with_files(
+            "nav-fetch-shutdown",
+            &[("old.rs", "fn old() {}\n")],
+            &sources,
+        )
+        .await;
+        let head = p.clone.head.clone();
+        let files = stored_by_another_clone(&p, &sources).await;
+        p.db.save_commit(&head, &files).unwrap();
+        let before = p.clone.repo.missing_objects(&head).await.unwrap();
+        assert!(files.iter().all(|(_, oid, _)| before.contains(oid)));
         Arc::get_mut(&mut p.service).unwrap().snippet_fetch_wait = Duration::from_millis(100);
 
         // The lookup stops waiting for the repo, which is held; its fetch of both blobs waits for it.
@@ -2274,23 +2579,27 @@ pub fn twice() {
         let guard = repo.lock().await.unwrap();
         let got = p.references(Side::Head, "a.rs", "target").await.unwrap();
         assert_eq!(got.hits, target_hits(false));
-        // Meanwhile the fetch of another lookup has failed on the blob of a.rs.
-        let (a_rs, b_rs) = (files[0].1.clone(), files[1].1.clone());
-        let failures = &p.service.fetch_failures;
-        failures.note(&repo.git_dir, std::slice::from_ref(&a_rs), Instant::now());
-        drop(guard);
-        drop(repo.lock().await.unwrap());
+        assert_eq!(in_flight_and_failed(&p.service.snippet_fetches), (2, 0));
 
-        // The first fetch got the blob of b.rs only. A lookup that comes now asks for no other.
-        let after = p.clone.repo.missing_objects(&head).await.unwrap();
-        assert_eq!(after, HashSet::from([a_rs]));
-        let got = p.references(Side::Head, "a.rs", "target").await.unwrap();
-        let [from_a, mut from_b] = target_hits(false);
-        from_b.snippet = "target();".to_string();
-        from_b.snippet_column = 1;
-        assert_eq!(got.hits, [from_a, from_b]);
-        assert_eq!(p.clone.repo.missing_objects(&head).await.unwrap(), after);
-        assert!(!after.contains(&b_rs));
+        // The server shuts down: it tells the fetches, and waits for the repo, which is held.
+        let service = p.service.clone();
+        let drain = tokio::spawn(async move { service.drain(Duration::from_secs(60)).await });
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while !p.service.snippet_fetches.is_shut_down() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the drain told the fetches that the service shuts down");
+
+        // The fetch gets the repo, and leaves it as it was.
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(60), drain)
+            .await
+            .expect("the service drained")
+            .unwrap();
+        assert_eq!(p.clone.repo.missing_objects(&head).await.unwrap(), before);
+        assert_eq!(in_flight_and_failed(&p.service.snippet_fetches), (0, 0));
     }
 
     #[tokio::test]
@@ -2316,19 +2625,22 @@ pub fn twice() {
                 _ = gate.begun() => {}
             }
         }
-        // The task that fetches still owns the repo lock, so nothing else touches the repo while git runs.
+        // The task that fetches still owns the repo lock, so nothing else touches the repo while git runs, and the blobs
+        // it fetches are still its own.
         let repo = p.service.repos.repo("github.com", "o", "r");
         let waited = tokio::time::timeout(Duration::from_millis(200), repo.lock()).await;
         assert!(
             waited.is_err(),
             "the repo was free while a fetch was under way"
         );
+        assert_eq!(in_flight_and_failed(&p.service.snippet_fetches), (2, 0));
 
-        // The fetch ends, and the lock is let go.
+        // The fetch ends, and the lock is let go, and the blobs with it.
         gate.open();
         drop(repo.lock().await.unwrap());
         let after = p.clone.repo.missing_objects(&head).await.unwrap();
         assert!(files.iter().all(|(_, oid, _)| !after.contains(oid)));
+        assert_eq!(in_flight_and_failed(&p.service.snippet_fetches), (0, 0));
         let got = p.references(Side::Head, "a.rs", "target").await.unwrap();
         assert_eq!(got.hits, target_hits(true));
     }
@@ -2351,15 +2663,13 @@ pub fn twice() {
         };
         let p = Pull { key, ..p };
         p.at(&head).await;
-        assert!(
-            p.service.tokens.get("ghe.invalid").await.is_err(),
-            "the test needs a host without a token: unset GH_ENTERPRISE_TOKEN and GITHUB_ENTERPRISE_TOKEN"
-        );
+        // Whatever the environment and `gh` hold for the host.
+        p.service.tokens.deny("ghe.invalid");
 
         let got = p.references(Side::Head, "a.rs", "target").await.unwrap();
         assert_eq!(got.hits, target_hits(false));
         assert_eq!(p.clone.repo.missing_objects(&head).await.unwrap(), before);
-        // Having no token is no failure of a blob.
-        assert!(p.service.fetch_failures.0.lock().unwrap().is_empty());
+        // Having no token is no failure of a blob, and leaves none of them claimed.
+        assert_eq!(in_flight_and_failed(&p.service.snippet_fetches), (0, 0));
     }
 }
