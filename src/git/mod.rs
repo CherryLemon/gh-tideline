@@ -85,6 +85,15 @@ const PASS_ENV: &[&str] = &[
 /// Mode for every directory under the cache and config dirs.
 pub const PRIVATE_DIR_MODE: u32 = 0o700;
 
+/// How long a fetch may stay under 1 kB/s before git gives up on it (`http.lowSpeed*`). Git is never killed, so a
+/// fetch that hangs would hold the repo lock for ever. The index build and the lookups that fetch for it give up
+/// after a minute, so that a cancel waits that long at most for a fetch that is stuck.
+pub const STALL_INDEX: Duration = Duration::from_secs(60);
+
+/// The same for what opening a pull request fetches (its commits, its files, a file read lazily): GitHub may take
+/// longer than a minute to prepare the pack of a huge pull request, and sends nothing but keepalives meanwhile.
+pub const STALL_PR: Duration = Duration::from_secs(300);
+
 /// Creates `dir` (and missing parents) with mode 0700, and chmods it to 0700 if it exists.
 pub fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::DirBuilder::new()
@@ -395,6 +404,21 @@ impl Repo {
         run_git(Some(&self.git_dir), auth, args, stdin).await
     }
 
+    /// [`Repo::git`] for a run that may fetch: a transfer that stays under 1 kB/s for `stall` is given up on
+    /// (`http.lowSpeed*`). A `file://` remote ignores that, so the tests cannot see it work.
+    async fn git_stalling(
+        &self,
+        stall: Duration,
+        auth: Option<&GitAuth>,
+        args: &[&str],
+        stdin: Option<Vec<u8>>,
+    ) -> Result<Vec<u8>, GitFailure> {
+        let time = format!("http.lowSpeedTime={}", stall.as_secs());
+        let mut guarded = vec!["-c", "http.lowSpeedLimit=1000", "-c", &time];
+        guarded.extend_from_slice(args);
+        self.git(auth, &guarded, stdin).await
+    }
+
     /// Takes the repo lock (creating the repo if needed): the tokio mutex, then an exclusive
     /// flock shared with other gh-tideline processes. Then removes stale git lock files and, once
     /// per process, hardens the repo's permissions.
@@ -514,8 +538,8 @@ impl Repo {
         ))
     }
 
-    /// Step 3: shallow, blob-less fetch of the merge base and head into PR refs.
-    /// `merge_base` and `head` must have been validated with [`is_oid`].
+    /// Step 3: shallow, blob-less fetch of the merge base and head into PR refs, given up on after [`STALL_PR`]
+    /// of a stalled transfer. `merge_base` and `head` must have been validated with [`is_oid`].
     pub async fn fetch_commits(
         &self,
         _guard: &RepoGuard,
@@ -526,7 +550,8 @@ impl Repo {
     ) -> Result<(), GitFailure> {
         let base_spec = format!("+{merge_base}:refs/dr/pull/{number}/base");
         let head_spec = format!("+{head}:refs/dr/pull/{number}/head");
-        self.git(
+        self.git_stalling(
+            STALL_PR,
             Some(auth),
             &[
                 "fetch",
@@ -618,28 +643,26 @@ impl Repo {
         })
     }
 
-    /// Step 5: batch-fetch blobs by OID, fed over stdin. A transfer that stays under 1 kB/s for a minute is given up
-    /// on (`http.lowSpeed*`): git is never killed, so a fetch that hangs would hold the repo lock for ever.
+    /// Step 5: batch-fetch blobs by OID, fed over stdin. A transfer that stays under 1 kB/s for `stall` is given up
+    /// on ([`STALL_INDEX`] or [`STALL_PR`], by what the caller can wait for).
     pub async fn fetch_blobs(
         &self,
         _guard: &RepoGuard,
         auth: &GitAuth,
         oids: &[String],
+        stall: Duration,
     ) -> Result<(), GitFailure> {
         if oids.is_empty() {
             return Ok(());
         }
         let mut input = oids.join("\n");
         input.push('\n');
-        self.git(
+        self.git_stalling(
+            stall,
             Some(auth),
             &[
                 "-c",
                 "fetch.negotiationAlgorithm=noop",
-                "-c",
-                "http.lowSpeedLimit=1000",
-                "-c",
-                "http.lowSpeedTime=60",
                 "fetch",
                 "origin",
                 "--no-tags",
@@ -768,22 +791,26 @@ impl Repo {
     /// Without `lazy` (`guard` = `None`) the read is purely local and needs no lock: git
     /// 2.43 has no `--no-lazy-fetch`, so `protocol.allow=never` makes the promisor fetch
     /// that git would start for a missing object fail at once, before it touches the repo.
-    /// With a guard, a missing object is fetched lazily from the promisor remote.
+    /// With a guard, a missing object is fetched lazily from the promisor remote, and the fetch is given up on after
+    /// [`STALL_PR`] of a stalled transfer (the run is one `cat-file`, so the setting reaches the fetch it starts).
     pub async fn read_object(
         &self,
         guard: Option<&RepoGuard>,
         auth: Option<&GitAuth>,
         oid: &str,
     ) -> Result<ObjectLookup, GitFailure> {
-        let mut args = Vec::new();
-        if guard.is_none() {
-            args.extend(["-c", "protocol.allow=never"]);
-        }
-        args.extend(["cat-file", "--batch"]);
-        match self
-            .git(auth, &args, Some(format!("{oid}\n").into_bytes()))
-            .await
-        {
+        let stdin = Some(format!("{oid}\n").into_bytes());
+        let read = match guard {
+            None => {
+                let args = ["-c", "protocol.allow=never", "cat-file", "--batch"];
+                self.git(auth, &args, stdin).await
+            }
+            Some(_) => {
+                let args = ["cat-file", "--batch"];
+                self.git_stalling(STALL_PR, auth, &args, stdin).await
+            }
+        };
+        match read {
             Ok(out) => parse::parse_batch_object(&out).map_err(|e| GitFailure {
                 command: "cat-file --batch".into(),
                 stderr: e,
@@ -1126,6 +1153,63 @@ mod tests {
             repo.read_object(None, None, &blob).await.unwrap(),
             ObjectLookup::Found { .. }
         ));
+        drop(guard);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The runs that fetch give up on a transfer that stalls (`http.lowSpeed*`) after as long as their caller can wait.
+    /// Over `file://` the setting cannot be seen to act, so the remote is a helper that writes down the options git was
+    /// started with: they reach it in the environment, as they reach the `git-remote-https` of a real fetch.
+    #[tokio::test]
+    async fn the_runs_that_fetch_give_up_on_a_stalled_transfer_after_as_long_as_their_caller_can_wait()
+     {
+        let dir = temp_dir("stalling");
+        let seen = dir.join("seen");
+        let probe = dir.join("probe.sh");
+        std::fs::write(&probe, "printenv GIT_CONFIG_PARAMETERS > \"$1\"\nexit 1\n").unwrap();
+        let url = format!("ext::sh {} {}", probe.display(), seen.display());
+        let repo = repo_at(dir.join("cache/o/r.git"), url);
+        let guard = repo.lock().await.unwrap();
+        // The `ext` transport is never allowed unless the repo says so.
+        git_in(&repo.git_dir, &["config", "protocol.ext.allow", "always"]).await;
+        let auth = GitAuth {
+            host: "example.invalid".into(),
+            token: "unused".into(),
+        };
+        let oid = "1234567890123456789012345678901234567890";
+        // The low-speed options the last run reached the remote with.
+        let low_speed = || {
+            let params = std::fs::read_to_string(&seen).unwrap();
+            std::fs::remove_file(&seen).unwrap();
+            let params = params.split_whitespace().map(|p| p.replace('\'', ""));
+            params
+                .filter(|p| p.starts_with("http.lowSpeed"))
+                .collect::<Vec<_>>()
+        };
+        let guard_of = |seconds: u64| {
+            vec![
+                "http.lowSpeedLimit=1000".to_string(),
+                format!("http.lowSpeedTime={seconds}"),
+            ]
+        };
+
+        // Every one of these fails: the remote is a helper that hangs up.
+        let oids = [oid.to_string()];
+        repo.fetch_blobs(&guard, &auth, &oids, STALL_INDEX)
+            .await
+            .unwrap_err();
+        assert_eq!(low_speed(), guard_of(60));
+        repo.fetch_blobs(&guard, &auth, &oids, STALL_PR)
+            .await
+            .unwrap_err();
+        assert_eq!(low_speed(), guard_of(300));
+        repo.fetch_commits(&guard, &auth, 1, oid, oid)
+            .await
+            .unwrap_err();
+        assert_eq!(low_speed(), guard_of(300));
+        // A missing object is fetched lazily, by a fetch that git starts on its own.
+        let _ = repo.read_object(Some(&guard), Some(&auth), oid).await;
+        assert_eq!(low_speed(), guard_of(300));
         drop(guard);
         std::fs::remove_dir_all(&dir).unwrap();
     }

@@ -1,12 +1,13 @@
 //! Code navigation: the symbols of a file, the index of a pull request's commits, and what it finds there.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::AppError;
-use crate::git::{GitAuth, Repo};
+use crate::git::{GitAuth, STALL_INDEX};
 use crate::index::build::groups;
 use crate::index::db::{BlobStatus, Hit, IndexDb, NewBlob};
 use crate::index::lang::{Family, Grammar, MAX_BLOB_BYTES};
@@ -104,6 +105,17 @@ pub struct IndexRequest {
 /// noted: a read holds its output in memory. A blob over it is read alone.
 const SNIPPET_READ_BYTES: u64 = 16 << 20;
 
+/// How long a file whose parse timed out is answered as too large without being parsed again. Taking too long says
+/// something about that run, not about the file, so the index keeps nothing; but a file that used up the whole time
+/// limit once will most likely do so again, and every try holds a thread of the blocking pool for that long.
+const SLOW_PARSE_TTL: Duration = Duration::from_secs(600);
+
+/// How many such files are remembered at most; the oldest are forgotten first.
+const SLOW_PARSES_KEPT: usize = 256;
+
+/// When the parse of a blob under a grammar last timed out.
+pub(super) type SlowParses = Mutex<HashMap<(String, Grammar), Instant>>;
+
 /// A definition or a reference found in the index (`GET /definitions` and `GET /references`). Lines are 1-based and
 /// columns 1-based UTF-16 code units, like a [`Symbol`]'s.
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -194,6 +206,12 @@ impl PrService {
             too_large,
             symbols,
         };
+        // What a file that was not parsed in time is told: what is told of a file that is too large.
+        let timed_out = || FileSymbols {
+            language: Some(grammar.id()),
+            too_large: true,
+            symbols: Vec::new(),
+        };
 
         if let Some(db) = db {
             let key = oid.to_string();
@@ -214,19 +232,21 @@ impl PrService {
         let (status, tags) = if too_large {
             (BlobStatus::TooLarge, Vec::new())
         } else {
+            // A file that timed out a moment ago is not worth another thread of the pool for as long.
+            if self.parse_was_slow(oid, grammar, Instant::now()) {
+                return Ok(timed_out());
+            }
             let parsed = tokio::task::spawn_blocking(move || tags::parse(grammar, &bytes, None))
                 .await
                 .map_err(|e| AppError::index_unavailable(format!("parsing {path} failed: {e}")))?;
             match parsed {
                 Ok(tags) => (BlobStatus::Parsed, tags),
-                // Taking too long says something about this run, not about the file, so nothing is kept: a build, or
-                // another request, tries again. The client is told what it is told of a file that is too large.
+                // Taking too long says something about this run, not about the file, so nothing is kept in the index:
+                // a build tries again, and so does a request once the time of `SLOW_PARSE_TTL` has gone by. The client
+                // is told what it is told of a file that is too large.
                 Err(ParseError::TimedOut) => {
-                    return Ok(FileSymbols {
-                        language: Some(grammar.id()),
-                        too_large: true,
-                        symbols: Vec::new(),
-                    });
+                    self.note_slow_parse(oid, grammar, Instant::now());
+                    return Ok(timed_out());
                 }
                 Err(e) => {
                     return Err(AppError::index_unavailable(format!(
@@ -250,6 +270,31 @@ impl PrService {
             }
         }
         Ok(outline(symbols))
+    }
+
+    /// Whether parsing the blob under the grammar timed out less than `SLOW_PARSE_TTL` before `now`.
+    fn parse_was_slow(&self, oid: &str, grammar: Grammar, now: Instant) -> bool {
+        let slow = self.slow_parses.lock().expect("slow parses poisoned");
+        slow.get(&(oid.to_string(), grammar))
+            .is_some_and(|&at| now.saturating_duration_since(at) < SLOW_PARSE_TTL)
+    }
+
+    /// Notes that parsing the blob under the grammar timed out at `now`. The notes that have expired are dropped, and
+    /// when `SLOW_PARSES_KEPT` are left, the oldest of them too.
+    fn note_slow_parse(&self, oid: &str, grammar: Grammar, now: Instant) {
+        let mut slow = self.slow_parses.lock().expect("slow parses poisoned");
+        slow.retain(|_, at| now.saturating_duration_since(*at) < SLOW_PARSE_TTL);
+        let key = (oid.to_string(), grammar);
+        if slow.len() >= SLOW_PARSES_KEPT && !slow.contains_key(&key) {
+            let oldest = slow
+                .iter()
+                .min_by_key(|&(_, &at)| at)
+                .map(|(key, _)| key.clone());
+            if let Some(oldest) = oldest {
+                slow.remove(&oldest);
+            }
+        }
+        slow.insert(key, now);
     }
 
     /// The index and the commit that `side` of the pull request means to the page showing `head`. A page
@@ -361,8 +406,10 @@ impl PrService {
     }
 
     /// Where `name` is used in the commit, as the file `path` of the commit sees it: the references of its family of
-    /// languages, the nearest first. The index knows where they are; the lines come from the blobs the cache repo
-    /// holds. Nothing is fetched and no build is started, so a reference whose blob is not local has no snippet.
+    /// languages, the nearest first. The index knows where they are; the lines come from the blobs of the cache repo.
+    /// The index may hold a commit that another clone of the repository built, so the blobs of the references that the
+    /// repo lacks are fetched, as far as the remote gives them: a reference whose blob cannot be had has no snippet.
+    /// No build is started.
     pub async fn references(
         self: &Arc<Self>,
         key: &PrKey,
@@ -383,8 +430,7 @@ impl PrService {
             .await?
         };
         let (found, truncated) = found.ok_or_else(|| not_indexed(&commit))?;
-        let repo = self.repos.repo(&key.host, &key.owner, &key.repo);
-        let hits = with_snippets(&repo, index.db(), &commit, found).await?;
+        let hits = self.with_snippets(key, index.db(), &commit, found).await?;
         Ok(NavResult {
             language: Some(language_of(index.db(), &commit, path).await?),
             commit,
@@ -415,99 +461,161 @@ async fn language_of(db: &IndexDb, commit: &str, path: &str) -> Result<&'static 
 /// A hit that wants its snippet: its index among the hits, and the line and column of its name.
 type Wanted = (usize, u32, u32);
 
-/// The references with the line each is on, cut out of the blob that holds it (`found` has the OID of the blob with
-/// each hit). Only the blobs `repo` holds for `commit` are read, a few at a time (see `SNIPPET_READ_BYTES`); nothing is
-/// fetched, and a hit whose blob is not local, or cannot be read, has no snippet.
-async fn with_snippets(
-    repo: &Repo,
-    db: &IndexDb,
-    commit: &str,
-    found: Vec<(Hit, String)>,
-) -> Result<Vec<NavHit>, AppError> {
-    let mut hits: Vec<NavHit> = Vec::with_capacity(found.len());
-    let mut in_blob: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-    for (hit, oid) in found {
-        in_blob.entry(oid).or_default().push(hits.len());
-        hits.push(hit.into());
-    }
-    if hits.is_empty() {
-        return Ok(hits);
-    }
-    // Reading a blob the repo lacks is slow: git scans its promisor packs before it gives up. The index holds the
-    // references of blobs that other clones of the repository fetched, so those are told first, with one listing.
-    let missing = match repo.missing_objects(commit).await {
-        Ok(missing) => missing,
-        Err(e) => {
-            eprintln!("gh-tideline: listing the blobs the repo lacks failed: {e}");
+impl PrService {
+    /// The references with the line each is on, cut out of the blob that holds it (`found` has the OID of the blob with
+    /// each hit). The index holds the references of blobs that other clones of the repository fetched, so the blobs of the
+    /// hits that the cache repo lacks are fetched first (see `fetch_for_snippets`). The blobs are read a few at a time (see
+    /// `SNIPPET_READ_BYTES`), and a hit whose blob could not be had, or cannot be read, has no snippet.
+    async fn with_snippets(
+        &self,
+        key: &PrKey,
+        db: &IndexDb,
+        commit: &str,
+        found: Vec<(Hit, String)>,
+    ) -> Result<Vec<NavHit>, AppError> {
+        let mut hits: Vec<NavHit> = Vec::with_capacity(found.len());
+        let mut in_blob: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        for (hit, oid) in found {
+            in_blob.entry(oid).or_default().push(hits.len());
+            hits.push(hit.into());
+        }
+        if hits.is_empty() {
             return Ok(hits);
         }
-    };
-    let local: Vec<String> = in_blob
-        .keys()
-        .filter(|oid| !missing.contains(*oid))
-        .cloned()
-        .collect();
-    let sizes = {
-        let local = local.clone();
-        with_index(db, move |db| db.blob_sizes(&local)).await
-    }
-    .unwrap_or_else(|e| {
-        eprintln!(
-            "gh-tideline: reading the sizes of blobs for the snippets of references failed: {e}"
-        );
-        HashMap::new()
-    });
-    // A blob of unknown size counts as the largest the index parses.
-    let size = |oid: &String| sizes.get(oid).copied().unwrap_or(MAX_BLOB_BYTES);
-    for group in groups(local, size, SNIPPET_READ_BYTES) {
-        let blobs = match repo.read_blobs(&group).await {
-            Ok(blobs) => blobs,
+        let repo = self.repos.repo(&key.host, &key.owner, &key.repo);
+        // Reading a blob the repo lacks is slow: git scans its promisor packs before it gives up. So the blobs the repo
+        // lacks are told first, with one listing, and those of the hits are fetched.
+        let mut missing = match repo.missing_objects(commit).await {
+            Ok(missing) => missing,
             Err(e) => {
-                eprintln!("gh-tideline: reading blobs for the snippets of references failed: {e}");
-                continue;
+                eprintln!("gh-tideline: listing the blobs the repo lacks failed: {e}");
+                return Ok(hits);
             }
         };
-        let cut: Vec<(Vec<u8>, Vec<Wanted>)> = blobs
-            .into_iter()
-            .filter_map(|(oid, text)| {
-                let at = in_blob.get(&oid)?;
-                let wanted = at.iter().map(|&i| (i, hits[i].line, hits[i].column));
-                Some((text, wanted.collect()))
-            })
+        let lacking: Vec<String> = in_blob
+            .keys()
+            .filter(|oid| missing.contains(*oid))
+            .cloned()
             .collect();
-        let snippets = tokio::task::spawn_blocking(move || {
-            let mut snippets = Vec::new();
-            for (text, wanted) in cut {
-                let places: Vec<(u32, u32)> = wanted
-                    .iter()
-                    .map(|&(_, line, column)| (line, column))
-                    .collect();
-                let found = tags::line_snippets(&text, &places);
-                for (&(i, _, _), found) in wanted.iter().zip(found) {
-                    if let Some((snippet, at)) = found {
-                        snippets.push((i, snippet, at));
+        if !lacking.is_empty() && self.fetch_for_snippets(key, lacking).await {
+            // What the remote did not give stays missing.
+            match repo.missing_objects(commit).await {
+                Ok(now) => missing = now,
+                Err(e) => eprintln!("gh-tideline: listing the blobs the repo lacks failed: {e}"),
+            }
+        }
+        let local: Vec<String> = in_blob
+            .keys()
+            .filter(|oid| !missing.contains(*oid))
+            .cloned()
+            .collect();
+        let sizes = {
+            let local = local.clone();
+            with_index(db, move |db| db.blob_sizes(&local)).await
+        }
+        .unwrap_or_else(|e| {
+            eprintln!(
+                "gh-tideline: reading the sizes of blobs for the snippets of references failed: {e}"
+            );
+            HashMap::new()
+        });
+        // A blob of unknown size counts as the largest the index parses.
+        let size = |oid: &String| sizes.get(oid).copied().unwrap_or(MAX_BLOB_BYTES);
+        for group in groups(local, size, SNIPPET_READ_BYTES) {
+            let blobs = match repo.read_blobs(&group).await {
+                Ok(blobs) => blobs,
+                Err(e) => {
+                    eprintln!(
+                        "gh-tideline: reading blobs for the snippets of references failed: {e}"
+                    );
+                    continue;
+                }
+            };
+            let cut: Vec<(Vec<u8>, Vec<Wanted>)> = blobs
+                .into_iter()
+                .filter_map(|(oid, text)| {
+                    let at = in_blob.get(&oid)?;
+                    let wanted = at.iter().map(|&i| (i, hits[i].line, hits[i].column));
+                    Some((text, wanted.collect()))
+                })
+                .collect();
+            let snippets = tokio::task::spawn_blocking(move || {
+                let mut snippets = Vec::new();
+                for (text, wanted) in cut {
+                    let places: Vec<(u32, u32)> = wanted
+                        .iter()
+                        .map(|&(_, line, column)| (line, column))
+                        .collect();
+                    let found = tags::line_snippets(&text, &places);
+                    for (&(i, _, _), found) in wanted.iter().zip(found) {
+                        if let Some((snippet, at)) = found {
+                            snippets.push((i, snippet, at));
+                        }
                     }
                 }
+                snippets
+            })
+            .await
+            .map_err(|e| AppError::index_unavailable(format!("reading snippets failed: {e}")))?;
+            for (i, snippet, column) in snippets {
+                hits[i].snippet = snippet;
+                hits[i].snippet_column = column;
             }
-            snippets
+        }
+        Ok(hits)
+    }
+
+    /// Fetches blobs the cache repo lacks, for the snippets of a lookup, and tells whether it did. It is best effort: a
+    /// lookup without lines is better than none, so no token, a remote that cannot be reached or one that does not give the
+    /// blobs only costs the lines (and is told on stderr). A fetch that stays under 1 kB/s for `STALL_INDEX` is given up on;
+    /// the repo lock, which a fetch needs, may be held by a build or a pull request that is loading.
+    async fn fetch_for_snippets(&self, key: &PrKey, oids: Vec<String>) -> bool {
+        let token = match self.tokens.get(&key.host).await {
+            Ok(token) => token,
+            Err(e) => {
+                eprintln!(
+                    "gh-tideline: no token to fetch the blobs for the snippets of references: {e}"
+                );
+                return false;
+            }
+        };
+        let auth = GitAuth {
+            host: key.host.clone(),
+            token,
+        };
+        let repo = self.repos.repo(&key.host, &key.owner, &key.repo);
+        // A detached task owns the repo lock: a lookup that is dropped does not leave git running without it.
+        let fetched = tokio::spawn(async move {
+            let guard = repo.lock().await?;
+            repo.fetch_blobs(&guard, &auth, &oids, STALL_INDEX).await
         })
-        .await
-        .map_err(|e| AppError::index_unavailable(format!("reading snippets failed: {e}")))?;
-        for (i, snippet, column) in snippets {
-            hits[i].snippet = snippet;
-            hits[i].snippet_column = column;
+        .await;
+        match fetched {
+            Ok(Ok(())) => true,
+            Ok(Err(e)) => {
+                eprintln!(
+                    "gh-tideline: fetching the blobs for the snippets of references failed: {e}"
+                );
+                false
+            }
+            Err(e) => {
+                eprintln!(
+                    "gh-tideline: the fetch of the blobs for the snippets of references failed: {e}"
+                );
+                false
+            }
         }
     }
-    Ok(hits)
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
-    use std::time::Duration;
 
     use super::*;
     use crate::error::ErrorCode;
+    use crate::git::Repos;
+    use crate::git::testing::git_in;
     use crate::index::{IndexState, Phase};
     use crate::pr::testing::{Fixture, Pull, RUST, UNKNOWN};
 
@@ -737,16 +845,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_file_that_takes_too_long_to_parse_is_answered_as_too_large_and_not_remembered() {
+    async fn a_file_that_takes_too_long_to_parse_is_answered_as_too_large_and_not_kept_in_the_index()
+     {
         // A definition and then a long run of `+` after an `=`: matching it takes tree-sitter far longer than a file is
         // given (see the tests of `tags`).
         let slow = format!("function f() {{}}\nx = {}", "+".repeat(300_000));
         assert!((slow.len() as u64) < MAX_BLOB_BYTES);
         let f = Fixture::new("nav-slow", &[slow.as_bytes(), b"function g() {}\n"]).await;
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         let got = f.symbols(&f.oids[0], "slow.js").await.unwrap();
         assert!(started.elapsed() < Duration::from_secs(30));
         // Not a failure, and not a file without symbols: one that was not parsed.
+        let not_parsed = FileSymbols {
+            language: Some("javascript"),
+            too_large: true,
+            symbols: Vec::new(),
+        };
+        assert_eq!(got, not_parsed);
+        // How long it took says something about this run, not about the file: nothing is kept in the index, so that
+        // a build of the commit tries again.
+        assert!(
+            f.db.blob_symbols(&f.oids[0], Grammar::JavaScript)
+                .unwrap()
+                .is_none()
+        );
+        // The service remembers it for a while, so that the next request does not spend the time again.
+        let slow_for = |grammar| {
+            f.service
+                .parse_was_slow(&f.oids[0], grammar, Instant::now())
+        };
+        assert!(slow_for(Grammar::JavaScript));
+        assert_eq!(f.symbols(&f.oids[0], "slow.js").await.unwrap(), not_parsed);
+        // The thread that parsed it is fine afterwards.
+        let fine = f.symbols(&f.oids[1], "fine.js").await.unwrap();
+        assert_eq!(fine.symbols, [symbol("g", "function", (1, 10, 11), (1, 1))]);
+    }
+
+    #[tokio::test]
+    async fn a_file_that_timed_out_lately_is_not_parsed_until_the_note_of_it_expires() {
+        let f = Fixture::new("nav-slow-noted", &[b"function g() {}\n"]).await;
+        let oid = &f.oids[0];
+        // The note is all the lookup goes by: this file parses in no time, and is not parsed.
+        f.service
+            .note_slow_parse(oid, Grammar::JavaScript, Instant::now());
+        let got = f.symbols(oid, "g.js").await.unwrap();
         assert_eq!(
             got,
             FileSymbols {
@@ -755,16 +897,51 @@ mod tests {
                 symbols: Vec::new(),
             }
         );
-        // How long it took says something about this run, not about the file: nothing is kept, so that a build of the
-        // commit, or another request, tries again.
-        assert!(
-            f.db.blob_symbols(&f.oids[0], Grammar::JavaScript)
-                .unwrap()
-                .is_none()
-        );
-        // The thread that parsed it is fine afterwards.
-        let fine = f.symbols(&f.oids[1], "fine.js").await.unwrap();
-        assert_eq!(fine.symbols, [symbol("g", "function", (1, 10, 11), (1, 1))]);
+        let held = |grammar| f.db.blob_symbols(oid, grammar).unwrap();
+        assert!(held(Grammar::JavaScript).is_none());
+        // The same bytes under another grammar are another parse.
+        let got = f.symbols(oid, "g.ts").await.unwrap();
+        assert_eq!(got.symbols, [symbol("g", "function", (1, 10, 11), (1, 1))]);
+        assert!(held(Grammar::TypeScript).is_some());
+    }
+
+    #[test]
+    fn the_notes_of_slow_parses_expire_and_are_capped() {
+        let service = PrService::new(Repos::new(std::env::temp_dir()), None, None);
+        let oid = |n: usize| format!("{n:040x}");
+        let was_slow = |n, grammar, at| service.parse_was_slow(&oid(n), grammar, at);
+        let now = Instant::now();
+        service.note_slow_parse(&oid(1), Grammar::C, now);
+        assert!(was_slow(1, Grammar::C, now));
+        // The same bytes under another grammar are another parse, and another blob is another file.
+        assert!(!was_slow(1, Grammar::Cpp, now));
+        assert!(!was_slow(2, Grammar::C, now));
+        // The note holds for `SLOW_PARSE_TTL`.
+        let almost = now + SLOW_PARSE_TTL - Duration::from_secs(1);
+        assert!(was_slow(1, Grammar::C, almost));
+        let expired = now + SLOW_PARSE_TTL;
+        assert!(!was_slow(1, Grammar::C, expired));
+
+        // Noting another file drops the notes that have expired.
+        service.note_slow_parse(&oid(2), Grammar::C, expired);
+        assert_eq!(service.slow_parses.lock().unwrap().len(), 1);
+
+        // At most `SLOW_PARSES_KEPT` are kept, and the oldest go first.
+        let at = |n: usize| expired + Duration::from_millis(n as u64);
+        for n in 0..SLOW_PARSES_KEPT + 10 {
+            service.note_slow_parse(&oid(100 + n), Grammar::C, at(n));
+        }
+        assert_eq!(service.slow_parses.lock().unwrap().len(), SLOW_PARSES_KEPT);
+        let last = SLOW_PARSES_KEPT + 9;
+        assert!(!was_slow(2, Grammar::C, at(last)));
+        assert!(!was_slow(100, Grammar::C, at(last)));
+        assert!(was_slow(110, Grammar::C, at(last)));
+        assert!(was_slow(100 + last, Grammar::C, at(last)));
+
+        // Noting a file again only renews its note: nothing else goes.
+        service.note_slow_parse(&oid(110), Grammar::C, at(last + 1));
+        assert_eq!(service.slow_parses.lock().unwrap().len(), SLOW_PARSES_KEPT);
+        assert!(was_slow(111, Grammar::C, at(last + 1)));
     }
 
     #[tokio::test]
@@ -1749,11 +1926,12 @@ pub fn twice() {
     }
 
     #[tokio::test]
-    async fn only_the_references_in_blobs_the_repo_holds_have_lines_and_nothing_is_fetched() {
+    async fn a_lookup_fetches_the_blobs_of_its_references_that_the_repo_lacks_and_no_others() {
         let sources = [
             TARGET_SOURCES[0],
             TARGET_SOURCES[1],
             ("c.rs", "fn third() {\n    target();\n}\n"),
+            ("d.rs", "fn unrelated() {}\n"),
         ];
         let p = Pull::with_files("nav-some-blobs", &[("old.rs", "fn old() {}\n")], &sources).await;
         let head = p.clone.head.clone();
@@ -1764,43 +1942,36 @@ pub fn twice() {
         let before = p.clone.repo.missing_objects(&head).await.unwrap();
         assert_eq!(
             before,
-            HashSet::from([files[0].1.clone(), files[2].1.clone()])
+            HashSet::from([files[0].1.clone(), files[2].1.clone(), files[3].1.clone()])
         );
 
         let got = p.references(Side::Head, "a.rs", "target").await.unwrap();
         assert_eq!(
             got.hits,
             [
-                hit("target", "a.rs", (4, 5), "call", ("", 0), "file"),
+                hit("target", "a.rs", (4, 5), "call", ("target();", 1), "file"),
                 hit("target", "b.rs", (2, 5), "call", ("target();", 1), "dir"),
-                hit("target", "c.rs", (2, 5), "call", ("", 0), "dir"),
+                hit("target", "c.rs", (2, 5), "call", ("target();", 1), "dir"),
             ]
         );
+        // The blobs of a.rs and c.rs were fetched; that of d.rs has no reference to `target`, and stays where it is.
         let after = p.clone.repo.missing_objects(&head).await.unwrap();
-        assert_eq!(after, before);
+        assert_eq!(after, HashSet::from([files[3].1.clone()]));
     }
 
     #[tokio::test]
-    async fn references_of_blobs_the_cache_repo_does_not_hold_have_no_snippets() {
+    async fn a_lookup_in_a_new_clone_gets_the_lines_of_a_commit_another_clone_indexed() {
         let sources = TARGET_SOURCES;
         let p = Pull::with_files("nav-no-blobs", &[("old.rs", "fn old() {}\n")], &sources).await;
         let head = p.clone.head.clone();
-        // The index of the commit is complete, but the cache repo never fetched its blobs: they were evicted, or
-        // another repo's build stored them.
+        // The index of the commit is complete, but the cache repo never fetched its blobs: a build in another clone of
+        // the repository stored them, and no build here has anything to parse.
         let files = stored_by_another_clone(&p, &sources).await;
         p.db.save_commit(&head, &files).unwrap();
         let before = p.clone.repo.missing_objects(&head).await.unwrap();
         assert!(files.iter().all(|(_, oid, _)| before.contains(oid)));
 
-        let got = p.references(Side::Head, "a.rs", "target").await.unwrap();
-        assert_eq!(
-            got.hits,
-            [
-                hit("target", "a.rs", (4, 5), "call", ("", 0), "file"),
-                hit("target", "b.rs", (2, 5), "call", ("", 0), "dir"),
-            ]
-        );
-        // The definitions come from the index alone, with their lines.
+        // The definitions come from the index alone, with their lines, and fetch nothing.
         let got = p.definitions(Side::Head, "a.rs", "target").await.unwrap();
         assert_eq!(
             got.hits,
@@ -1813,8 +1984,61 @@ pub fn twice() {
                 "file"
             )]
         );
-        // Nothing was fetched to answer.
+        assert_eq!(p.clone.repo.missing_objects(&head).await.unwrap(), before);
+
+        // The references have to be cut out of the blobs, which the lookup fetches.
+        let got = p.references(Side::Head, "a.rs", "target").await.unwrap();
+        assert_eq!(
+            got.hits,
+            [
+                hit("target", "a.rs", (4, 5), "call", ("target();", 1), "file"),
+                hit("target", "b.rs", (2, 5), "call", ("target();", 1), "dir"),
+            ]
+        );
         let after = p.clone.repo.missing_objects(&head).await.unwrap();
-        assert_eq!(after, before);
+        assert!(files.iter().all(|(_, oid, _)| !after.contains(oid)));
+    }
+
+    #[tokio::test]
+    async fn a_lookup_that_cannot_fetch_the_blobs_answers_without_lines_and_tries_again_next_time()
+    {
+        let sources = TARGET_SOURCES;
+        let p = Pull::with_files("nav-fetch-fails", &[("old.rs", "fn old() {}\n")], &sources).await;
+        let head = p.clone.head.clone();
+        let files = stored_by_another_clone(&p, &sources).await;
+        p.db.save_commit(&head, &files).unwrap();
+        let before = p.clone.repo.missing_objects(&head).await.unwrap();
+        assert!(files.iter().all(|(_, oid, _)| before.contains(oid)));
+
+        // The remote cannot be reached.
+        let url = |path: &std::path::Path| format!("file://{}", path.display());
+        let gone = url(&p.clone.dir.join("gone"));
+        let git_dir = &p.clone.repo.git_dir;
+        git_in(git_dir, &["config", "remote.origin.url", &gone]).await;
+        let got = p.references(Side::Head, "a.rs", "target").await.unwrap();
+        // Not an error: the references are where the index says, without their lines.
+        assert_eq!(
+            got.hits,
+            [
+                hit("target", "a.rs", (4, 5), "call", ("", 0), "file"),
+                hit("target", "b.rs", (2, 5), "call", ("", 0), "dir"),
+            ]
+        );
+        assert_eq!(p.clone.repo.missing_objects(&head).await.unwrap(), before);
+
+        // Nothing about the failure is remembered: with the remote back, the next lookup has the lines.
+        git_in(
+            git_dir,
+            &["config", "remote.origin.url", &url(&p.clone.origin)],
+        )
+        .await;
+        let got = p.references(Side::Head, "a.rs", "target").await.unwrap();
+        assert_eq!(
+            got.hits,
+            [
+                hit("target", "a.rs", (4, 5), "call", ("target();", 1), "file"),
+                hit("target", "b.rs", (2, 5), "call", ("target();", 1), "dir"),
+            ]
+        );
     }
 }

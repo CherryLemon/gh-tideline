@@ -15,7 +15,7 @@ use serde::Serialize;
 use crate::error::AppError;
 use crate::git::parse::GITLINK_MODE;
 use crate::git::{
-    ChangedFile, GitAuth, GitFailure, ObjectLookup, Repo, RepoGuard, Repos, TreeEntry,
+    ChangedFile, GitAuth, GitFailure, ObjectLookup, Repo, RepoGuard, Repos, STALL_PR, TreeEntry,
 };
 use crate::github::{Github, Tokens, ViewedState};
 use crate::index::Indexer;
@@ -159,6 +159,8 @@ pub struct PrService {
     /// None if the index database could not be opened; a file's symbols are then parsed on demand,
     /// without a cache, and nothing else of code navigation works.
     index: Option<Indexer>,
+    /// The files whose parse timed out lately, so that they are not parsed again at once (see [`PrService::symbols`]).
+    slow_parses: nav::SlowParses,
     cache: Mutex<HashMap<PrKey, CacheSlot>>,
     /// Detached work after a response (see [`PrService::set_viewed`]), awaited on shutdown.
     bookkeeping: Mutex<tokio::task::JoinSet<()>>,
@@ -178,6 +180,7 @@ impl PrService {
             tokens: Tokens::default(),
             state,
             index: index.map(|db| Indexer::new(db, Limits::default())),
+            slow_parses: Default::default(),
             cache: Default::default(),
             bookkeeping: Default::default(),
             review_writes: Default::default(),
@@ -621,7 +624,7 @@ async fn range_files(
         oids.extend(repo.gitattributes_oids(to, &paths).await.map_err(git_err)?);
         oids.sort();
         oids.dedup();
-        repo.fetch_blobs(guard, auth, &oids)
+        repo.fetch_blobs(guard, auth, &oids, STALL_PR)
             .await
             .map_err(git_err)?;
         guard.state.blobs_fetched.insert(pair);

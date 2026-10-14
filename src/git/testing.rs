@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use super::{GitAuth, Repo, run_git};
+use super::{GitAuth, Repo, STALL_INDEX, run_git};
 
 /// A valid OID that no repo holds.
 pub(crate) const UNKNOWN: &str = "1234567890123456789012345678901234567891";
@@ -269,7 +269,7 @@ impl PartialClone {
         let oids: Vec<String> = oids.iter().map(|oid| oid.to_string()).collect();
         let guard = self.repo.lock().await.unwrap();
         self.repo
-            .fetch_blobs(&guard, &self.auth, &oids)
+            .fetch_blobs(&guard, &self.auth, &oids, STALL_INDEX)
             .await
             .unwrap();
     }

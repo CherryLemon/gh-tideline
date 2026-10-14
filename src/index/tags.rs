@@ -2028,12 +2028,9 @@ Foo::Foo() {}
                 parsed(grammar, &src.as_bytes()[..cut]);
             }
         }
-        // A name that is not UTF-8 is no name.
-        let found = parsed(
-            Grammar::C,
-            b"int caf\xE9(void) { return 0; }\nint ok(void) { return 1; }\n",
-        );
-        let Some(found) = found else { return };
+        // A name that is not UTF-8 is no name. This one is given time enough, so that it is always checked.
+        let src = b"int caf\xE9(void) { return 0; }\nint ok(void) { return 1; }\n";
+        let found = parse_within(Grammar::C, src, None, Duration::from_secs(600)).unwrap();
         assert!(found.iter().all(|t| t.name != "caf\u{FFFD}"));
         assert!(found.iter().any(|t| t.name == "ok" && t.is_def));
     }

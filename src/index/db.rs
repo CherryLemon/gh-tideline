@@ -26,7 +26,9 @@ use super::rank::{self, Origin};
 use super::tags::Tag;
 use crate::clock;
 
-const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a connection waits for the lock another one holds. The tests hold it on purpose, and a machine that runs
+/// many of them at once may take longer than that to get to the point where they let it go.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(if cfg!(test) { 60 } else { 5 });
 /// A lookup refreshes the `used_at` of its commit only when it is older than this, so lookups hardly ever write.
 const TOUCH_AFTER_SECS: i64 = 3600;
 
@@ -102,7 +104,9 @@ impl BlobStatus {
         }
     }
 
-    fn from_stored(text: &str) -> Option<BlobStatus> {
+    /// From the text in the database. A status this version does not know was stored by a newer one, which held the
+    /// blob: it counts as `parsed`, so that it is not done again, as a grammar this version does not know is left alone.
+    fn from_stored(text: &str) -> BlobStatus {
         [
             BlobStatus::Parsed,
             BlobStatus::TooLarge,
@@ -110,6 +114,7 @@ impl BlobStatus {
         ]
         .into_iter()
         .find(|status| status.as_str() == text)
+        .unwrap_or(BlobStatus::Parsed)
     }
 }
 
@@ -245,9 +250,7 @@ impl IndexDb {
                 let Some(grammar) = Grammar::from_id(&id) else {
                     continue;
                 };
-                let status = BlobStatus::from_stored(&status)
-                    .ok_or_else(|| format!("index database: unknown blob status {status:?}"))?;
-                held.push((grammar, status));
+                held.push((grammar, BlobStatus::from_stored(&status)));
             }
             if !held.is_empty() {
                 held.sort_by_key(|&(grammar, _)| grammar);
@@ -365,8 +368,7 @@ impl IndexDb {
         let Some((blob_id, status)) = blob else {
             return Ok(None);
         };
-        let status = BlobStatus::from_stored(&status)
-            .ok_or_else(|| format!("index database: unknown blob status {status:?}"))?;
+        let status = BlobStatus::from_stored(&status);
         let mut query = conn.prepare_cached(SYMBOLS_SQL).map_err(db_err)?;
         let symbols = query
             .query_map([blob_id], |row| {
@@ -1121,15 +1123,26 @@ mod tests {
         assert_eq!(sizes, HashMap::from([(oid(1), 100), (oid(2), 5 << 20)]));
         assert!(fx.blob_sizes(&[]).unwrap().is_empty());
 
-        // A status this version does not know is not guessed at.
+        // A status this version does not know was stored by a newer one, which held the blob: the row counts as held
+        // and parsed, instead of failing every build and outline that meets it. A grammar it does not know is left out.
         fx.side()
-            .execute(
-                "INSERT INTO blobs (oid, grammar, status, size) VALUES (?1, 'rust', 'surprise', 1)",
-                [oid(9)],
-            )
+            .execute_batch(&format!(
+                "INSERT INTO blobs (oid, grammar, status, size) VALUES ('{0}', 'rust', 'surprise', 1);
+                 INSERT INTO blobs (oid, grammar, status, size) VALUES ('{0}', 'cobol', 'parsed', 1);",
+                oid(9)
+            ))
             .unwrap();
-        let error = fx.stored_blobs(&[oid(9)]).unwrap_err();
-        assert!(error.contains("unknown blob status"), "{error}");
+        assert_eq!(
+            fx.stored_blobs(&[oid(9)]).unwrap(),
+            HashMap::from([(oid(9), vec![(Grammar::Rust, BlobStatus::Parsed)])])
+        );
+        assert_eq!(
+            fx.blob_symbols(&oid(9), Grammar::Rust).unwrap(),
+            Some(StoredSymbols {
+                status: BlobStatus::Parsed,
+                symbols: vec![]
+            })
+        );
     }
 
     #[test]
@@ -1197,7 +1210,7 @@ mod tests {
             BlobStatus::Unreadable,
         ];
         for (n, status) in statuses.into_iter().enumerate() {
-            assert_eq!(BlobStatus::from_stored(status.as_str()), Some(status));
+            assert_eq!(BlobStatus::from_stored(status.as_str()), status);
             fx.insert_blobs(vec![NewBlob {
                 oid: oid(n as u32),
                 grammar: Grammar::Go,
@@ -1214,7 +1227,7 @@ mod tests {
                 })
             );
         }
-        assert_eq!(BlobStatus::from_stored("surprise"), None);
+        assert_eq!(BlobStatus::from_stored("surprise"), BlobStatus::Parsed);
         let oids: Vec<_> = (0..3).map(oid).collect();
         assert_eq!(fx.stored_blobs(&oids).unwrap().len(), 3);
         let size = format!("SELECT size FROM blobs WHERE oid = '{}'", oid(1));

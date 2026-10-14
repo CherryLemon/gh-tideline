@@ -5,7 +5,7 @@
 //! It looks for a cancellation between its steps and inside the parser. It never kills git, and it holds the repo lock
 //! only while one chunk of blobs is fetched, so pull requests that are opened meanwhile are not kept waiting.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -17,7 +17,7 @@ use super::lang::{Family, Grammar, MAX_BLOB_BYTES, skipped_path};
 use super::tags::{self, ParseError};
 use super::{Job, Phase};
 use crate::git::parse::GITLINK_MODE;
-use crate::git::{GitAuth, GitFailure, Repo, TreeEntry};
+use crate::git::{GitAuth, GitFailure, Repo, STALL_INDEX, TreeEntry};
 
 /// Regular files. Symlinks (120000) and gitlinks (160000) have no source to read.
 const FILE_MODES: [&str; 2] = ["100644", "100755"];
@@ -114,29 +114,34 @@ fn select_files(entries: &[TreeEntry], max_files: usize) -> Result<Vec<TreeEntry
 }
 
 /// The grammar under which the index holds a blob for `path`, if it does: the one the extension names. A `.h` file
-/// has no such grammar, since it depends on the content, which is not at hand: any grammar of the C family will do.
-fn held_grammar(path: &str, stored: &[Grammar]) -> Option<Grammar> {
+/// has no such grammar, since it depends on the content, which is not at hand: any grammar of the C family will do, one
+/// whose row has tags before one that is `unreadable` (a stale one), and C before C++.
+fn held_grammar(path: &str, stored: &[(Grammar, BlobStatus)]) -> Option<Grammar> {
     match Grammar::for_path_only(path) {
-        Some(grammar) => stored.contains(&grammar).then_some(grammar),
+        Some(grammar) => stored
+            .iter()
+            .any(|&(held, _)| held == grammar)
+            .then_some(grammar),
         None => stored
             .iter()
-            .copied()
-            .filter(|grammar| grammar.family() == Family::C)
-            .min(),
+            .filter(|(grammar, _)| grammar.family() == Family::C)
+            .map(|&(grammar, status)| (status == BlobStatus::Unreadable, grammar))
+            .min()
+            .map(|(_, grammar)| grammar),
     }
 }
 
-/// Splits the files by whether the index holds their blob (`stored` lists the grammars it holds each under): `listing`
-/// has the files it does, with the grammar, and `pending` the blobs it lacks, each with its paths, in the order the
-/// files first use them.
-fn settle(files: &[TreeEntry], stored: &HashMap<String, Vec<Grammar>>) -> (Listing, Vec<Pending>) {
+/// Splits the files by whether the index holds their blob (`stored` lists the rows it holds each under): `listing` has
+/// the files it does, with the grammar, and `pending` the blobs it lacks, each with its paths, in the order the files
+/// first use them.
+fn settle(files: &[TreeEntry], stored: &Stored) -> (Listing, Vec<Pending>) {
     let mut listing = Listing::new();
     let mut pending: Vec<Pending> = Vec::new();
     let mut at: HashMap<&str, usize> = HashMap::new();
     for file in files {
         let held = stored
             .get(&file.oid)
-            .and_then(|grammars| held_grammar(&file.path, grammars));
+            .and_then(|rows| held_grammar(&file.path, rows));
         if let Some(grammar) = held {
             listing.push((file.path.clone(), file.oid.clone(), grammar));
             continue;
@@ -154,34 +159,31 @@ fn settle(files: &[TreeEntry], stored: &HashMap<String, Vec<Grammar>>) -> (Listi
     (listing, pending)
 }
 
-/// The grammars each blob is stored under in a row whose status `keep` accepts.
-fn grammars_with(
-    stored: &Stored,
-    keep: impl Fn(BlobStatus) -> bool,
-) -> HashMap<String, Vec<Grammar>> {
+/// The rows of `stored` that are not `unreadable`: what a build has no reason to do again.
+fn without_unreadable(stored: &Stored) -> Stored {
     stored
         .iter()
         .map(|(oid, rows)| {
-            let grammars = rows
+            let read = rows
                 .iter()
-                .filter(|&&(_, status)| keep(status))
-                .map(|&(grammar, _)| grammar)
+                .copied()
+                .filter(|&(_, status)| status != BlobStatus::Unreadable)
                 .collect();
-            (oid.clone(), grammars)
+            (oid.clone(), read)
         })
         .collect()
 }
 
-/// The blobs among `oids` to fetch: those the repo lacks (`missing`) that the build has to parse (`pending`), and those
-/// the index holds with their tags. A repo needs those for the lines of the references it finds in them, and a second
-/// clone of a repository, or one made anew, lacks what the index holds from the first. A blob too large to be parsed
-/// has no tags, so no references to read lines for.
+/// The blobs among `oids` that the repo lacks (`missing`) and a build fetches, in two lists: those it has to parse
+/// (`pending`), and those the index holds with their tags. A repo needs the latter for the lines of the references it
+/// finds in them, and a second clone of a repository, or one made anew, lacks what the index holds from the first. A
+/// blob too large to be parsed has no tags, so no references to read lines for.
 fn to_fetch(
     oids: &[String],
     pending: &[Pending],
     stored: &Stored,
     missing: &HashSet<String>,
-) -> Vec<String> {
+) -> (Vec<String>, Vec<String>) {
     let pending: HashSet<&str> = pending.iter().map(|blob| blob.oid.as_str()).collect();
     let parsed = |oid: &String| {
         stored
@@ -191,7 +193,29 @@ fn to_fetch(
     oids.iter()
         .filter(|oid| missing.contains(*oid) && (pending.contains(oid.as_str()) || parsed(oid)))
         .cloned()
-        .collect()
+        .partition(|oid| pending.contains(oid.as_str()))
+}
+
+/// The `.h` files of `listing` that the content of their blob has to place: those whose blob was parsed under more than
+/// one grammar of the C family, since only then does the choice matter (a blob that was not parsed has no tags). By
+/// blob, with the places of its files in `listing`.
+fn header_choices(listing: &Listing, stored: &Stored) -> BTreeMap<String, Vec<usize>> {
+    let parsed_as_c = |oid: &str| {
+        stored.get(oid).map_or(0, |rows| {
+            rows.iter()
+                .filter(|&&(grammar, status)| {
+                    grammar.family() == Family::C && status == BlobStatus::Parsed
+                })
+                .count()
+        })
+    };
+    let mut choices: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (i, (path, oid, _)) in listing.iter().enumerate() {
+        if Grammar::for_path_only(path).is_none() && parsed_as_c(oid) > 1 {
+            choices.entry(oid.clone()).or_default().push(i);
+        }
+    }
+    choices
 }
 
 /// The grammars a blob is stored under: one for each its paths name. Without the content (`&[]`) a `.h` file counts as C.
@@ -418,6 +442,14 @@ impl Build {
     async fn build(&self) -> Result<(), Stop> {
         let commit = self.job.commit.as_str();
         self.alive()?;
+        // Another job may have completed the commit while this one waited for its turn.
+        let complete = self.with_db({
+            let commit = commit.to_string();
+            move |db| db.commit_complete(&commit)
+        });
+        if complete.await? {
+            return Ok(());
+        }
         let entries = self.repo.ls_tree(commit).await?;
         let files = select_files(&entries, self.limits.max_files)?;
         // From now on the blob endpoint may fetch any file of the commit, as it may those of a pull request.
@@ -432,14 +464,13 @@ impl Build {
 
         // A blob that was left unreadable (it could not be fetched, or parsed in time) is tried again.
         let stored = self.stored(oids.clone()).await?;
-        let usable = grammars_with(&stored, |status| status != BlobStatus::Unreadable);
-        let (_, pending) = settle(&files, &usable);
+        let (_, pending) = settle(&files, &without_unreadable(&stored));
         self.index_blobs(&oids, &stored, pending).await?;
 
         self.job.enter(Phase::Saving, 0);
         let stored = self.stored(oids).await?;
         // A blob that is unreadable still is no reason not to list the commit.
-        let (mut listing, pending) = settle(&files, &grammars_with(&stored, |_| true));
+        let (mut listing, pending) = settle(&files, &stored);
         if !pending.is_empty() {
             return Err(Stop::Failed(format!(
                 "{} blobs are still missing from the index after the build",
@@ -456,49 +487,48 @@ impl Build {
     }
 
     /// A `.h` file is C or C++ by its content, but the index only knows which grammars its blob is stored under, and
-    /// `settle` takes the first of the C family. Where there is a choice (the same content is stored as C and as C++,
-    /// because it has other names) the content, which is local by now, decides, if the grammar it names is stored.
+    /// `settle` takes the first of the C family. Where there is a choice (the same content is parsed as C and as C++,
+    /// because it has other names) the content, which is local by now, decides, if the grammar it names has the tags. The
+    /// blobs are read a group at a time, and only those the index parsed, which are no larger than it parses.
     async fn headers_by_content(&self, listing: &mut Listing, stored: &Stored) -> Result<(), Stop> {
-        let has_choice = |path: &str, oid: &str| {
-            Grammar::for_path_only(path).is_none()
-                && stored.get(oid).is_some_and(|rows| {
-                    rows.iter()
-                        .filter(|(grammar, _)| grammar.family() == Family::C)
-                        .count()
-                        > 1
-                })
-        };
-        let mut oids: Vec<String> = listing
-            .iter()
-            .filter(|(path, oid, _)| has_choice(path, oid))
-            .map(|(_, oid, _)| oid.clone())
-            .collect();
-        oids.sort();
-        oids.dedup();
-        if oids.is_empty() {
+        let choices = header_choices(listing, stored);
+        if choices.is_empty() {
             return Ok(());
         }
-        let contents: HashMap<String, Vec<u8>> =
-            self.repo.read_blobs(&oids).await?.into_iter().collect();
-        for (path, oid, grammar) in listing.iter_mut() {
-            let Some(content) = contents.get(oid.as_str()) else {
-                continue;
-            };
-            if !has_choice(path, oid) {
-                continue;
-            }
-            let by_content = Grammar::for_path(path, content);
-            let is_stored =
-                |wanted: Grammar| stored[oid.as_str()].iter().any(|&(held, _)| held == wanted);
-            if let Some(wanted) = by_content.filter(|&wanted| is_stored(wanted)) {
-                *grammar = wanted;
+        let oids: Vec<String> = choices.keys().cloned().collect();
+        let sizes = self
+            .with_db({
+                let oids = oids.clone();
+                move |db| db.blob_sizes(&oids)
+            })
+            .await?;
+        let size = |oid: &String| sizes.get(oid).copied().unwrap_or(MAX_BLOB_BYTES);
+        let readable: Vec<String> = oids
+            .into_iter()
+            .filter(|oid| size(oid) <= MAX_BLOB_BYTES)
+            .collect();
+        let has_tags = |oid: &str, wanted: Grammar| {
+            stored[oid]
+                .iter()
+                .any(|&(held, status)| held == wanted && status == BlobStatus::Parsed)
+        };
+        for group in groups(readable, size, self.limits.group_bytes) {
+            self.alive()?;
+            for (oid, content) in self.repo.read_blobs(&group).await? {
+                for &i in choices.get(&oid).into_iter().flatten() {
+                    let (path, _, grammar) = &mut listing[i];
+                    let by_content = Grammar::for_path(path, &content);
+                    if let Some(wanted) = by_content.filter(|&wanted| has_tags(&oid, wanted)) {
+                        *grammar = wanted;
+                    }
+                }
             }
         }
         Ok(())
     }
 
-    /// Gets the blobs into the index: fetches those the repo lacks, then parses and stores those the index lacks
-    /// (`pending`). A blob the index holds is fetched too when the repo lacks it (see `to_fetch`), though not parsed.
+    /// Gets the blobs into the index: fetches those the index lacks that the repo lacks too, then parses and stores them
+    /// (`pending`). Last it fetches the blobs the index holds that the repo lacks (see `to_fetch`), which are not parsed.
     async fn index_blobs(
         &self,
         oids: &[String],
@@ -507,18 +537,28 @@ impl Build {
     ) -> Result<(), Stop> {
         let commit = self.job.commit.as_str();
         let missing = self.repo.missing_objects(commit).await?;
-        let to_fetch = to_fetch(oids, &pending, stored, &missing);
-        let missing = if to_fetch.is_empty() {
-            missing
-        } else {
-            self.fetch(to_fetch).await?;
-            // What the remote did not give stays missing.
-            self.repo.missing_objects(commit).await?
-        };
-        if pending.is_empty() {
-            return Ok(());
+        let (to_parse, held) = to_fetch(oids, &pending, stored, &missing);
+        if !pending.is_empty() {
+            let missing = if to_parse.is_empty() {
+                missing
+            } else {
+                self.fetch(to_parse).await?;
+                // What the remote did not give stays missing.
+                self.repo.missing_objects(commit).await?
+            };
+            self.parse_and_store(pending, &missing).await?;
         }
-        let (present, lost) = partition(pending, &missing);
+        self.fetch_held(held).await
+    }
+
+    /// Parses and stores the blobs the index lacks. Those the repo lacks (`missing`), because the remote did not give
+    /// them, get an `unreadable` row.
+    async fn parse_and_store(
+        &self,
+        pending: Vec<Pending>,
+        missing: &HashSet<String>,
+    ) -> Result<(), Stop> {
+        let (present, lost) = partition(pending, missing);
         // Sizing a blob that is not local would cost git a scan of the promisor packs.
         let present_oids: Vec<String> = present.iter().map(|blob| blob.oid.clone()).collect();
         let sizes = self.repo.object_sizes(&present_oids).await?;
@@ -550,6 +590,25 @@ impl Build {
         Ok(())
     }
 
+    /// Fetches the blobs the index holds that the repo lacks, for the lines of the references in them. The commit does
+    /// not need them to be indexed, and a lookup fetches the ones it needs, so a fetch that fails is told and the build
+    /// goes on, without the chunks after it. A cancellation ends the build.
+    async fn fetch_held(&self, oids: Vec<String>) -> Result<(), Stop> {
+        if oids.is_empty() {
+            return Ok(());
+        }
+        match self.fetch(oids).await {
+            Err(Stop::Failed(message)) => {
+                eprintln!(
+                    "gh-tideline: fetching the indexed blobs of {} failed: {message}",
+                    self.job.commit
+                );
+                Ok(())
+            }
+            result => result,
+        }
+    }
+
     /// Fetches in a detached task that owns the repo lock: if the build is dropped, git is not left running without it.
     async fn fetch_chunk(&self, oids: Vec<String>) -> Result<(), Stop> {
         let (repo, job, auth) = (self.repo.clone(), self.job.clone(), self.auth.clone());
@@ -559,7 +618,7 @@ impl Build {
             if job.cancelled() {
                 return Err(Stop::Cancelled);
             }
-            repo.fetch_blobs(&guard, &auth, &oids).await?;
+            repo.fetch_blobs(&guard, &auth, &oids, STALL_INDEX).await?;
             Ok(())
         })
         .await
@@ -693,18 +752,45 @@ mod tests {
 
     #[test]
     fn a_blob_is_held_under_the_grammar_its_extension_names() {
-        assert_eq!(held_grammar("a.rs", &[Grammar::Rust]), Some(Grammar::Rust));
+        let parsed = |grammars: &[Grammar]| -> Vec<(Grammar, BlobStatus)> {
+            grammars.iter().map(|&g| (g, BlobStatus::Parsed)).collect()
+        };
+        assert_eq!(
+            held_grammar("a.rs", &parsed(&[Grammar::Rust])),
+            Some(Grammar::Rust)
+        );
         assert_eq!(held_grammar("a.rs", &[]), None);
         // Stored under another grammar only: the index lacks it for this name.
-        assert_eq!(held_grammar("a.cc", &[Grammar::C]), None);
-        assert_eq!(held_grammar("a.c", &[Grammar::Cpp]), None);
+        assert_eq!(held_grammar("a.cc", &parsed(&[Grammar::C])), None);
+        assert_eq!(held_grammar("a.c", &parsed(&[Grammar::Cpp])), None);
         // A `.h` file follows its content, which is not at hand: any grammar of its family will do, C first.
-        assert_eq!(held_grammar("a.h", &[Grammar::Cpp]), Some(Grammar::Cpp));
         assert_eq!(
-            held_grammar("a.h", &[Grammar::C, Grammar::Cpp]),
+            held_grammar("a.h", &parsed(&[Grammar::Cpp])),
+            Some(Grammar::Cpp)
+        );
+        assert_eq!(
+            held_grammar("a.h", &parsed(&[Grammar::C, Grammar::Cpp])),
             Some(Grammar::C)
         );
-        assert_eq!(held_grammar("a.h", &[Grammar::Rust]), None);
+        assert_eq!(held_grammar("a.h", &parsed(&[Grammar::Rust])), None);
+    }
+
+    #[test]
+    fn a_header_is_held_under_a_grammar_that_was_read_before_one_that_was_not() {
+        let unreadable_c = (Grammar::C, BlobStatus::Unreadable);
+        let parsed_cpp = (Grammar::Cpp, BlobStatus::Parsed);
+        // A stale `unreadable` row of C must not hide the tags the blob has as C++.
+        assert_eq!(
+            held_grammar("a.h", &[unreadable_c, parsed_cpp]),
+            Some(Grammar::Cpp)
+        );
+        // With nothing better, the row is held all the same: a build lists a blob it could not read.
+        assert_eq!(held_grammar("a.h", &[unreadable_c]), Some(Grammar::C));
+        // A name that tells the grammar is held under that, whatever the other rows say.
+        assert_eq!(
+            held_grammar("a.c", &[unreadable_c, parsed_cpp]),
+            Some(Grammar::C)
+        );
     }
 
     #[test]
@@ -717,7 +803,7 @@ mod tests {
             // Blob 1 is stored as Rust, and this name needs it as Python.
             file("e.py", 1),
         ];
-        let stored = HashMap::from([(oid(1), vec![Grammar::Rust])]);
+        let stored = stored_as(&[(1, &[(Grammar::Rust, BlobStatus::Parsed)])]);
         let (listing, pending_blobs) = settle(&files, &stored);
         assert_eq!(listing, [("a.rs".to_string(), oid(1), Grammar::Rust)]);
         assert_eq!(
@@ -803,8 +889,7 @@ mod tests {
             (3, &[(Grammar::Rust, BlobStatus::TooLarge)]),
         ]);
         // A blob that could not be read is one to do again, ...
-        let usable = grammars_with(&stored, |status| status != BlobStatus::Unreadable);
-        let (listing, pending_blobs) = settle(&files, &usable);
+        let (listing, pending_blobs) = settle(&files, &without_unreadable(&stored));
         assert_eq!(
             listing,
             [
@@ -814,7 +899,7 @@ mod tests {
         );
         assert_eq!(pending_blobs, [pending(2, &["b.rs"])]);
         // ... and when the build has done what it can, a blob it could not read is listed all the same.
-        let (listing, pending_blobs) = settle(&files, &grammars_with(&stored, |_| true));
+        let (listing, pending_blobs) = settle(&files, &stored);
         assert_eq!(listing.len(), 3);
         assert!(pending_blobs.is_empty());
     }
@@ -839,13 +924,66 @@ mod tests {
         let pending_blobs = vec![pending(1, &["a.rs"]), pending(4, &["d.rs"])];
         // The repo lacks all but 6.
         let missing: HashSet<String> = (1..=5).map(oid).collect();
-        // Not 3, which is too large to have tags.
+        // The blobs to parse come apart from those the index holds, which are fetched last and for their lines only. Not
+        // 3, which is too large to have tags.
         assert_eq!(
             to_fetch(&oids, &pending_blobs, &stored, &missing),
-            [oid(1), oid(2), oid(4), oid(5)]
+            (vec![oid(1), oid(4)], vec![oid(2), oid(5)])
         );
-        assert!(to_fetch(&oids, &pending_blobs, &stored, &HashSet::new()).is_empty());
-        assert!(to_fetch(&[], &pending_blobs, &stored, &missing).is_empty());
+        // A blob that is to be parsed for another name is no blob that is only held.
+        let stored_as_go = stored_as(&[(1, &[(Grammar::Go, BlobStatus::Parsed)])]);
+        assert_eq!(
+            to_fetch(&oids, &pending_blobs, &stored_as_go, &missing),
+            (vec![oid(1), oid(4)], vec![])
+        );
+        let nothing = (Vec::<String>::new(), Vec::<String>::new());
+        assert_eq!(
+            to_fetch(&oids, &pending_blobs, &stored, &HashSet::new()),
+            nothing
+        );
+        assert_eq!(to_fetch(&[], &pending_blobs, &stored, &missing), nothing);
+    }
+
+    #[test]
+    fn the_headers_the_content_has_to_place_are_those_parsed_under_two_grammars_of_c() {
+        let listing: Listing = vec![
+            ("a.h".to_string(), oid(1), Grammar::C),
+            // Another name of the same blob.
+            ("b/a.h".to_string(), oid(1), Grammar::C),
+            // A name that tells its grammar needs no content.
+            ("a.c".to_string(), oid(1), Grammar::C),
+            // Too large to be parsed: both rows say so, and there are no tags to choose between.
+            ("big.h".to_string(), oid(2), Grammar::C),
+            // One of the rows is a stale `unreadable` one.
+            ("stale.h".to_string(), oid(3), Grammar::Cpp),
+            ("lone.h".to_string(), oid(4), Grammar::C),
+            ("other.h".to_string(), oid(5), Grammar::C),
+        ];
+        let both = |status: BlobStatus| [(Grammar::C, status), (Grammar::Cpp, status)];
+        let stored = stored_as(&[
+            (1, &both(BlobStatus::Parsed)),
+            (2, &both(BlobStatus::TooLarge)),
+            (
+                3,
+                &[
+                    (Grammar::C, BlobStatus::Unreadable),
+                    (Grammar::Cpp, BlobStatus::Parsed),
+                ],
+            ),
+            (4, &[(Grammar::C, BlobStatus::Parsed)]),
+            // Parsed under two grammars, but not of the same family.
+            (
+                5,
+                &[
+                    (Grammar::C, BlobStatus::Parsed),
+                    (Grammar::Rust, BlobStatus::Parsed),
+                ],
+            ),
+        ]);
+        assert_eq!(
+            header_choices(&listing, &stored),
+            BTreeMap::from([(oid(1), vec![0, 1])])
+        );
     }
 
     #[test]

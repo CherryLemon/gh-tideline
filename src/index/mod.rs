@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tokio::sync::{Notify, Semaphore};
@@ -32,8 +32,8 @@ use build::{Build, Limits, Stop};
 use db::IndexDb;
 
 const JOBS_POISONED: &str = "index jobs poisoned";
-/// How many jobs that failed or were cancelled are kept for their outcome to be asked for. Past that they are forgotten,
-/// and a commit that was never built is `missing` all the same.
+/// How many jobs that failed or were cancelled are kept for their outcome to be asked for. Past that the oldest are
+/// forgotten, and a commit that was never built is `missing` all the same.
 const FINISHED_JOBS_KEPT: usize = 64;
 
 /// How far indexing a commit has come.
@@ -99,6 +99,8 @@ struct Progress {
     done: u64,
     total: u64,
     message: Option<String>,
+    /// When the job finished.
+    finished_at: Option<Instant>,
 }
 
 /// One build of one commit in one cache repo, and what it has done so far.
@@ -123,6 +125,7 @@ impl Job {
                 done: 0,
                 total: 0,
                 message: None,
+                finished_at: None,
             }),
         }
     }
@@ -194,6 +197,7 @@ impl Job {
     fn finish(&self, outcome: Result<(), Stop>) {
         let mut progress = self.progress();
         progress.phase = None;
+        progress.finished_at = Some(Instant::now());
         match outcome {
             Ok(()) => progress.state = IndexState::Ready,
             Err(Stop::Cancelled) => progress.state = IndexState::Cancelled,
@@ -206,11 +210,19 @@ impl Job {
 }
 
 /// Forgets the jobs whose outcome nobody needs: those that are ready (the database tells), and, when more than
-/// `FINISHED_JOBS_KEPT` failed or were cancelled, all of those. A job that has not finished is never forgotten.
+/// `FINISHED_JOBS_KEPT` failed or were cancelled, the oldest of those. A job that has not finished is never forgotten.
 fn forget_finished(jobs: &mut HashMap<(PathBuf, String), Arc<Job>>) {
     jobs.retain(|_, job| job.state() != IndexState::Ready);
-    if jobs.values().filter(|job| !job.active()).count() > FINISHED_JOBS_KEPT {
-        jobs.retain(|_, job| job.active());
+    let mut finished: Vec<_> = jobs
+        .iter()
+        .filter(|(_, job)| !job.active())
+        .map(|(key, job)| (job.progress().finished_at, key.clone()))
+        .collect();
+    if let Some(surplus) = finished.len().checked_sub(FINISHED_JOBS_KEPT) {
+        finished.sort();
+        for (_, key) in &finished[..surplus] {
+            jobs.remove(key);
+        }
     }
 }
 
@@ -554,6 +566,26 @@ mod tests {
         }
     }
 
+    /// Makes the remote of `repo` serve the first fetch it gets and refuse every one after it.
+    async fn serve_one_fetch_only(clone: &PartialClone, repo: &Repo) {
+        let served = clone.dir.join("fetch-served");
+        let script = clone.dir.join("serve-one-fetch.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "if [ -e '{0}' ]; then echo 'the remote is gone' >&2; exit 1; fi\ntouch '{0}'\nexec git upload-pack \"$@\"\n",
+                served.display()
+            ),
+        )
+        .unwrap();
+        let command = format!("sh {}", script.display());
+        git_in(
+            &repo.git_dir,
+            &["config", "remote.origin.uploadpack", &command],
+        )
+        .await;
+    }
+
     fn kept_tag() -> Tag {
         Tag {
             name: "kept".to_string(),
@@ -669,12 +701,13 @@ mod tests {
 
         assert_eq!(s.build(&head).await.state, IndexState::Ready);
         // The repo must hold a blob the index has tags of, for the lines of the references found in it, but not one
-        // that was too large to be parsed. The helpers come with the two sources the index lacked, in one fetch.
+        // that was too large to be parsed. The two sources the index lacked are fetched first and parsed, then the
+        // helpers are fetched in a fetch of their own, so that a failure of it cannot lose what was parsed.
         let missing = s.clone.repo.missing_objects(&head).await.unwrap();
         assert!(!missing.contains(&helpers));
         assert!(missing.contains(&big));
         let after = s.packs().await;
-        assert_eq!((after.0 - before.0, after.1 - before.1), (1, 3));
+        assert_eq!((after.0 - before.0, after.1 - before.1), (2, 3));
         let stored = s.db.blob_symbols(&helpers, Grammar::Rust).unwrap().unwrap();
         let names: Vec<&str> = stored.symbols.iter().map(|tag| tag.name.as_str()).collect();
         assert_eq!(names, ["kept"]);
@@ -742,6 +775,101 @@ mod tests {
                 s.db.blob_symbols(&python, Grammar::Python).unwrap()
             ),
             held
+        );
+        assert_eq!(s.listing(&head).len(), 4);
+    }
+
+    #[tokio::test]
+    async fn a_build_is_ready_if_the_blobs_the_index_holds_cannot_be_fetched() {
+        let s = Setup::new("index-held-fails").await;
+        let (base, head) = (s.clone.base.clone(), s.clone.head.clone());
+        let helpers = s.clone.oid(&head, "src/util/helpers.rs").await;
+        let python = s.clone.oid(&head, "dir with space/a b.py").await;
+        assert_eq!(s.build(&base).await.state, IndexState::Ready);
+        // A clone made anew, whose remote serves the one fetch for the blobs to parse (the new lib.rs and big.rs) and
+        // then goes away, before the fetch for the helpers and the Python file that the index holds.
+        let other = s.clone.another_cache().await;
+        serve_one_fetch_only(&s.clone, &other).await;
+
+        // The lines of their references are all those blobs are fetched for, which the lookups can do on their own:
+        // the commit is indexed all the same.
+        assert_eq!(
+            s.build_in(&other, &head).await,
+            IndexStatus::idle(&head, IndexState::Ready)
+        );
+        assert_eq!(s.listing(&head).len(), 4);
+        let text = s.clone.oid(&head, "same-1.txt").await;
+        let binary = s.clone.oid(&head, "data.bin").await;
+        assert_eq!(
+            other.missing_objects(&head).await.unwrap(),
+            HashSet::from([text, binary, helpers, python])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancel_while_the_blobs_the_index_holds_are_fetched_ends_the_build_all_the_same() {
+        let s = Setup::with_limits("index-held-cancel", limits_of_chunk(1)).await;
+        let gate = Gate::install(&s.clone).await;
+        let head = s.clone.head.clone();
+        // The index holds every source of the head, from builds in other clones, but has not listed the commit.
+        let mut rows = Vec::new();
+        for (path, grammar, status) in [
+            ("big.rs", Grammar::Rust, BlobStatus::TooLarge),
+            ("dir with space/a b.py", Grammar::Python, BlobStatus::Parsed),
+            ("src/lib.rs", Grammar::Rust, BlobStatus::Parsed),
+            ("src/util/helpers.rs", Grammar::Rust, BlobStatus::Parsed),
+        ] {
+            rows.push(NewBlob {
+                oid: s.clone.oid(&head, path).await,
+                grammar,
+                status,
+                size: 17,
+                tags: if status == BlobStatus::Parsed {
+                    vec![kept_tag()]
+                } else {
+                    Vec::new()
+                },
+            });
+        }
+        s.db.insert_blobs(rows).unwrap();
+        let before = s.packs().await;
+
+        // Nothing is to be parsed, so the job only fetches: the three blobs with tags, one at a time.
+        s.start(&head).await;
+        gate.begun().await;
+        let fetching = IndexStatus {
+            commit: head.clone(),
+            state: IndexState::Building,
+            phase: Some(Phase::Fetching),
+            done: 0,
+            total: 3,
+            cancelling: false,
+            message: None,
+        };
+        assert_eq!(s.status(&head).await, fetching);
+        assert!(s.cancel(&head).await.cancelling);
+
+        gate.open();
+        assert_eq!(
+            s.end(&head).await,
+            IndexStatus {
+                state: IndexState::Cancelled,
+                phase: None,
+                done: 1,
+                ..fetching
+            }
+        );
+        let after = s.packs().await;
+        assert_eq!((after.0 - before.0, after.1 - before.1), (1, 1));
+        assert!(!s.db.commit_complete(&head).unwrap());
+
+        // The next build fetches the two that are left, and lists the commit.
+        assert_eq!(s.build(&head).await.state, IndexState::Ready);
+        let after_all = s.packs().await;
+        assert_eq!(
+            (after_all.0 - after.0, after_all.1 - after.1),
+            (2, 2),
+            "only the blobs still missing are fetched"
         );
         assert_eq!(s.listing(&head).len(), 4);
     }
@@ -904,6 +1032,29 @@ mod tests {
         let after = s.packs().await;
         assert_eq!((after.0 - before.0, after.1 - before.1), (4, 4));
         assert_eq!(s.listing(&head).len(), 4);
+    }
+
+    #[tokio::test]
+    async fn a_job_that_finds_the_commit_complete_when_its_turn_comes_is_ready_without_fetching() {
+        let s = Setup::new("index-complete-meanwhile").await;
+        let gate = Gate::install(&s.clone).await;
+        let head = s.clone.head.clone();
+        let other = s.clone.another_cache().await;
+        let lacking = other.missing_objects(&head).await.unwrap();
+
+        // A build of the commit in one clone is under way, and another clone asks for the same commit: it waits.
+        s.start(&head).await;
+        gate.begun().await;
+        let auth = s.clone.auth.clone();
+        let queued = s.indexer.start(other.clone(), auth, &head).await.unwrap();
+        assert_eq!(queued, IndexStatus::idle(&head, IndexState::Queued));
+
+        // When the first build has listed the commit, the second has nothing left to do, not even to fetch.
+        gate.open();
+        assert_eq!(s.end(&head).await.state, IndexState::Ready);
+        let second = s.until_in(&other, &head, ended).await;
+        assert_eq!(second, IndexStatus::idle(&head, IndexState::Ready));
+        assert_eq!(other.missing_objects(&head).await.unwrap(), lacking);
     }
 
     #[tokio::test]
@@ -1081,14 +1232,23 @@ mod tests {
             jobs.insert(key(n), made(failed()));
         }
         forget_finished(&mut jobs);
-        assert_eq!(
-            jobs.values().filter(|job| !job.active()).count(),
-            FINISHED_JOBS_KEPT
-        );
-        // ...and past it none do, while the others stay.
+        let finished = |jobs: &HashMap<(PathBuf, String), Arc<Job>>| {
+            jobs.values().filter(|job| !job.active()).count()
+        };
+        assert_eq!(finished(&jobs), FINISHED_JOBS_KEPT);
+        // ...and past it the oldest go, whatever their commits are called, while the newest and the others stay.
         jobs.insert(key(9), made(failed()));
         forget_finished(&mut jobs);
-        assert_eq!(kept(&jobs), [0, 4]);
+        assert_eq!(finished(&jobs), FINISHED_JOBS_KEPT);
+        assert!(!jobs.contains_key(&key(2)));
+        assert!(jobs.contains_key(&key(9)) && jobs.contains_key(&key(3)));
+        jobs.insert(key(8), made(failed()));
+        jobs.insert(key(7), made(failed()));
+        forget_finished(&mut jobs);
+        assert_eq!(finished(&jobs), FINISHED_JOBS_KEPT);
+        assert!(!jobs.contains_key(&key(3)) && !jobs.contains_key(&key(10)));
+        assert!(jobs.contains_key(&key(7)) && jobs.contains_key(&key(11)));
+        assert!(jobs.contains_key(&key(0)) && jobs.contains_key(&key(4)));
     }
 
     #[tokio::test]
@@ -1320,7 +1480,12 @@ mod tests {
             ],
         )
         .await;
-        let s = Setup::over(clone, Limits::default()).await;
+        // Each header is read in a group of its own to be looked at.
+        let limits = Limits {
+            group_bytes: 1,
+            ..Limits::default()
+        };
+        let s = Setup::over(clone, limits).await;
         let head = s.clone.head.clone();
 
         assert_eq!(s.build(&head).await.state, IndexState::Ready);
