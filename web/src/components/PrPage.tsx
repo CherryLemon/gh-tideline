@@ -698,7 +698,7 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
   )
 
   const openFile = useCallback(
-    (path: string, jump?: PendingJump['where']) => {
+    (path: string, jump?: 'first' | 'last') => {
       pendingJump.current = jump ? { path, where: jump } : null
       if (path !== requested) navigate(location.pathname + fileQuery(path, location.search))
     },

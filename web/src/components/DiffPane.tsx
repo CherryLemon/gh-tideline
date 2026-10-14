@@ -2,13 +2,14 @@ import { forwardRef, useCallback, useEffect, useImperativeHandle, useLayoutEffec
 import { createPortal } from 'react-dom'
 import { DiffEditor, Editor } from '@monaco-editor/react'
 import type * as Monaco from 'monaco-editor/editor/editor.api'
-import type { ChangedFile, RepoRef, ReviewThread, TreeEntry } from '../api'
+import type { ChangedFile, NavPos, NavSide, RepoRef, ReviewThread, TreeEntry } from '../api'
 import { errorMessage } from '../api'
 import { SANDY_BEACH_THEME } from '../monaco/theme'
 import { ZoneHost } from '../monaco/zones'
 import { CommentGutter, type PickedLines } from '../monaco/gutter'
 import { LIMITS, isGitlink, shortSha } from '../degrade'
 import { formatBytes, loadFile, loadUnchanged, models, prefetchFile, type LoadedFile, type SideInfo } from '../monaco/files'
+import { mapLine } from '../nav/targets'
 import {
   commentableLines,
   gitLineCount,
@@ -34,10 +35,8 @@ export interface ChangeInfo {
   total: number
 }
 
-export interface PendingJump {
-  path: string
-  where: 'first' | 'last'
-}
+/** A move queued until the file's text (and diff) is ready: to its first / last change (F7), or to a place (`reveal`). */
+export type PendingJump = { path: string; where: 'first' | 'last' } | { path: string; pos: NavPos }
 
 /**
  * - moved: went to another change in this file;
@@ -66,6 +65,16 @@ export interface DiffPaneHandle {
   commentAtCursor(): CommentAtCursor
   /** Focuses the editor shown (in a diff, the side focused last), or the threads panel when there is none. */
   focus(): void
+  /**
+   * The caret as a place in the app: on the side focused last (in a diff), or in the plain editor. Null when no
+   * text is shown, or when the user hasn't put the caret anywhere in this file yet.
+   */
+  position(): NavPos | null
+  /**
+   * Puts the caret on `pos` (unfolding what hides it), brings it into view and focuses its editor. If its file's
+   * text isn't ready yet it is queued through `pendingJump`; a file without text (an image, a binary) ignores it.
+   */
+  reveal(pos: NavPos): void
 }
 
 /** The review threads of the file shown, and how to draw them. */
@@ -100,7 +109,7 @@ interface Props {
   nextFile: ChangedFile | null
   sideBySide: boolean
   ignoreTrimWhitespace: boolean
-  /** Set by the page before switching files with F7 / Shift+F7; applied once the diff is computed. */
+  /** Set by the page before switching files (F7 / Shift+F7, or to reveal a place); applied once the file is shown. */
   pendingJump: React.MutableRefObject<PendingJump | null>
   /** Controls shown at the right end of the file header. */
   headerActions?: React.ReactNode
@@ -201,11 +210,19 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
   const viewStates = useRef(new Map<string, { view: Monaco.editor.IDiffEditorViewState; fresh: boolean }>())
   /** As above, for the plain editor. */
   const singlePath = useRef<string | null>(null)
-  const singleViewStates = useRef(new Map<string, Monaco.editor.ICodeEditorViewState>())
+  const singleViewStates = useRef(new Map<string, { view: Monaco.editor.ICodeEditorViewState; fresh: boolean }>())
   /** Index of the change we last navigated to (valid while the caret stays on it). */
   const navIndex = useRef<number | null>(null)
-  /** True until the user moves the caret in a freshly opened file: F7 then goes to change #1 even at line 1. */
+  /**
+   * True until the user moves the caret in a freshly opened file: F7 then goes to change #1 even at line 1,
+   * and the caret isn't a place worth going back to (`position`).
+   */
   const fresh = useRef(true)
+  /**
+   * Where a reveal put the caret, until the view is moved: cards and unfolded lines that arrive later can push
+   * it out of view, so each card sync brings it back.
+   */
+  const settle = useRef<{ editor: EditorT; at: Monaco.IPosition; scrollTop: number } | null>(null)
   const onChangeInfoRef = useRef(onChangeInfo)
   onChangeInfoRef.current = onChangeInfo
   /** The thread cards in the diff editor. */
@@ -274,6 +291,7 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
       const line = anchor(changes[index], side)
       navIndex.current = index
       fresh.current = false
+      settle.current = null
       editor.setPosition({ lineNumber: line, column: 1 })
       editor.revealLineInCenterIfOutsideViewport(line)
       editor.focus()
@@ -286,7 +304,7 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
   const consumePendingJump = useCallback((): boolean => {
     const ed = editorRef.current
     const pj = pendingJump.current
-    if (!ed || !pj || pj.path !== shownPath.current) return false
+    if (!ed || !pj || !('where' in pj) || pj.path !== shownPath.current) return false
     const changes = ed.getLineChanges()
     if (!changes) return false
     pendingJump.current = null
@@ -330,7 +348,14 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
 
   useImperativeHandle(
     ref,
-    () => ({ nextChange: () => step(1), prevChange: () => step(-1), commentAtCursor: () => commentRef.current(), focus: () => focusRef.current() }),
+    () => ({
+      nextChange: () => step(1),
+      prevChange: () => step(-1),
+      commentAtCursor: () => commentRef.current(),
+      focus: () => focusRef.current(),
+      position: () => positionRef.current(),
+      reveal: (pos: NavPos) => revealRef.current(pos),
+    }),
     [step],
   )
 
@@ -346,6 +371,7 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
         if (e.source === 'mouse' || e.source === 'keyboard') {
           fresh.current = false
           navIndex.current = null
+          settle.current = null
         }
         reportRef.current()
       }
@@ -385,6 +411,9 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
     singleRef.current = ed
     // @monaco-editor/react attached an empty model of its own; files are set per load.
     ed.getModel()?.dispose()
+    ed.onDidChangeCursorPosition((e) => {
+      if (e.source === 'mouse' || e.source === 'keyboard') fresh.current = false
+    })
     setSingleReady(true)
   }, [])
 
@@ -405,7 +434,7 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
     if (!ed) return
     if (singlePath.current !== null && ed.getModel()) {
       const vs = ed.saveViewState()
-      if (vs) singleViewStates.current.set(singlePath.current, vs)
+      if (vs) singleViewStates.current.set(singlePath.current, { view: vs, fresh: fresh.current })
     }
     singlePath.current = null
     ed.setModel(null)
@@ -440,6 +469,7 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
           return
         }
         const ed = editorRef.current!
+        settle.current = null
         if (res.kind === 'single') {
           const se = singleRef.current!
           detachDiff()
@@ -447,7 +477,7 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
           // Includes the same path (refresh, retry): its scroll position is the one to keep.
           if (prevPath !== null && se.getModel()) {
             const vs = se.saveViewState()
-            if (vs) singleViewStates.current.set(prevPath, vs)
+            if (vs) singleViewStates.current.set(prevPath, { view: vs, fresh: fresh.current })
           }
           singlePath.current = file.path
           const unchanged = se.getModel() === res.model
@@ -455,8 +485,9 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
           models.setInUse([res.model])
           res.release()
           if (!(unchanged && prevPath === file.path)) {
-            const vs = singleViewStates.current.get(file.path)
-            if (vs) se.restoreViewState(vs)
+            const saved = singleViewStates.current.get(file.path)
+            fresh.current = !saved || saved.fresh
+            if (saved) se.restoreViewState(saved.view)
             else se.setScrollTop(0)
           }
           setAttached('single')
@@ -503,6 +534,9 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
       .catch((e: unknown) => {
         if (cancelled) return
         detach()
+        // A place to show would otherwise surface much later, after a retry.
+        const pj = pendingJump.current
+        if (pj && 'pos' in pj && pj.path === file.path) pendingJump.current = null
         setState({ kind: 'error', message: errorMessage(e) })
       })
     return () => {
@@ -551,9 +585,16 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
       ...(placement?.zones ?? []).map((z) => spec(z.thread.id, z)),
       ...(draftPlacement?.zones ?? []).map((z) => spec(draftCardKey(z.draft.key), z)),
     ]
+    // The caret a reveal brought into view, unless the view has been moved since.
+    const settled = settle.current
+    const stay = settled !== null && settled.editor.getScrollTop() === settled.scrollTop
     // Unfolding moves the caret; in a file the user hasn't moved in, leave it on the first change.
     const first = editorRef.current?.getLineChanges()?.[0]
     host.sync(specs, fresh.current ? (first ? anchor(first, 'modified') : 1) : 'keep')
+    if (settled && stay) {
+      settled.editor.revealPositionInCenterIfOutsideViewport(settled.at, 1)
+      settled.scrollTop = settled.editor.getScrollTop()
+    } else if (settled) settle.current = null
   }, [placed, placement, draftPlacement, host])
 
   // After the zones are synced: a box opened again is already placed, so `revealTick` runs this.
@@ -565,6 +606,89 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
       host.revealCard(draftCardKey(reveal))
     } else if (draftPlacement?.panel.some((d) => d.draft.key === reveal)) revealDraft.current = null
   }, [draftPlacement, host, revealTick])
+
+  /**
+   * Puts the caret on `pos`, brings it into view and focuses its editor; false when the file isn't shown yet.
+   * In a diff, the base side is the original editor in split view; unified view has only the modified editor,
+   * where an old line shows at the line the diff maps it to. The plain editor takes either side.
+   */
+  const showPos = (pos: NavPos): boolean => {
+    if (pos.path !== file.path) return false
+    const ed = editorRef.current
+    let editor: EditorT | null = null
+    let side: EditorSide = 'modified'
+    let line = pos.line
+    if (state.kind === 'single' && attached === 'single' && singlePath.current === file.path) {
+      editor = singleRef.current
+    } else if (ed && state.kind === 'text' && attached === 'diff' && shownPath.current === file.path) {
+      const changes = ed.getLineChanges()
+      const modified = ed.getModifiedEditor()
+      const modifiedModel = modified.getModel()
+      if (!changes || !modifiedModel) return false
+      if (pos.side === 'base') {
+        const mapped = mapLine(changes, line, 'original')
+        if (sideBySide) {
+          side = 'original'
+          // The original editor unfolds a collapsed region only part of the way to a line (Monaco's showOriginalLine
+          // reveals `bottom - top` lines), the modified one all the way, and a region hides the same lines on both sides.
+          modified.setPosition({ lineNumber: Math.min(Math.max(1, mapped), modifiedModel.getLineCount()), column: 1 })
+        } else line = mapped
+      }
+      editor = side === 'original' ? ed.getOriginalEditor() : modified
+    }
+    const model = editor?.getModel()
+    if (!editor || !model) return false
+    const lineNumber = Math.min(Math.max(1, line), model.getLineCount())
+    const at = { lineNumber, column: Math.min(Math.max(1, pos.column), model.getLineMaxColumn(lineNumber)) }
+    // Moving the caret also unfolds the unchanged lines that hide it.
+    editor.setPosition(at)
+    // Immediate (1), not the default smooth scrolling that a later scroll would cut short. Only if it is
+    // out of view, so Back to a file keeps the scroll position it had.
+    editor.revealPositionInCenterIfOutsideViewport(at, 1)
+    editor.focus()
+    lastSide.current = side
+    fresh.current = false
+    navIndex.current = null
+    if (editor === singleRef.current) return true
+    settle.current = { editor, at, scrollTop: editor.getScrollTop() }
+    reportChangeInfo()
+    return true
+  }
+
+  const position = (): NavPos | null => {
+    if (fresh.current) return null
+    const ed = editorRef.current
+    let editor: EditorT | null = null
+    let side: NavSide = 'head'
+    if (state.kind === 'single' && attached === 'single' && singlePath.current === file.path) {
+      editor = singleRef.current
+    } else if (ed && state.kind === 'text' && attached === 'diff' && shownPath.current === file.path) {
+      const original = sideBySide && lastSide.current === 'original'
+      if (original) side = 'base'
+      editor = original ? ed.getOriginalEditor() : ed.getModifiedEditor()
+    }
+    const caret = editor?.getPosition()
+    return caret ? { path: file.path, side, line: caret.lineNumber, column: caret.column } : null
+  }
+  const positionRef = useRef(position)
+  positionRef.current = position
+
+  const reveal = (pos: NavPos) => {
+    if (showPos(pos)) return
+    // No text to put a caret in: an image, a binary file, one too large to load, a submodule, a failed load.
+    if (pos.path === file.path && state.kind !== 'loading' && state.kind !== 'text' && state.kind !== 'single') return
+    pendingJump.current = { path: pos.path, pos }
+  }
+  const revealRef = useRef(reveal)
+  revealRef.current = reveal
+
+  // A place queued by `reveal` for a file that wasn't shown yet. After the cards are placed (above), which
+  // can move the caret to the first change; and once the file is visible, or its editor couldn't take focus.
+  useLayoutEffect(() => {
+    const pj = pendingJump.current
+    if (pj && 'pos' in pj && pj.path === file.path && showPos(pj.pos)) pendingJump.current = null
+    // `showPos` reads what these stand for, and `diffTick` the editor's diff.
+  }, [state.kind, attached, diffTick, file.path, host])
 
   // Lines GitHub takes comments on, per side (none on a side the file doesn't have);
   // 'stopped': Monaco gave up on the diff and shows the whole file as changed.

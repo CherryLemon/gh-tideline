@@ -207,6 +207,67 @@ export interface RepoRef {
   repo: string
 }
 
+/** Which version of a file: the PR's head (the new file) or its base (the old file). */
+export type NavSide = 'head' | 'base'
+
+/** A position in the app, for history entries and for revealing a place in the diff. */
+export interface NavPos {
+  /** The PR file path as in `?file=` (for a renamed file, its new path even on the base side). */
+  path: string
+  /** 'base' is the original (left) editor; 'head' the modified (right) editor, or the single editor of an unchanged file. */
+  side: NavSide
+  line: number
+  column: number
+}
+
+export interface SymbolInfo {
+  name: string
+  kind: string
+  line: number
+  column: number
+  endColumn: number
+  startLine: number
+  endLine: number
+}
+
+export interface FileSymbols {
+  /** null when the file's language has no grammar. */
+  language: string | null
+  tooLarge: boolean
+  symbols: SymbolInfo[]
+}
+
+export type IndexState = 'missing' | 'queued' | 'building' | 'ready' | 'failed' | 'cancelled'
+
+export interface IndexStatus {
+  commit: string
+  state: IndexState
+  phase: 'listing' | 'fetching' | 'parsing' | 'saving' | null
+  done: number
+  total: number
+  cancelling: boolean
+  message: string | null
+}
+
+export interface NavHit {
+  path: string
+  line: number
+  column: number
+  endColumn: number
+  kind: string
+  snippet: string
+  snippetColumn: number
+  tier: 'file' | 'dir' | 'other'
+}
+
+export interface NavResult {
+  language: string | null
+  commit: string
+  name: string
+  hits: NavHit[]
+  truncated: boolean
+}
+
 export const UNAUTHORIZED_MESSAGE = 'Run `gh-tideline` in a terminal to authorize this browser'
 export const STALE_HEAD_MESSAGE = 'The pull request has been updated; refresh to load the new version'
 
