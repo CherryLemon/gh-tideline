@@ -3,11 +3,15 @@
 ; (upstream has none). When several patterns tag the same name, the one written first wins, so definitions come before
 ; references and constructors before the general function and method patterns.
 
-; constructors defined in a class body: the function has the name of the class (`@local.reference` is a capture the
-; tags crate ignores; it only serves to compare the two names)
+; constructors defined in a class body: the function has the name of the class (`@local.reference` is a capture that
+; tags nothing; it only serves to compare the two names). A class template specialization is named `Box<T *>`.
 
 ((class_specifier
-    name: (type_identifier) @local.reference
+    name: [
+        (type_identifier) @local.reference
+        (template_type
+            name: (type_identifier) @local.reference)
+    ]
     body: (field_declaration_list
         (function_definition
             declarator: (function_declarator
@@ -15,19 +19,28 @@
     (#eq? @local.reference @name))
 
 ((struct_specifier
-    name: (type_identifier) @local.reference
+    name: [
+        (type_identifier) @local.reference
+        (template_type
+            name: (type_identifier) @local.reference)
+    ]
     body: (field_declaration_list
         (function_definition
             declarator: (function_declarator
                 declarator: (identifier) @name)) @definition.constructor))
     (#eq? @local.reference @name))
 
-; constructors defined outside of their class (`Foo::Foo() {}`, `ns::Foo::Foo() {}`)
+; constructors defined outside of their class (`Foo::Foo() {}`, `ns::Foo::Foo() {}`, and `Foo<T>::Foo() {}` of a class
+; template)
 
 ((function_definition
     declarator: (function_declarator
         declarator: (qualified_identifier
-            scope: (namespace_identifier) @local.reference
+            scope: [
+                (namespace_identifier) @local.reference
+                (template_type
+                    name: (type_identifier) @local.reference)
+            ]
             name: (identifier) @name))) @definition.constructor
     (#eq? @local.reference @name))
 
@@ -35,7 +48,11 @@
     declarator: (function_declarator
         declarator: (qualified_identifier
             name: (qualified_identifier
-                scope: (namespace_identifier) @local.reference
+                scope: [
+                    (namespace_identifier) @local.reference
+                    (template_type
+                        name: (type_identifier) @local.reference)
+                ]
                 name: (identifier) @name)))) @definition.constructor
     (#eq? @local.reference @name))
 
@@ -44,7 +61,11 @@
         declarator: (qualified_identifier
             name: (qualified_identifier
                 name: (qualified_identifier
-                    scope: (namespace_identifier) @local.reference
+                    scope: [
+                        (namespace_identifier) @local.reference
+                        (template_type
+                            name: (type_identifier) @local.reference)
+                    ]
                     name: (identifier) @name))))) @definition.constructor
     (#eq? @local.reference @name))
 

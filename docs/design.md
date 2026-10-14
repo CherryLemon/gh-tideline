@@ -127,7 +127,7 @@ The defaults stay as close to JetBrains as possible, and they are configurable.
  gh tideline <pr>  ──start / reuse──▶  local server (Rust, 127.0.0.1:PORT)
                                 ├─ git layer ──── runs git commands ──▶ cache repo (bare + partial + shallow)
                                 ├─ GitHub layer ─ GraphQL / REST ──▶ api.github.com / GHE
-                                ├─ index layer (M3) ─ tree-sitter-tags ──▶ SQLite
+                                ├─ index layer (M3) ─ tree-sitter tags queries ──▶ SQLite
                                 └─ HTTP: /api/*, /api/events (SSE), static assets (embedded in the binary)
                                           ▲
  browser single-page app (TS + React) ────┘
@@ -145,7 +145,7 @@ The defaults stay as close to JetBrains as possible, and they are configurable.
 | Embedded frontend | rust-embed | The result is a single binary |
 | Cache directory | directories | Follows the XDG spec |
 | Opening the browser | webbrowser | |
-| Index (M3) | tree-sitter + tree-sitter-tags + per-language grammar crates; stored with rusqlite | tags.scm is exactly what GitHub's "search-based code navigation" uses |
+| Index (M3) | tree-sitter + per-language grammar crates, with our own tags queries and our own runner for them (not the `tree-sitter-tags` crate); stored with rusqlite | tags.scm is exactly what GitHub's "search-based code navigation" uses. The `tree-sitter-tags` crate can neither be cancelled nor given a time limit, and some files (deeply nested code, long runs of comments) take it tens of seconds or more |
 | Frontend | Vite + React + TS | |
 | Editor | monaco-editor (bundled into the frontend, not loaded from a CDN) + @monaco-editor/react | Built-in side-by-side / unified views, collapsing of unchanged regions, word-level highlighting and view zones. It also lets us register a definition provider |
 | Highlighting | shiki + @shikijs/monaco | Uses TextMate grammars, so highlighting quality matches VS Code and beats Monaco's built-in Monarch |
@@ -166,7 +166,7 @@ src/
   git/           cache repo management, fetch, diff, cat-file process pool, one lock per repo
   github/        token lookup, GraphQL / REST client, ETag cache
   pr/            ties git and GitHub together: open a PR, file list, review threads and review writing
-  index/  (M3)   symbol extraction with tree-sitter-tags, SQLite, definition and usage lookup
+  index/  (M3)   symbol extraction with tree-sitter tags queries, SQLite, definition and usage lookup
   config.rs      config file ~/.config/tideline/config.toml
 web/             frontend project; rust-embed embeds its build output
 ```
@@ -386,7 +386,7 @@ Drafts live on GitHub, not in Tideline: a review started here can be finished on
 1. `git ls-tree -r -z --long <head>` lists all files in the head version.
 2. Filter by extension to the supported languages, and keep only files of 1 MB or less.
 3. Batch-fetch these blobs in one go, with the method from step 6 of 5.1.
-4. Read them one by one through `cat-file --batch`, and extract symbols with tree-sitter-tags.
+4. Read them one by one through `cat-file --batch`, and extract symbols by running the tree-sitter tags queries. A file that takes more than 1.5 seconds to parse and match is given up on (it has no symbols), and a cancelled build stops within the file it is on.
 
 **The index is keyed by blob OID, not by commit.** Files with the same content have the same OID.
 So when the same repo moves to another head or another PR, only the new blobs need processing, and the increment is small.

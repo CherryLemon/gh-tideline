@@ -2,8 +2,10 @@
 ; declarator, so a scope ends at the signature), and calls and type uses are references (upstream has none). When several
 ; patterns tag the same name, the one written first wins, so definitions come before references.
 
-; function definitions, with the declarator possibly wrapped in pointer or parenthesized declarators
-; (`char *f(void)`, `int (*f(void))(int)`); declarations without a body are not definitions
+; function definitions; declarations without a body are not definitions. The name is found by following the
+; `declarator` fields from the function down to its function declarator, which never leads into the parameters (a
+; wildcard that matches any child would tag `cb` for `void f(int cb(int)) {}`). A pattern cannot repeat, so every
+; depth is written out: up to five pointer declarators around the function declarator (`char **f(void)`) ...
 
 (function_definition
     declarator: (function_declarator
@@ -11,21 +13,66 @@
 
 (function_definition
     declarator: (_
-        (function_declarator
+        declarator: (function_declarator
             declarator: (identifier) @name))) @definition.function
 
 (function_definition
     declarator: (_
-        (_
-            (function_declarator
+        declarator: (_
+            declarator: (function_declarator
                 declarator: (identifier) @name)))) @definition.function
 
 (function_definition
     declarator: (_
-        (_
-            (_
-                (function_declarator
+        declarator: (_
+            declarator: (_
+                declarator: (function_declarator
                     declarator: (identifier) @name))))) @definition.function
+
+(function_definition
+    declarator: (_
+        declarator: (_
+            declarator: (_
+                declarator: (_
+                    declarator: (function_declarator
+                        declarator: (identifier) @name)))))) @definition.function
+
+(function_definition
+    declarator: (_
+        declarator: (_
+            declarator: (_
+                declarator: (_
+                    declarator: (_
+                        declarator: (function_declarator
+                            declarator: (identifier) @name))))))) @definition.function
+
+; ... and a function that returns a function pointer or a pointer to an array, whose name is inside parentheses
+; (`int (*f(void))(int)`, `char *(**f(void))[3]`), with up to one pointer declarator in front and two inside
+
+(function_definition
+    declarator: (_
+        declarator: (parenthesized_declarator
+            (_
+                declarator: [
+                    (function_declarator
+                        declarator: (identifier) @name)
+                    (_
+                        declarator: (function_declarator
+                            declarator: (identifier) @name))
+                ])))) @definition.function
+
+(function_definition
+    declarator: (_
+        declarator: (_
+            declarator: (parenthesized_declarator
+                (_
+                    declarator: [
+                        (function_declarator
+                            declarator: (identifier) @name)
+                        (_
+                            declarator: (function_declarator
+                                declarator: (identifier) @name))
+                    ]))))) @definition.function
 
 ; struct, union and enum definitions (without a body they are only uses of the type)
 

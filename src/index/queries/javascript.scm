@@ -1,4 +1,4 @@
-; Additions to the upstream JavaScript tags query for the JavaScript grammar only.
+; Additions to ecma_base.scm and ecma.scm for the JavaScript grammar only.
 
 ; class fields holding functions
 

@@ -4,15 +4,22 @@
 //! queries in `queries/` are ours (most replace the ones shipped with the grammars, which tag little more than
 //! definitions): they also tag calls and type uses as references, and tag whole definitions so a scope spans the
 //! entire function or class. Where several patterns tag the same name node, the pattern written first wins.
+//!
+//! Running the queries is ours too, not the `tree-sitter-tags` crate's: tree-sitter's query cursor takes minutes on some
+//! files that are not code (see `parse`), and the crate cannot be told to give up on them.
 
-use std::cell::RefCell;
-use std::collections::HashMap;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
+use std::ops::{ControlFlow, Range};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
-use tree_sitter::Language;
-use tree_sitter_tags::{TagsConfiguration, TagsContext};
+use tree_sitter::{
+    Language, ParseOptions, ParseState, Parser, Query, QueryCursor, QueryCursorOptions,
+    QueryCursorState, StreamingIterator,
+};
 
 use super::lang::Grammar;
 
@@ -22,7 +29,9 @@ const PYTHON_QUERY: &str = include_str!("queries/python.scm");
 const JAVA_QUERY: &str = include_str!("queries/java.scm");
 const C_QUERY: &str = include_str!("queries/c.scm");
 const CPP_QUERY: &str = include_str!("queries/cpp.scm");
-/// Additions to the upstream JavaScript and TypeScript queries, shared by JavaScript, TypeScript and TSX.
+/// The JavaScript query that JavaScript, TypeScript and TSX start from.
+const ECMA_BASE_QUERY: &str = include_str!("queries/ecma_base.scm");
+/// Additions to `ECMA_BASE_QUERY` that are valid in all three grammars.
 const ECMA_QUERY: &str = include_str!("queries/ecma.scm");
 const JAVASCRIPT_QUERY: &str = include_str!("queries/javascript.scm");
 const JSX_QUERY: &str = include_str!("queries/jsx.scm");
@@ -30,6 +39,15 @@ const TYPESCRIPT_QUERY: &str = include_str!("queries/typescript.scm");
 
 /// A byte order mark, ignored like the editor ignores it.
 const BOM: &[u8] = b"\xEF\xBB\xBF";
+/// How long `parse` works on one file at most, parsing and matching together. Real code never comes near it (a file of
+/// 1 MiB takes about a tenth of a second); text that is not code can: a megabyte of `+` after an `=` takes tree-sitter's
+/// query cursor half a minute. The limit is wall-clock time, so a busy machine can only make a file slower by a factor
+/// of ten before it is given up on.
+const TIME_LIMIT: Duration = Duration::from_millis(1500);
+/// The depth in the syntax tree below which nothing is tagged. The query cursor keeps the depth where a match starts in
+/// 16 bits: from depth 65 536 on, matches are lost track of, pile up and make the work grow with the square of the
+/// depth. Code nested even a thousand levels deep is not code.
+const MAX_DEPTH: u32 = 60_000;
 /// The longest snippet, in UTF-16 code units.
 const SNIPPET_UNITS: usize = 200;
 /// How many code units before the name a snippet starts when the name is too far into a long line to fit.
@@ -82,61 +100,88 @@ impl fmt::Display for ParseError {
     }
 }
 
-impl From<tree_sitter_tags::Error> for ParseError {
-    fn from(error: tree_sitter_tags::Error) -> Self {
-        match error {
-            tree_sitter_tags::Error::Cancelled => ParseError::Cancelled,
-            other => ParseError::Failed(other.to_string()),
-        }
-    }
-}
-
 thread_local! {
     /// Parsers are expensive to create and cheap to reuse.
-    static CONTEXT: RefCell<TagsContext> = RefCell::new(TagsContext::new());
+    static ENGINE: RefCell<Engine> = RefCell::new(Engine {
+        parser: Parser::new(),
+        cursor: QueryCursor::new(),
+    });
 }
 
 /// Tags of one file, ordered by (line, column). A leading byte order mark is ignored. `cancel` is tree-sitter's
-/// cancellation flag: once it is non-zero the parse stops with `Err(Cancelled)`.
+/// cancellation flag: once it is non-zero (before or during the call) the call stops with `Err(Cancelled)`.
 ///
 /// When overlapping patterns tag the same name more than once as a definition (or more than once as a reference),
 /// only the first tag is kept, and a reference that sits exactly on the name of a definition is dropped: the catch-all
 /// patterns that tag every type name also match the name of a type being defined. Source that is not valid code
 /// yields whatever tags the parser could recover, never an error.
+///
+/// A file is given up on after `TIME_LIMIT`: the call returns `Ok` with no tags at all (it is no error, and not
+/// different from an empty file; the caller has nothing to retry). Tags nested deeper than `MAX_DEPTH` are left out.
+/// Neither happens to code, only to text that makes tree-sitter spend minutes on a megabyte.
 pub fn parse(
     grammar: Grammar,
     src: &[u8],
     cancel: Option<&AtomicUsize>,
 ) -> Result<Vec<Tag>, ParseError> {
-    // The flag is otherwise only looked at while parsing, which a small file may finish without ever doing.
+    parse_within(grammar, src, cancel, TIME_LIMIT)
+}
+
+/// `parse` that gives up after `limit` instead of `TIME_LIMIT`.
+fn parse_within(
+    grammar: Grammar,
+    src: &[u8],
+    cancel: Option<&AtomicUsize>,
+    limit: Duration,
+) -> Result<Vec<Tag>, ParseError> {
+    // The flag is otherwise only looked at while working, which a small file may finish without ever doing.
     if cancelled(cancel) {
         return Err(ParseError::Cancelled);
     }
     let src = src.strip_prefix(BOM).unwrap_or(src);
     let config = config(grammar)?;
-    let found = CONTEXT.with_borrow_mut(
-        |context| -> Result<Vec<tree_sitter_tags::Tag>, ParseError> {
-            let (found, _) = context.generate_tags(config, src, cancel)?;
-            Ok(found.collect::<Result<_, _>>()?)
-        },
-    )?;
+    let budget = Budget {
+        cancel,
+        deadline: Instant::now() + limit,
+        timed_out: Cell::new(false),
+    };
+    let Some(mut found) = ENGINE.with_borrow_mut(|engine| engine.find(config, src, &budget))?
+    else {
+        return Ok(Vec::new());
+    };
+    if grammar == Grammar::Rust {
+        // `r#type` is the name `type`.
+        for tag in &mut found {
+            if src[tag.name.clone()].starts_with(b"r#") {
+                tag.name.start += 2;
+            }
+        }
+    }
 
     let line_starts = line_starts(src);
     let row_of = |offset: usize| line_starts.partition_point(|&start| start <= offset) - 1;
+    // The row, byte and UTF-16 column where the previous tag starts: the next tag is on the same line more often than
+    // not, and counting from the start of a line of 100 000 bytes for each of 8000 tags on it would take forever.
+    let mut previous = (usize::MAX, 0, 0);
     let mut tags = Vec::new();
-    for i in select(src, &found) {
+    for i in select(grammar, src, &found) {
         let found = &found[i];
-        let name = String::from_utf8_lossy(&src[found.name_range.clone()]).into_owned();
-        let kind = config.syntax_type_name(found.syntax_type_id);
-        let row = found.span.start.row;
+        let name = String::from_utf8_lossy(&src[found.name.clone()]).into_owned();
+        let kind = config.kind(found.capture);
+        let row = row_of(found.name.start);
+        let (from_byte, from_column) = match previous {
+            (previous_row, byte, column) if previous_row == row => (byte, column),
+            _ => (line_starts[row], 0),
+        };
+        let column = from_column + utf16_len(&src[from_byte..found.name.start]);
+        let end_column = column + utf16_len(&src[found.name.clone()]);
+        previous = (row, found.name.start, column);
         let (scope_start, scope_end, snippet, snippet_column) =
-            if found.is_definition || kind == "implementation" {
+            if found.is_def || kind == "implementation" {
                 let line_start = line_starts[row];
                 let line_end = line_starts.get(row + 1).map_or(src.len(), |&next| next - 1);
-                let (snippet, snippet_column) = snippet_at(
-                    &src[line_start..line_end],
-                    found.name_range.start - line_start,
-                );
+                let (snippet, snippet_column) =
+                    snippet_at(&src[line_start..line_end], found.name.start - line_start);
                 // A node can end with its line break (a C `#define`), which belongs to the next line.
                 let last = found.range.end.saturating_sub(1).max(found.range.start);
                 (
@@ -151,10 +196,10 @@ pub fn parse(
         tags.push(Tag {
             name,
             kind: kind.to_string(),
-            is_def: found.is_definition,
+            is_def: found.is_def,
             line: row as u32 + 1,
-            column: found.utf16_column_range.start as u32 + 1,
-            end_column: found.utf16_column_range.end as u32 + 1,
+            column: column as u32 + 1,
+            end_column: end_column as u32 + 1,
             scope_start: scope_start as u32 + 1,
             scope_end: scope_end as u32 + 1,
             snippet,
@@ -164,17 +209,153 @@ pub fn parse(
     Ok(tags)
 }
 
+/// What a call of `parse` may spend: it stops, as soon as tree-sitter asks, when `cancel` is raised or the deadline
+/// has passed.
+struct Budget<'a> {
+    cancel: Option<&'a AtomicUsize>,
+    deadline: Instant,
+    /// Whether the deadline made the work stop.
+    timed_out: Cell<bool>,
+}
+
+impl Budget<'_> {
+    /// tree-sitter calls this every few hundred steps of the parse and of the matching; it costs an atomic load and a
+    /// clock reading.
+    fn check(&self) -> ControlFlow<()> {
+        if cancelled(self.cancel) {
+            ControlFlow::Break(())
+        } else if Instant::now() >= self.deadline {
+            self.timed_out.set(true);
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    }
+
+    /// The result of work that stopped early.
+    fn stopped<T>(&self) -> Result<Option<T>, ParseError> {
+        if cancelled(self.cancel) {
+            Err(ParseError::Cancelled)
+        } else if self.timed_out.get() {
+            Ok(None)
+        } else {
+            Err(ParseError::Failed("the parser gave up".to_string()))
+        }
+    }
+}
+
+/// A tag found by a query, before anything is read from the source.
+struct Found {
+    /// Where the name is.
+    name: Range<usize>,
+    /// The node the tag is for, grown to include the name.
+    range: Range<usize>,
+    /// The `@definition.<kind>` or `@reference.<kind>` capture that tags it.
+    capture: u32,
+    is_def: bool,
+}
+
+/// The parser and query cursor of a thread.
+struct Engine {
+    parser: Parser,
+    cursor: QueryCursor,
+}
+
+impl Engine {
+    /// The tags of `src` in the order the tags crate would hand them out: the matches of the query in the order
+    /// tree-sitter finds them, with one tag per name node (the pattern written first wins), except that a tag is handed
+    /// out as soon as the matching has moved past its name. `Ok(None)` when the time ran out.
+    fn find(
+        &mut self,
+        config: &Config,
+        src: &[u8],
+        budget: &Budget,
+    ) -> Result<Option<Vec<Found>>, ParseError> {
+        self.parser
+            .set_language(&config.language)
+            .map_err(|e| ParseError::Failed(e.to_string()))?;
+        self.parser.reset();
+        let mut on_parse_progress = |_: &ParseState| budget.check();
+        let tree = self.parser.parse_with_options(
+            &mut |at, _| src.get(at..).unwrap_or_default(),
+            None,
+            Some(ParseOptions::new().progress_callback(&mut on_parse_progress)),
+        );
+        let Some(tree) = tree else {
+            return budget.stopped();
+        };
+
+        let mut on_query_progress = |_: &QueryCursorState| budget.check();
+        self.cursor.set_max_start_depth(Some(MAX_DEPTH));
+        let mut matches = self.cursor.matches_with_options(
+            &config.query,
+            tree.root_node(),
+            src,
+            QueryCursorOptions::new().progress_callback(&mut on_query_progress),
+        );
+        let mut found = Vec::new();
+        // Tags not handed out yet, each with the index of the pattern that matched it, sorted by where the name ends and
+        // starts.
+        let mut queue: VecDeque<(Found, usize)> = VecDeque::new();
+        while let Some(m) = matches.next() {
+            let (mut name, mut tagged) = (None, None);
+            for capture in m.captures() {
+                match config.captures[capture.index as usize] {
+                    Capture::Name => name = Some(capture.node),
+                    Capture::Tag { is_def } => tagged = Some((capture, is_def)),
+                    Capture::Other => {}
+                }
+            }
+            let (Some(name), Some((tagged, is_def))) = (name, tagged) else {
+                continue;
+            };
+            if name.has_error() {
+                continue;
+            }
+            let (name_range, node_range) = (name.byte_range(), tagged.node.byte_range());
+            let tag = Found {
+                range: node_range.start.min(name_range.start)..node_range.end.max(name_range.end),
+                name: name_range,
+                capture: tagged.index,
+                is_def,
+            };
+            let key = |tag: &Found| (tag.name.end, tag.name.start);
+            match queue.binary_search_by_key(&key(&tag), |(queued, _)| key(queued)) {
+                Ok(at) => {
+                    if queue[at].1 > m.pattern_index {
+                        queue[at] = (tag, m.pattern_index);
+                    }
+                }
+                Err(at) => queue.insert(at, (tag, m.pattern_index)),
+            }
+            // What ends before the last name starts is final, unless a pattern that completes late (a C++ class, once
+            // the body is seen) matches the same name again.
+            while queue.len() > 1 && queue[0].0.name.end < queue[queue.len() - 1].0.name.start {
+                found.extend(queue.pop_front().map(|(tag, _)| tag));
+            }
+        }
+        // Matching that stopped early looks like matching that ran out of nodes.
+        if cancelled(budget.cancel) || budget.timed_out.get() {
+            return budget.stopped();
+        }
+        found.extend(queue.into_iter().map(|(tag, _)| tag));
+        Ok(Some(found))
+    }
+}
+
 /// The indices into `found` of the tags to keep, in source order: tags with an identifier-like name, the first one
 /// per name node and kind of tag, and no reference on the name of a definition.
 ///
-/// The tags crate keeps one tag per name node, preferring the pattern written first, but only among the tags it has
+/// `Engine::find` keeps one tag per name node, preferring the pattern written first, but only among the tags it has
 /// not handed out yet. A pattern that matches late (a C++ class, once the body is seen) loses to a catch-all that
 /// already matched the same name, so both can arrive.
-fn select(src: &[u8], found: &[tree_sitter_tags::Tag]) -> Vec<usize> {
+fn select(grammar: Grammar, src: &[u8], found: &[Found]) -> Vec<usize> {
     let mut kept: HashMap<(usize, usize, bool), usize> = HashMap::new();
     for (i, tag) in found.iter().enumerate() {
-        if std::str::from_utf8(&src[tag.name_range.clone()]).is_ok_and(plausible_name) {
-            kept.entry((tag.name_range.start, tag.name_range.end, tag.is_definition))
+        if std::str::from_utf8(&src[tag.name.clone()])
+            .is_ok_and(|name| plausible_name(grammar, name))
+        {
+            kept.entry((tag.name.start, tag.name.end, tag.is_def))
                 .or_insert(i);
         }
     }
@@ -183,7 +364,7 @@ fn select(src: &[u8], found: &[tree_sitter_tags::Tag]) -> Vec<usize> {
         .filter(|&(&(start, end, is_def), _)| is_def || !kept.contains_key(&(start, end, true)))
         .map(|(_, &i)| i)
         .collect();
-    indices.sort_by_key(|&i| (found[i].name_range.start, i));
+    indices.sort_by_key(|&i| (found[i].name.start, i));
     indices
 }
 
@@ -232,14 +413,20 @@ fn snippet_at(line: &[u8], name_byte: usize) -> (String, u32) {
     } else {
         0
     };
+    let mut shown = head;
     let mut dropped = 0;
+    for ch in head.chars() {
+        if dropped >= drop_units {
+            break;
+        }
+        dropped += ch.len_utf16();
+        shown = &shown[ch.len_utf8()..];
+    }
+    // The window can start in the middle of the whitespace between two tokens.
+    let shown = shown.trim_start();
     let mut units = 0;
     let mut snippet = String::new();
-    for ch in head.chars().chain(tail.chars()) {
-        if dropped < drop_units {
-            dropped += ch.len_utf16();
-            continue;
-        }
+    for ch in shown.chars().chain(tail.chars()) {
         if units + ch.len_utf16() > SNIPPET_UNITS {
             break;
         }
@@ -247,7 +434,7 @@ fn snippet_at(line: &[u8], name_byte: usize) -> (String, u32) {
         snippet.push(ch);
     }
     snippet.truncate(snippet.trim_end().len());
-    (snippet, (head_units - dropped) as u32 + 1)
+    (snippet, shown.encode_utf16().count() as u32 + 1)
 }
 
 /// The byte offset in `line` of the char that starts at the 0-based UTF-16 `unit`, or the end of the line when it is
@@ -274,7 +461,20 @@ fn byte_offset_of(line: &[u8], unit: usize) -> usize {
     offset
 }
 
-/// Start offsets of every line.
+/// The number of UTF-16 units of `bytes`, where a run of invalid UTF-8 counts as one, like the parser counts it.
+fn utf16_len(bytes: &[u8]) -> usize {
+    bytes
+        .utf8_chunks()
+        .map(|chunk| {
+            let valid: usize = chunk.valid().chars().map(char::len_utf16).sum();
+            valid + usize::from(!chunk.invalid().is_empty())
+        })
+        .sum()
+}
+
+/// Start offsets of every line. A line ends with `\n`, which also covers `\r\n`: files with LF or CRLF line breaks are
+/// the contract. A `\r` on its own is not a line break, as in tree-sitter's rows (an editor that counts it as one, for
+/// a file from classic Mac OS, disagrees with the lines here).
 fn line_starts(src: &[u8]) -> Vec<usize> {
     std::iter::once(0)
         .chain(
@@ -287,28 +487,90 @@ fn line_starts(src: &[u8]) -> Vec<usize> {
 }
 
 /// Whether `name` looks like an identifier. The upstream queries also capture things like `ns.Thing` or `(getClass())`.
-fn plausible_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= MAX_NAME_BYTES
-        && !name.chars().any(|c| c.is_whitespace() || c.is_control())
-        // C++ operators (`operator()`, `operator[]`) are the one name with punctuation.
-        && (name.starts_with("operator")
-            || !name.contains(['.', ',', ';', ':', '(', ')', '[', ']', '{', '}', '"', '\'', '`', '\\']))
+///
+/// C++ operators (`operator()`, `operator[]`, `operator bool`, `operator delete[]`) are the one kind of name with
+/// punctuation or a space in it. They are told from identifiers that start with `operator` (a JavaScript
+/// `operators.Binary`) by the character after the keyword and by the grammar.
+fn plausible_name(grammar: Grammar, name: &str) -> bool {
+    if name.is_empty() || name.len() > MAX_NAME_BYTES || name.chars().any(char::is_control) {
+        return false;
+    }
+    let operator = grammar == Grammar::Cpp
+        && name.strip_prefix("operator").is_some_and(|rest| {
+            !rest.starts_with(|c: char| c.is_alphanumeric() || c == '_' || c == '$')
+        });
+    if operator {
+        return true;
+    }
+    !name.chars().any(char::is_whitespace)
+        && !name.contains([
+            '.', ',', ';', ':', '(', ')', '[', ']', '{', '}', '"', '\'', '`', '\\',
+        ])
 }
 
 fn cancelled(cancel: Option<&AtomicUsize>) -> bool {
     cancel.is_some_and(|flag| flag.load(Ordering::Relaxed) != 0)
 }
 
-/// The tags configuration of a grammar, compiled on first use.
-fn config(grammar: Grammar) -> Result<&'static TagsConfiguration, ParseError> {
-    static CONFIGS: [OnceLock<Result<TagsConfiguration, String>>; Grammar::ALL.len()] =
+/// A compiled query and what its captures mean.
+struct Config {
+    language: Language,
+    query: Query,
+    /// For each capture of the query, by index.
+    captures: Vec<Capture>,
+}
+
+enum Capture {
+    /// `@name`, the node whose text is the name.
+    Name,
+    /// `@definition.<kind>` or `@reference.<kind>`, the node that is tagged.
+    Tag { is_def: bool },
+    /// Captures that only serve the predicates of the query (`@local.reference`).
+    Other,
+}
+
+impl Config {
+    fn new(grammar: Grammar) -> Result<Self, String> {
+        let error = |what: &dyn fmt::Display| format!("{} tags query: {what}", grammar.id());
+        let language = language(grammar);
+        let query = Query::new(&language, &tags_query(grammar)).map_err(|e| error(&e))?;
+        let mut has_name = false;
+        let mut captures = Vec::new();
+        for name in query.capture_names() {
+            captures.push(match *name {
+                "name" => {
+                    has_name = true;
+                    Capture::Name
+                }
+                "local.reference" => Capture::Other,
+                _ if name.starts_with("definition.") => Capture::Tag { is_def: true },
+                _ if name.starts_with("reference.") => Capture::Tag { is_def: false },
+                _ => return Err(error(&format!("invalid capture @{name}"))),
+            });
+        }
+        if !has_name {
+            return Err(error(&"no @name capture"));
+        }
+        Ok(Config {
+            language,
+            query,
+            captures,
+        })
+    }
+
+    /// The kind of a `Capture::Tag`: `function` for `@definition.function`.
+    fn kind(&self, capture: u32) -> &str {
+        let name = self.query.capture_names()[capture as usize];
+        name.split_once('.').map_or(name, |(_, kind)| kind)
+    }
+}
+
+/// The configuration of a grammar, compiled on first use.
+fn config(grammar: Grammar) -> Result<&'static Config, ParseError> {
+    static CONFIGS: [OnceLock<Result<Config, String>>; Grammar::ALL.len()] =
         [const { OnceLock::new() }; Grammar::ALL.len()];
     CONFIGS[grammar as usize]
-        .get_or_init(|| {
-            TagsConfiguration::new(language(grammar), &tags_query(grammar), "")
-                .map_err(|e| format!("{} tags query: {e}", grammar.id()))
-        })
+        .get_or_init(|| Config::new(grammar))
         .as_ref()
         .map_err(|e| ParseError::Failed(e.clone()))
 }
@@ -327,20 +589,19 @@ fn language(grammar: Grammar) -> Language {
     }
 }
 
-/// The query of a grammar. The TypeScript and TSX ones start from the upstream queries of JavaScript and TypeScript
-/// (the TypeScript grammar extends the JavaScript one); the catch-all `type` references stay last in each query so any
-/// pattern written before them wins.
+/// The query of a grammar. The TypeScript and TSX ones start from the JavaScript query and the upstream query of
+/// TypeScript (the TypeScript grammar extends the JavaScript one); the catch-all `type` references stay last in each
+/// query so any pattern written before them wins.
 fn tags_query(grammar: Grammar) -> String {
-    let javascript = tree_sitter_javascript::TAGS_QUERY;
     let typescript = tree_sitter_typescript::TAGS_QUERY;
     let parts: &[&str] = match grammar {
         Grammar::Rust => &[RUST_QUERY],
         Grammar::Go => &[GO_QUERY],
         Grammar::Python => &[PYTHON_QUERY],
-        Grammar::JavaScript => &[javascript, ECMA_QUERY, JSX_QUERY, JAVASCRIPT_QUERY],
-        Grammar::TypeScript => &[javascript, typescript, ECMA_QUERY, TYPESCRIPT_QUERY],
+        Grammar::JavaScript => &[ECMA_BASE_QUERY, ECMA_QUERY, JSX_QUERY, JAVASCRIPT_QUERY],
+        Grammar::TypeScript => &[ECMA_BASE_QUERY, typescript, ECMA_QUERY, TYPESCRIPT_QUERY],
         Grammar::Tsx => &[
-            javascript,
+            ECMA_BASE_QUERY,
             typescript,
             ECMA_QUERY,
             JSX_QUERY,
@@ -581,8 +842,10 @@ int helper() { ns::Widget w; w.draw(); return std::max(1, 2); }
         (Grammar::Cpp, CPP),
     ];
 
+    /// The tags of `src`. The time limit is far above that of `parse`, so a busy machine cannot make a test of what is
+    /// tagged fail by being slow; the tests of the limit itself call `parse` or `parse_within`.
     fn tags(grammar: Grammar, src: &str) -> Vec<Tag> {
-        parse(grammar, src.as_bytes(), None).unwrap()
+        parse_within(grammar, src.as_bytes(), None, Duration::from_secs(600)).unwrap()
     }
 
     /// Definitions as `kind name line:column first-last`, where `first-last` are the lines of the scope.
@@ -981,6 +1244,46 @@ int helper() { ns::Widget w; w.draw(); return std::max(1, 2); }
     }
 
     #[test]
+    fn c_functions_are_found_behind_declarators_and_not_among_their_parameters() {
+        let src = r#"void takes_fn(int cb(int)) { cb(1); }
+void takes_ptr(int (*cb)(int), char *names[]) {}
+void takes_nested(int cb(int (*inner)(int))) {}
+char ****h4(void) {
+    return 0;
+}
+char *****h5(void) { return 0; }
+int (*get(void))(int) { return 0; }
+int (**get2(void))(int) { return 0; }
+char *(**get3(void))[3] {
+    return 0;
+}
+int *(*get4(void))(int) { return 0; }
+int (*get5(void))[3] { return 0; }
+void (*signal2(int sig, void (*func)(int)))(int) { return 0; }
+int declared_only(int x);
+"#;
+        // A function declarator among the parameters is no function: `cb` is only called. The scope of the rest is
+        // the whole definition.
+        assert_eq!(
+            defs(Grammar::C, src),
+            [
+                "function takes_fn 1:6 1-1",
+                "function takes_ptr 2:6 2-2",
+                "function takes_nested 3:6 3-3",
+                "function h4 4:10 4-6",
+                "function h5 7:11 7-7",
+                "function get 8:7 8-8",
+                "function get2 9:8 9-9",
+                "function get3 10:10 10-12",
+                "function get4 13:8 13-13",
+                "function get5 14:7 14-14",
+                "function signal2 15:8 15-15",
+            ]
+        );
+        assert_has(&refs(Grammar::C, src), &["call cb 1:30"]);
+    }
+
+    #[test]
     fn cpp_tags() {
         assert_eq!(
             defs(Grammar::Cpp, CPP),
@@ -1028,6 +1331,42 @@ int helper() { ns::Widget w; w.draw(); return std::max(1, 2); }
             .collect();
         assert_eq!(at_class_name.len(), 1);
         assert!(at_class_name[0].is_def);
+    }
+
+    #[test]
+    fn cpp_constructors_of_class_templates_are_constructors() {
+        let src = r#"template <typename T> Foo<T>::Foo() {}
+template <typename T> Foo<T>::Foo(const Foo &o) : v(o.v) {
+}
+template <typename T> Foo<T>::~Foo() {}
+template <typename T> void Foo<T>::bar() {}
+template <typename T> Foo<T>::Other() {}
+ns::Foo<int>::Foo() {}
+a::b::Foo<T>::Foo() {}
+Outer<T>::Foo::Foo() {}
+template <> Box<int *>::Box() {}
+template <typename T> struct Box<T *> { Box() {} };
+Foo::Foo() {}
+"#;
+        // The scope of a constructor is named like it, also when the scope is a template specialization. The
+        // destructor and the methods that are not named like their class stay methods.
+        assert_eq!(
+            defs(Grammar::Cpp, src),
+            [
+                "constructor Foo 1:31 1-1",
+                "constructor Foo 2:31 2-3",
+                "method ~Foo 4:31 4-4",
+                "method bar 5:36 5-5",
+                "method Other 6:31 6-6",
+                "constructor Foo 7:15 7-7",
+                "constructor Foo 8:15 8-8",
+                "constructor Foo 9:16 9-9",
+                "constructor Box 10:25 10-10",
+                "class Box 11:30 11-11",
+                "constructor Box 11:41 11-11",
+                "constructor Foo 12:6 12-12",
+            ]
+        );
     }
 
     #[test]
@@ -1243,6 +1582,147 @@ int helper() { ns::Widget w; w.draw(); return std::max(1, 2); }
         );
     }
 
+    /// A definition and then a run of `+` after an `=`: tree-sitter's query cursor needs time quadratic in the length of
+    /// the run (half a minute for 500 000), the parser does not.
+    fn slow_to_match() -> String {
+        format!("function f() {{}}\nx = {}", "+".repeat(300_000))
+    }
+
+    /// Nested template arguments: the parser itself needs time quadratic in the depth (seconds for 150 000).
+    fn slow_to_parse() -> String {
+        let depth = 150_000;
+        format!(
+            "template<{}int> struct s;{}",
+            "A<".repeat(depth),
+            ">".repeat(depth)
+        )
+    }
+
+    #[test]
+    fn work_that_takes_too_long_is_given_up_on_without_tags_or_an_error() {
+        let limit = Duration::from_millis(200);
+        for (grammar, src) in [
+            (Grammar::JavaScript, slow_to_match()),
+            (Grammar::Cpp, slow_to_parse()),
+        ] {
+            let started = Instant::now();
+            assert_eq!(
+                parse_within(grammar, src.as_bytes(), None, limit),
+                Ok(Vec::new()),
+                "{grammar:?}"
+            );
+            let took = started.elapsed();
+            assert!(took < Duration::from_secs(20), "{grammar:?} took {took:?}");
+        }
+        // The parser of the thread is fine afterwards, and real code does not come near the limit.
+        assert_eq!(
+            defs(Grammar::Cpp, "int f() { return 0; }"),
+            ["function f 1:5 1-1"]
+        );
+        assert_eq!(
+            defs(Grammar::JavaScript, "function g() {}"),
+            ["function g 1:10 1-1"]
+        );
+    }
+
+    #[test]
+    fn a_cancel_flag_raised_while_working_stops_the_parse_and_the_matching() {
+        for (grammar, src) in [
+            (Grammar::JavaScript, slow_to_match()),
+            (Grammar::Cpp, slow_to_parse()),
+        ] {
+            let cancel = AtomicUsize::new(0);
+            let started = Instant::now();
+            let found = std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    std::thread::sleep(Duration::from_millis(100));
+                    cancel.store(1, Ordering::SeqCst);
+                });
+                parse_within(
+                    grammar,
+                    src.as_bytes(),
+                    Some(&cancel),
+                    Duration::from_secs(600),
+                )
+            });
+            assert_eq!(found, Err(ParseError::Cancelled), "{grammar:?}");
+            let took = started.elapsed();
+            assert!(took < Duration::from_secs(20), "{grammar:?} took {took:?}");
+        }
+        assert_eq!(
+            defs(Grammar::JavaScript, "function g() {}"),
+            ["function g 1:10 1-1"]
+        );
+    }
+
+    #[test]
+    fn nothing_is_tagged_below_the_depth_limit() {
+        // The body of a function is a level of its own, so every function sits two levels below the one around it.
+        let depth = MAX_DEPTH as usize / 2 + 2_000;
+        let src = format!("{}{}", "function f() {\n".repeat(depth), "}".repeat(depth));
+        let started = Instant::now();
+        let found = tags(Grammar::JavaScript, &src);
+        let took = started.elapsed();
+        assert!(took < Duration::from_secs(20), "took {took:?}");
+        let kept = MAX_DEPTH as usize / 2;
+        assert!(
+            (kept - 5..=kept + 5).contains(&found.len()),
+            "{} tags",
+            found.len()
+        );
+        // The outermost ones are kept.
+        assert_eq!((found[0].line, found[0].scope_start), (1, 1));
+        assert!(found.iter().all(|t| t.is_def && t.name == "f"));
+        assert!(
+            found
+                .windows(2)
+                .all(|pair| pair[0].line + 1 == pair[1].line)
+        );
+    }
+
+    #[test]
+    fn long_runs_of_comments_are_matched_in_linear_time() {
+        // A pattern that collects the comments in front of a definition takes time quadratic in the length of the run.
+        let lines = 100_000;
+        for (grammar, comment) in [
+            (Grammar::JavaScript, "// comment\n"),
+            (Grammar::TypeScript, "/** comment */\n"),
+            (Grammar::Tsx, "/* comment */ // comment\n"),
+        ] {
+            let src = format!("{}function f() {{}}\n", comment.repeat(lines));
+            let started = Instant::now();
+            let found = defs(grammar, &src);
+            let took = started.elapsed();
+            assert!(took < Duration::from_secs(20), "{grammar:?} took {took:?}");
+            assert_eq!(
+                found,
+                [format!(
+                    "function f {}:10 {}-{}",
+                    lines + 1,
+                    lines + 1,
+                    lines + 1
+                )]
+            );
+        }
+    }
+
+    #[test]
+    fn comments_in_front_of_definitions_do_not_change_what_is_tagged() {
+        let src = "/** The doc. */\nfunction a() {}\n// two\n// lines\nconst b = () => 1;\n/* x */ var c = function () {};\n\
+                   /* y */\nclass D { /** m */ method() {} }\nexport default e = 1;\n";
+        let expected = [
+            "function a 2:10 2-2",
+            "function b 5:7 5-5",
+            "function c 6:13 6-6",
+            "class D 8:7 8-8",
+            "method method 8:20 8-8",
+            "constant e 9:16 9-9",
+        ];
+        for grammar in [Grammar::JavaScript, Grammar::TypeScript, Grammar::Tsx] {
+            assert_eq!(defs(grammar, src), expected, "{grammar:?}");
+        }
+    }
+
     #[test]
     fn garbage_and_truncated_source_do_not_panic() {
         let mut state = 0x2545_F491_u32;
@@ -1278,35 +1758,112 @@ int helper() { ns::Widget w; w.draw(); return std::max(1, 2); }
 
     #[test]
     fn names_that_are_not_identifiers_are_left_out() {
+        let long = "a".repeat(MAX_NAME_BYTES + 1);
+        for grammar in Grammar::ALL {
+            for name in [
+                "foo",
+                "Foo_1",
+                "$scope",
+                "_",
+                "~Widget",
+                "中文",
+                "operator",
+                "operators",
+                "operator_",
+                "operator1",
+                "operatorFoo",
+            ] {
+                assert!(plausible_name(grammar, name), "{grammar:?} {name}");
+            }
+            for name in [
+                "",
+                "ns.Thing",
+                "(getClass())",
+                "a b",
+                "\"quoted\"",
+                "a\nb",
+                "x,y",
+                "tab\t",
+                "a:b",
+                // Only a C++ operator name can have punctuation or a space.
+                "operators.Binary",
+                "operator_.x",
+                "operator1 x",
+                "operator\nbool",
+                long.as_str(),
+            ] {
+                assert!(!plausible_name(grammar, name), "{grammar:?} {name:?}");
+            }
+            assert!(plausible_name(grammar, &"a".repeat(MAX_NAME_BYTES)));
+        }
+        for name in ["operator==", "operator<<", "operator->"] {
+            assert!(plausible_name(Grammar::Cpp, name), "{name}");
+        }
         for name in [
-            "foo",
-            "Foo_1",
-            "$scope",
-            "_",
-            "~Widget",
             "operator()",
             "operator[]",
-            "operator==",
-            "中文",
+            "operator,",
+            "operator bool",
+            "operator new",
+            "operator delete[]",
+            "operator std::string",
         ] {
-            assert!(plausible_name(name), "{name}");
+            assert!(plausible_name(Grammar::Cpp, name), "{name}");
+            assert!(!plausible_name(Grammar::Go, name), "{name}");
         }
-        let long = "a".repeat(MAX_NAME_BYTES + 1);
-        for name in [
-            "",
-            "ns.Thing",
-            "(getClass())",
-            "a b",
-            "\"quoted\"",
-            "a\nb",
-            "x,y",
-            "tab\t",
-            "a:b",
-            long.as_str(),
-        ] {
-            assert!(!plausible_name(name), "{name:?}");
-        }
-        assert!(plausible_name(&"a".repeat(MAX_NAME_BYTES)));
+        assert!(!plausible_name(
+            Grammar::Cpp,
+            &format!("operator {}", "a".repeat(MAX_NAME_BYTES))
+        ));
+    }
+
+    #[test]
+    fn a_member_expression_is_no_name_even_when_it_starts_with_operator() {
+        // The catch-all pattern for `new` takes whatever follows it as the name.
+        let src = "new operators.Binary(1);\nnew Plain(2);\nnew ns.Thing(3);\n";
+        assert_eq!(
+            refs(Grammar::JavaScript, src),
+            ["class Binary 1:15", "class Plain 2:5", "class Thing 3:8"]
+        );
+    }
+
+    #[test]
+    fn cpp_operators_are_methods_named_as_written() {
+        let src = "struct S {\n  void *operator new(size_t n) { return 0; }\n  void operator delete[](void *p) {}\n  bool operator ()(int a) { return a; }\n  S operator+(S o) const { return o; }\n  bool operator==(const S &o) const { return true; }\n};\n";
+        assert_eq!(
+            defs(Grammar::Cpp, src),
+            [
+                "class S 1:8 1-7",
+                "method operator new 2:9 2-2",
+                "method operator delete[] 3:8 3-3",
+                "method operator () 4:8 4-4",
+                "method operator+ 5:5 5-5",
+                "method operator== 6:8 6-6",
+            ]
+        );
+        // A name that merely starts with `operator` is no operator name: not with a template argument list in it.
+        let src = "void f() { ns::operator_<detail::op_pow,L,R>(); operatorFoo(1); }\n";
+        let found = refs(Grammar::Cpp, src);
+        assert_has(&found, &["call operatorFoo 1:49"]);
+        assert_lacks(&found, &["operator_<detail::op_pow,L,R>"]);
+    }
+
+    #[test]
+    fn raw_identifiers_are_tagged_without_their_prefix() {
+        let src = "fn r#type(r#match: u8) -> u8 { r#match }\nfn call() { r#type(1); let y: r#Foo = r#Foo::new(); }\n";
+        let found = tags(Grammar::Rust, src);
+        assert!(found.iter().all(|t| !t.name.contains('#')), "{found:#?}");
+        let def = found.iter().find(|t| t.is_def && t.name == "type").unwrap();
+        // The name starts after `r#`, in the line as in its snippet.
+        assert_eq!((def.line, def.column, def.end_column), (1, 6, 10));
+        assert_eq!(
+            (def.snippet.as_str(), def.snippet_column),
+            ("fn r#type(r#match: u8) -> u8 { r#match }", 6)
+        );
+        assert_has(
+            &refs(Grammar::Rust, src),
+            &["call type 2:15", "type Foo 2:33", "call new 2:46"],
+        );
     }
 
     #[test]
@@ -1422,6 +1979,38 @@ int helper() { ns::Widget w; w.draw(); return std::max(1, 2); }
         assert_eq!(
             String::from_utf16(&utf16[column as usize - 1..]).unwrap(),
             "target"
+        );
+    }
+
+    #[test]
+    fn a_snippet_does_not_start_with_the_whitespace_it_was_cut_at() {
+        // The snippet starts 40 units before the name. Where that lands in whitespace (the text is `x x x ...`, so on
+        // every other unit), it starts at the next token instead: the name is then 39 units in. 100 pairs fit in the
+        // part of the line that is looked at, 800 do not (and 50 000 are a minified bundle).
+        for pairs in [100, 800, 50_000] {
+            let before = format!("{} ", "x ".repeat(pairs));
+            let line = format!("{before}target(x) {}", "z".repeat(300));
+            let name_column = before.len() as u32 + 1;
+            let (snippet, column) = line_snippet(line.as_bytes(), 1, name_column).unwrap();
+            assert_eq!(column, 40, "{pairs} pairs");
+            assert!(snippet.starts_with("x x"), "{pairs} pairs: {snippet:?}");
+            assert!(snippet[column as usize - 1..].starts_with("target(x)"));
+            assert!(snippet.len() <= SNIPPET_UNITS);
+        }
+        // A run of whitespace longer than that leaves nothing in front of the name.
+        let line = format!("x{}target(1) rest", " ".repeat(500));
+        assert_eq!(
+            line_snippet(line.as_bytes(), 1, 502),
+            Some(("target(1) rest".to_string(), 1))
+        );
+        let found = tags(
+            Grammar::JavaScript,
+            &format!("var x = 1;{}function target() {{}}\n", " ".repeat(500)),
+        );
+        let target = found.iter().find(|t| t.name == "target").unwrap();
+        assert_eq!(
+            (target.snippet.as_str(), target.snippet_column),
+            ("function target() {}", 10)
         );
     }
 }

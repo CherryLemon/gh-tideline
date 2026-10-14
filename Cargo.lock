@@ -545,7 +545,6 @@ dependencies = [
  "tree-sitter-javascript",
  "tree-sitter-python",
  "tree-sitter-rust",
- "tree-sitter-tags",
  "tree-sitter-typescript",
  "webbrowser",
 ]
@@ -2076,19 +2075,6 @@ checksum = "439e577dbe07423ec2582ac62c7531120dbfccfa6e5f92406f93dd271a120e45"
 dependencies = [
  "cc",
  "tree-sitter-language",
-]
-
-[[package]]
-name = "tree-sitter-tags"
-version = "0.27.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5bfc06a03e1bfabf198e2f21a31ed4308fff0a1fb7917e141525a884dabad94e"
-dependencies = [
- "memchr",
- "regex",
- "streaming-iterator",
- "thiserror",
- "tree-sitter",
 ]
 
 [[package]]

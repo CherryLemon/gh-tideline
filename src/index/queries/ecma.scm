@@ -1,5 +1,5 @@
-; Additions to the upstream JavaScript tags query (appended to it) that are valid in the JavaScript, TypeScript and TSX
-; grammars. Upstream defines only function-valued variables and no constructors.
+; Additions to ecma_base.scm (appended to it) that are valid in the JavaScript, TypeScript and TSX grammars. Upstream
+; defines only function-valued variables and no constructors.
 
 ; module-level variables that are not functions (function-valued ones are matched by the upstream patterns)
 

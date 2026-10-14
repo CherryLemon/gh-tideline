@@ -7,8 +7,9 @@
 //!
 //! Every server and job shares the file: WAL mode, a busy timeout and `INSERT OR IGNORE` make it harmless to write
 //! the same blob twice. A writer connection does the writes and a reader connection the lookups, each behind a
-//! mutex, so a lookup never waits for a long insert. The methods are synchronous; async callers run them on the
-//! blocking pool.
+//! mutex, so a lookup never waits for a long insert. A second reader answers a build's question which blobs are
+//! stored, a long read that would keep the lookups waiting. The methods are synchronous; async callers run them on
+//! the blocking pool.
 
 use std::collections::HashMap;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -17,7 +18,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use rusqlite::{
-    Connection, OpenFlags, OptionalExtension, TransactionBehavior, named_params, params,
+    Connection, OpenFlags, OptionalExtension, ToSql, TransactionBehavior, named_params, params,
 };
 
 use super::lang::{Family, Grammar};
@@ -181,6 +182,10 @@ pub type References = (Vec<(Hit, String)>, bool);
 pub struct IndexDb {
     writer: Arc<Mutex<Connection>>,
     reader: Arc<Mutex<Connection>>,
+    /// A reader of its own for `stored_blobs`, which a build calls with every blob of a commit. On the shared reader
+    /// it would keep the lookups for clicks waiting for as long as it runs: a mutex does not hand over to the thread
+    /// waiting for it, so releasing it between chunks of blobs does not help.
+    bulk_reader: Arc<Mutex<Connection>>,
 }
 
 impl IndexDb {
@@ -205,23 +210,20 @@ impl IndexDb {
             .pragma_update(None, "synchronous", "NORMAL")
             .map_err(|e| fail(&e))?;
         migrate(&mut writer, MIGRATIONS).map_err(|e| fail(&e))?;
-        let reader = Connection::open_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .map_err(|e| fail(&e))?;
-        reader.busy_timeout(BUSY_TIMEOUT).map_err(|e| fail(&e))?;
+        let reader = open_reader(path).map_err(|e| fail(&e))?;
+        let bulk_reader = open_reader(path).map_err(|e| fail(&e))?;
         Ok(IndexDb {
             writer: Arc::new(Mutex::new(writer)),
             reader: Arc::new(Mutex::new(reader)),
+            bulk_reader: Arc::new(Mutex::new(bulk_reader)),
         })
     }
 
     /// Every grammar each of `oids` is stored with, whatever the status of the blob. A build skips what is stored
     /// (a `.h` file has one grammar, but the same content may be stored under two names). OIDs that are not stored
-    /// are left out of the map.
+    /// are left out of the map. It does not use the reader of the lookups, so it never keeps a click waiting.
     pub fn stored_blobs(&self, oids: &[String]) -> Result<HashMap<String, Vec<Grammar>>, String> {
-        let conn = lock(&self.reader);
+        let conn = lock(&self.bulk_reader);
         let mut query = conn
             .prepare_cached("SELECT grammar FROM blobs WHERE oid = ?1")
             .map_err(db_err)?;
@@ -433,8 +435,9 @@ impl IndexDb {
         tx.commit().map_err(db_err)
     }
 
-    /// The definitions of `name` in the files of `family` in the commit, ranked by how close they are to `from_path`,
-    /// the file of the click (see `rank`); at most 200. None when the commit is not completely indexed.
+    /// The definitions of `name` in the files of `family` in the commit, the nearest to `from_path`, the file of the
+    /// click, first (see `rank`); at most 200, which are the nearest of all. None when the commit is not completely
+    /// indexed.
     ///
     /// Constructors are left out (they remain symbols of their file): they have the name of their class, so the class
     /// would otherwise never be the only definition of `new Foo()`.
@@ -450,47 +453,53 @@ impl IndexDb {
             return Ok(None);
         };
         let origin = Origin::new(from_path);
+        let ancestors = origin.ancestors();
         let sql = format!(
             "SELECT te.path, t.line, t.col, t.end_col, t.kind, t.snippet, t.snippet_col, {tier} AS tier
              FROM names n
              JOIN tags t ON t.name_id = n.id AND t.is_def = 1 AND t.kind <> 'constructor'
              JOIN tree_entries te ON te.commit_id = :commit AND te.blob_id = t.blob_id AND te.family = :family
              WHERE n.name = :name
-             ORDER BY tier, te.path, t.line, t.col
+             ORDER BY {order}
              LIMIT {limit}",
             tier = rank::TIER_SQL,
-            limit = rank::DEFINITION_CANDIDATES
+            order = rank::nearest_first_sql(&ancestors),
+            limit = rank::MAX_DEFINITIONS
+        );
+        let family = family.id();
+        let mut params: Vec<(&str, &dyn ToSql)> = vec![
+            (":commit", &commit_id),
+            (":family", &family),
+            (":name", &name),
+            (":from", &origin.path),
+            (":dir", &origin.dir),
+        ];
+        params.extend(
+            ancestors
+                .iter()
+                .map(|(param, dir)| (param.as_str(), dir as &dyn ToSql)),
         );
         let mut query = conn.prepare_cached(&sql).map_err(db_err)?;
         let hits = query
-            .query_map(
-                named_params! {
-                    ":commit": commit_id,
-                    ":family": family.id(),
-                    ":name": name,
-                    ":from": origin.path,
-                    ":dir": origin.dir,
-                },
-                |row| {
-                    Ok(Hit {
-                        path: row.get(0)?,
-                        line: row.get(1)?,
-                        column: row.get(2)?,
-                        end_column: row.get(3)?,
-                        kind: row.get(4)?,
-                        snippet: row.get(5)?,
-                        snippet_column: row.get(6)?,
-                        tier: Tier::from_sql(row.get(7)?),
-                    })
-                },
-            )
+            .query_map(params.as_slice(), |row| {
+                Ok(Hit {
+                    path: row.get(0)?,
+                    line: row.get(1)?,
+                    column: row.get(2)?,
+                    end_column: row.get(3)?,
+                    kind: row.get(4)?,
+                    snippet: row.get(5)?,
+                    snippet_column: row.get(6)?,
+                    tier: Tier::from_sql(row.get(7)?),
+                })
+            })
             .map_err(db_err)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(db_err)?;
         drop(query);
         drop(conn);
         self.touch(commit_id, used_at);
-        Ok(Some(rank::rank_definitions(from_path, hits)))
+        Ok(Some(hits))
     }
 
     /// The references to `name` in the files of `family` in the commit: the same file first, then its directory,
@@ -618,8 +627,18 @@ fn intern(conn: &Connection, name: &str) -> rusqlite::Result<i64> {
     Ok(conn.last_insert_rowid())
 }
 
+fn open_reader(path: &Path) -> rusqlite::Result<Connection> {
+    let reader = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    reader.busy_timeout(BUSY_TIMEOUT)?;
+    Ok(reader)
+}
+
 fn lock(conn: &Mutex<Connection>) -> MutexGuard<'_, Connection> {
-    // A panic while the lock was held leaves nothing half done: SQLite rolls its transaction back.
+    // A panic while the lock was held leaves nothing half done: unwinding drops the open `Transaction`, which rolls
+    // back when it is dropped without a commit.
     conn.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -1112,6 +1131,8 @@ mod tests {
                 ("src/a/b/d.rs", vec![def("parse", 5, 8)]),
                 ("src/a/b/e.rs", vec![def("parse", 7, 8)]),
                 ("src/a/b/c/deep.rs", vec![def("parse", 2, 8)]),
+                ("src/a/bc/y.rs", vec![def("parse", 6, 8)]),
+                ("src/a/a.rs", vec![def("parse", 3, 8)]),
                 ("src/a/z.rs", vec![def("parse", 12, 8), def("parse", 9, 8)]),
                 ("src/q/r.rs", vec![def("parse", 1, 8)]),
                 ("lib/x.rs", vec![def("parse", 1, 8)]),
@@ -1132,10 +1153,16 @@ mod tests {
                 ("src/a/b/c.rs", 30),
                 ("src/a/b/d.rs", 5),
                 ("src/a/b/e.rs", 7),
+                // Three directories shared.
                 ("src/a/b/c/deep.rs", 2),
+                // Two, by path: `src/a/bc` is not inside `src/a/b`.
+                ("src/a/a.rs", 3),
+                ("src/a/bc/y.rs", 6),
                 ("src/a/z.rs", 9),
                 ("src/a/z.rs", 12),
+                // One.
                 ("src/q/r.rs", 1),
+                // None, by path.
                 ("lib/x.rs", 1),
                 ("root.rs", 4),
                 ("zzz.rs", 1),
@@ -1143,7 +1170,7 @@ mod tests {
         );
         let tiers: Vec<_> = hits.iter().map(|h| h.tier).collect();
         let mut expected = vec![Tier::File, Tier::Dir, Tier::Dir];
-        expected.extend([Tier::Other; 7]);
+        expected.extend([Tier::Other; 9]);
         assert_eq!(tiers, expected);
         assert_eq!(
             hits[0],
@@ -1223,7 +1250,7 @@ mod tests {
     }
 
     #[test]
-    fn at_most_200_definitions_are_returned_from_candidates_that_keep_the_nearest() {
+    fn at_most_200_definitions_are_returned_and_the_cut_keeps_the_nearest() {
         let fx = TempDb::new("limits");
         let mut blobs = vec![
             blob(1, Grammar::Rust, vec![def("dup", 1, 4)]),
@@ -1233,7 +1260,7 @@ mod tests {
             entry("zzzz/z.rs", 1, Grammar::Rust),
             entry("zzzz/y.rs", 2, Grammar::Rust),
         ];
-        // More than the candidates a lookup ranks, all sorting before the nearest files.
+        // More than a lookup returns, all sorting before the nearest files.
         for i in 0..2100 {
             blobs.push(blob(10 + i, Grammar::Rust, vec![def("dup", 1, 4)]));
             entries.push(entry(&format!("d{i:04}/x.rs"), 10 + i, Grammar::Rust));
@@ -1255,6 +1282,58 @@ mod tests {
         );
         assert_eq!(hits[2].path, "d0000/x.rs");
         assert_eq!(hits[199].path, "d0197/x.rs");
+    }
+
+    #[test]
+    fn the_cut_keeps_the_definitions_that_share_the_most_directories_however_late_they_sort() {
+        let fx = TempDb::new("nearest-cut");
+        let mut blobs = vec![
+            blob(1, Grammar::Rust, vec![def("dup", 1, 4)]),
+            blob(2, Grammar::Rust, vec![def("dup", 1, 4)]),
+        ];
+        let mut entries = vec![
+            entry("src/zzz/z.rs", 1, Grammar::Rust),
+            entry("src/zeta/other/y.rs", 2, Grammar::Rust),
+        ];
+        // Far more than a lookup returns, none in the tree of the click, all sorting before the nearest files.
+        for i in 0..2100 {
+            blobs.push(blob(10 + i, Grammar::Rust, vec![def("dup", 1, 4)]));
+            entries.push(entry(&format!("a{i:04}/x.rs"), 10 + i, Grammar::Rust));
+        }
+        fx.insert_blobs(blobs).unwrap();
+        fx.save_commit(&commit(1), &entries).unwrap();
+        let hits = fx
+            .definitions(&commit(1), Family::Rust, "dup", "src/zeta/deep/main.rs")
+            .unwrap()
+            .unwrap();
+        assert_eq!(hits.len(), 200);
+        assert!(hits.iter().all(|h| h.tier == Tier::Other));
+        // Two directories shared, one, and none, which go by path.
+        assert_eq!(hits[0].path, "src/zeta/other/y.rs");
+        assert_eq!(hits[1].path, "src/zzz/z.rs");
+        assert_eq!(hits[2].path, "a0000/x.rs");
+        assert_eq!(hits[199].path, "a0197/x.rs");
+    }
+
+    #[test]
+    fn a_click_deeper_in_the_tree_than_any_repository_still_ranks_by_its_outer_directories() {
+        let fx = TempDb::new("deep-click");
+        let deep = "d/".repeat(100);
+        let near = format!("{deep}other/y.rs");
+        let f = || vec![def("f", 1, 1)];
+        rust_commit(
+            &fx,
+            &commit(1),
+            vec![("zz/y.rs", f()), (near.as_str(), f()), ("aa/y.rs", f())],
+        );
+        let hits = fx
+            .definitions(&commit(1), Family::Rust, "f", &format!("{deep}main.rs"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            places(&hits),
+            [(near.as_str(), 1), ("aa/y.rs", 1), ("zz/y.rs", 1)]
+        );
     }
 
     #[test]
@@ -1689,6 +1768,72 @@ mod tests {
         fx.definitions(&commit(1), Family::Rust, "f", "a.rs")
             .unwrap();
         assert!(used_at() >= now);
+    }
+
+    #[test]
+    fn a_build_asking_for_every_blob_and_a_click_do_not_wait_for_each_other() {
+        let fx = TempDb::new("bulk-reader");
+        rust_commit(&fx, &commit(1), vec![("a.rs", vec![def("f", 1, 4)])]);
+
+        // A click is in the middle of a lookup: the build reads on.
+        let click = lock(&fx.reader);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let db = fx.db.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send(db.stored_blobs(&[oid(1), oid(2)]));
+        });
+        let stored = receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the build waited for the lookup of a click")
+            .unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[&oid(1)], [Grammar::Rust]);
+        drop(click);
+
+        // And the build is in the middle of a long read: the click goes through.
+        let build = lock(&fx.bulk_reader);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let db = fx.db.clone();
+        let c = commit(1);
+        std::thread::spawn(move || {
+            let _ = sender.send(db.definitions(&c, Family::Rust, "f", "a.rs"));
+        });
+        let hits = receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the lookup of a click waited for the build");
+        assert_eq!(hits.unwrap().unwrap().len(), 1);
+        drop(build);
+    }
+
+    #[test]
+    fn a_panic_in_a_transaction_rolls_it_back_and_the_next_write_goes_on() {
+        let fx = TempDb::new("panic");
+        let db = fx.db.clone();
+        let crashed = std::thread::spawn(move || {
+            let mut conn = lock(&db.writer);
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            tx.execute("INSERT INTO names (name) VALUES ('half')", [])
+                .unwrap();
+            panic!("a panic in the middle of a transaction");
+        })
+        .join();
+        assert!(crashed.is_err());
+        assert!(fx.writer.is_poisoned());
+        assert_eq!(fx.count("SELECT count(*) FROM names"), 0);
+
+        // The lock is poisoned, and the next write takes it all the same.
+        rust_commit(&fx, &commit(1), vec![("a.rs", vec![def("f", 1, 4)])]);
+        assert_eq!(
+            fx.count("SELECT count(*) FROM names WHERE name = 'half'"),
+            0
+        );
+        let hits = fx
+            .definitions(&commit(1), Family::Rust, "f", "a.rs")
+            .unwrap()
+            .unwrap();
+        assert_eq!(hits.len(), 1);
     }
 
     #[test]

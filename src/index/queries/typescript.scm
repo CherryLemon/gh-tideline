@@ -1,4 +1,4 @@
-; Additions to the upstream JavaScript and TypeScript tags queries for the TypeScript and TSX grammars. Upstream has no
+; Additions to ecma_base.scm and the upstream TypeScript tags query for the TypeScript and TSX grammars. Upstream has no
 ; type aliases, enums, namespaces or class fields holding functions, and no references to types other than type
 ; annotations. When several patterns tag the same name, the one written first wins, so the catch-all type references
 ; come last.
