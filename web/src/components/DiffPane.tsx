@@ -7,6 +7,8 @@ import { errorMessage } from '../api'
 import { SANDY_BEACH_THEME } from '../monaco/theme'
 import { ZoneHost } from '../monaco/zones'
 import { CommentGutter, type PickedLines } from '../monaco/gutter'
+import { StickyHeader, type StickyHost } from '../monaco/sticky'
+import { setSymbolsRepo } from '../monaco/symbols'
 import { LIMITS, isGitlink, shortSha } from '../degrade'
 import { formatBytes, loadFile, loadUnchanged, models, prefetchFile, type LoadedFile, type SideInfo } from '../monaco/files'
 import { mapLine } from '../nav/targets'
@@ -111,6 +113,8 @@ interface Props {
   provisional?: boolean
   nextFile: ChangedFile | null
   sideBySide: boolean
+  /** Show the scopes around the first visible line (a class, a function) at the top of each editor. */
+  stickyHeader: boolean
   ignoreTrimWhitespace: boolean
   /** Set by the page before switching files (F7 / Shift+F7, or to reveal a place); applied once the file is shown. */
   pendingJump: React.MutableRefObject<PendingJump | null>
@@ -191,7 +195,7 @@ function centerIfOutside(editor: EditorT, at: Monaco.IPosition): boolean {
 }
 
 export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
-  { repo, file, provisional = false, nextFile, sideBySide, ignoreTrimWhitespace, pendingJump, headerActions, review, onChangeInfo, onCaret },
+  { repo, file, provisional = false, nextFile, sideBySide, stickyHeader, ignoreTrimWhitespace, pendingJump, headerActions, review, onChangeInfo, onCaret },
   ref,
 ) {
   const editorRef = useRef<DiffEditorT | null>(null)
@@ -247,6 +251,11 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
   const [diffTick, setDiffTick] = useState(0)
   /** The "+" in each editor's glyph margin. */
   const gutters = useRef<Record<EditorSide, CommentGutter> | null>(null)
+  /** The sticky header of each editor of the diff, and of the plain editor. */
+  const stickies = useRef<Record<EditorSide, StickyHeader> | null>(null)
+  const singleSticky = useRef<StickyHeader | null>(null)
+  const repoRef = useRef(repo)
+  repoRef.current = repo
   /** The editor that had focus last: `c` comments there when neither has it now. */
   const lastSide = useRef<EditorSide>('modified')
   /** A box just opened from here: brought into view once it has its zone. */
@@ -446,6 +455,40 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
       setHost(null)
     }
   }, [diffEditor])
+
+  // The models' outline for Monaco (breadcrumbs in collapsed regions) is read from this repository.
+  useEffect(() => {
+    setSymbolsRepo(repo)
+    return () => setSymbolsRepo(null)
+  }, [repo])
+
+  /** A row of a header was clicked; `side` is the side of the file its editor shows. */
+  const stickyHost = (side: NavSide): StickyHost => ({ repo: () => repoRef.current, reveal: (line) => revealRowRef.current(side, line) })
+
+  useEffect(() => {
+    if (!diffEditor) return
+    const s = {
+      original: new StickyHeader(diffEditor.getOriginalEditor(), stickyHost('base')),
+      modified: new StickyHeader(diffEditor.getModifiedEditor(), stickyHost('head')),
+    }
+    stickies.current = s
+    return () => {
+      s.original.dispose()
+      s.modified.dispose()
+      stickies.current = null
+    }
+  }, [diffEditor])
+
+  useEffect(() => {
+    const ed = singleRef.current
+    if (!singleReady || !ed) return
+    const s = new StickyHeader(ed, stickyHost('head'))
+    singleSticky.current = s
+    return () => {
+      s.dispose()
+      singleSticky.current = null
+    }
+  }, [singleReady])
 
   const handleSingleMount = useCallback((ed: EditorT) => {
     singleRef.current = ed
@@ -744,6 +787,16 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
   const revealRef = useRef(reveal)
   revealRef.current = reveal
 
+  /** The user clicked a row of a sticky header: they go to its line, as if they had put the caret there. */
+  const revealRow = (side: NavSide, line: number) => {
+    // While the next file loads, the editor still shows the previous one.
+    if (state.kind !== 'text' && state.kind !== 'single') return
+    reveal({ path: file.path, side, line, column: 1 })
+    onCaretRef.current?.()
+  }
+  const revealRowRef = useRef(revealRow)
+  revealRowRef.current = revealRow
+
   // A place queued by `reveal` for a file that wasn't shown yet. After the cards are placed (above), which
   // can move the caret to the first change; and once the file is visible, or its editor couldn't take focus.
   useLayoutEffect(() => {
@@ -876,6 +929,12 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
   // The attached content may be stale at the new head of a provisional file: show neither editor.
   const showEditor = !provisional && (state.kind === 'text' || (state.kind === 'loading' && attached === 'diff'))
   const showSingle = !provisional && (state.kind === 'single' || (state.kind === 'loading' && attached === 'single'))
+  // Headers only for the editors in view; in unified view the diff has the modified editor alone.
+  useEffect(() => {
+    stickies.current?.original.setActive(stickyHeader && showEditor && sideBySide)
+    stickies.current?.modified.setActive(stickyHeader && showEditor)
+    singleSticky.current?.setActive(stickyHeader && showSingle)
+  }, [stickyHeader, showEditor, showSingle, sideBySide, diffEditor, singleReady])
   focusRef.current = () => {
     const ed = editorRef.current
     if (showSingle) singleRef.current?.focus()

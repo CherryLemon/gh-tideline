@@ -515,6 +515,103 @@ function bigSql(): string {
   return rows.join('\n') + '\n'
 }
 
+const registryChecks = Array.from({ length: 14 }, (_, i) => `  if (bands.low > ${i * 3}) {\n    lines.push('more than ${i * 3} low entries')\n  }\n`).join('')
+const registryDefaults = Array.from({ length: 48 }, (_, i) => `  { id: 'entry-${i}', weight: ${(i * 7) % 100} },\n`).join('')
+
+/** A source file with nested scopes (class, method, nested function), a long function and data after the last scope, for the sticky header. */
+const registryTs = `// The registry of named entries, kept in weight order. Unchanged in this pull request.
+import { log } from './log'
+
+export interface Entry {
+  id: string
+  weight: number
+  label?: string
+}
+
+export type Filter = (entry: Entry) => boolean
+
+export const LIMITS = {
+  maxEntries: 64,
+  maxLabel: 40,
+  minWeight: 0,
+  maxWeight: 100,
+  warnAt: 48,
+}
+
+export class Registry {
+  private readonly entries = new Map<string, Entry>()
+
+  constructor(private readonly name: string) {
+    log('registry ' + name + ' opened')
+  }
+
+  get size(): number {
+    return this.entries.size
+  }
+
+  add(entry: Entry): void {
+    this.check(entry)
+    this.entries.set(entry.id, entry)
+    if (this.entries.size > LIMITS.warnAt) {
+      log('registry ' + this.name + ' is almost full')
+    }
+  }
+
+  find(id: string): Entry | undefined {
+    return this.entries.get(id)
+  }
+
+  list(filter?: Filter): Entry[] {
+    function byWeight(a: Entry, b: Entry): number {
+      if (a.weight !== b.weight) {
+        return b.weight - a.weight
+      }
+      // Equal weights are ordered by label.
+      const left = a.label ?? a.id
+      const right = b.label ?? b.id
+      return left < right ? -1 : left > right ? 1 : 0
+    }
+    const all = Array.from(this.entries.values())
+    const kept = filter ? all.filter(filter) : all
+    return kept.sort(byWeight)
+  }
+
+  render(html = '<img src=x onerror=alert(1)>'): string {
+    const items = this.list().map((entry) => '<li>' + (entry.label ?? entry.id) + '</li>')
+    return html + '<ul>' + items.join('') + '</ul>'
+  }
+
+  private check(entry: Entry): void {
+    if (entry.weight < LIMITS.minWeight || entry.weight > LIMITS.maxWeight) {
+      throw new Error('weight out of range: ' + entry.weight)
+    }
+    if (entry.label && entry.label.length > LIMITS.maxLabel) {
+      throw new Error('label too long: ' + entry.label)
+    }
+    if (this.entries.size >= LIMITS.maxEntries) {
+      throw new Error('registry ' + this.name + ' is full')
+    }
+  }
+}
+
+/** One line per entry with its weight band, then a line per count that matters. */
+export function summarize(registry: Registry): string[] {
+  const lines: string[] = []
+  const bands: Record<string, number> = { low: 0, mid: 0, high: 0 }
+  for (const entry of registry.list()) {
+    const band = entry.weight < 33 ? 'low' : entry.weight < 66 ? 'mid' : 'high'
+    bands[band] += 1
+    lines.push(band + ': ' + (entry.label ?? entry.id) + ' (' + entry.weight + ')')
+  }
+  lines.push('')
+${registryChecks}  lines.push('total: ' + registry.size)
+  return lines
+}
+
+export const DEFAULTS: Entry[] = [
+${registryDefaults}]
+`
+
 /** Files the PR doesn't touch: content (blob) or a commit (gitlink). */
 function unchangedSpecs(): Array<{ path: string; content?: string | Buffer; commit?: string; mode?: string }> {
   const out: Array<{ path: string; content?: string | Buffer; commit?: string; mode?: string }> = []
@@ -535,6 +632,7 @@ function unchangedSpecs(): Array<{ path: string; content?: string | Buffer; comm
   out.push({ path: 'data/archive/events.sql', content: bigSql() })
   out.push({ path: 'data/archive/snapshot.bin', content: fakeBinary(5_400_000, 11) })
   out.push({ path: 'scripts/deploy.sh', content: '#!/bin/sh\nset -eu\necho deploy\n', mode: '100755' })
+  out.push({ path: 'src/app/util/registry.ts', content: registryTs })
   return out
 }
 

@@ -266,6 +266,7 @@ function PrView({ repo, data, search, entryId, refreshing, onRefresh }: ViewProp
         : { kind: 'loading' }
 
   const [sideBySide, setSideBySide] = usePersistentState('dr.sideBySide', true)
+  const [stickyHeader, setStickyHeader] = usePersistentState('dr.stickyHeader', true)
   const [ignoreWs, setIgnoreWs] = usePersistentState('dr.ignoreTrimWhitespace', false)
   const [finderOpen, setFinderOpen] = useState(false)
   const [reviewOpen, setReviewOpen] = useState(false)
@@ -1000,6 +1001,16 @@ function PrView({ repo, data, search, entryId, refreshing, onRefresh }: ViewProp
             Unified
           </button>
         </div>
+        <div className="segmented" role="group" aria-label="Sticky header">
+          <button
+            className={stickyHeader ? 'is-on' : ''}
+            onClick={() => setStickyHeader(!stickyHeader)}
+            aria-pressed={stickyHeader}
+            title="Show the enclosing function or class at the top"
+          >
+            Sticky
+          </button>
+        </div>
         <label className="check" title="Ignores whitespace only at the start and end of lines (a Monaco limit)">
           <input type="checkbox" checked={ignoreWs} onChange={(e) => setIgnoreWs(e.target.checked)} />
           Ignore whitespace
@@ -1047,6 +1058,7 @@ function PrView({ repo, data, search, entryId, refreshing, onRefresh }: ViewProp
                 provisional={provisional}
                 nextFile={nextFile}
                 sideBySide={sideBySide}
+                stickyHeader={stickyHeader}
                 ignoreTrimWhitespace={ignoreWs}
                 pendingJump={pendingJump}
                 headerActions={

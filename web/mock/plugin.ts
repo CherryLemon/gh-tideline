@@ -33,6 +33,7 @@ export function mockApi(): Plugin {
     async configureServer(server) {
       const data = await import('./data.ts')
       const review = await import('./review.ts')
+      const nav = await import('./nav.ts')
       server.config.logger.info(`  [mock] serving fake PR with ${data.files.length} files at /github.com/acme/demo-app/pull/42`)
 
       server.middlewares.use((req: IncomingMessage, res: ServerResponse, next: () => void) => {
@@ -165,6 +166,16 @@ export function mockApi(): Plugin {
             await delay(300)
             const r = review.renderPreview(body)
             return json(res, r.status, r.body)
+          }
+          if (kind === 'blobs' && id && sub === 'symbols' && req.method === 'GET') {
+            if (!/^[0-9a-f]{40}$/.test(id)) return error(res, 400, 'bad_request', 'invalid oid')
+            const blob = data.blobs.get(id)
+            if (!blob) return error(res, 404, 'not_found', `blob ${id} not found`)
+            const path = url.searchParams.get('path')
+            if (!path || path.length > 4096 || /[\x00-\x1f]/.test(path)) return error(res, 400, 'bad_request', 'invalid path')
+            await delay(30)
+            res.setHeader('Cache-Control', 'no-store')
+            return json(res, 200, nav.fileSymbols(path, blob))
           }
           if (kind === 'blobs' && id && sub === undefined) {
             if (!/^[0-9a-f]{40}$/.test(id)) return error(res, 400, 'bad_request', 'invalid oid')

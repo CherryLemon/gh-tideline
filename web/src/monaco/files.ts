@@ -46,6 +46,13 @@ export function modelUri(side: Side, oid: string | null, path: string): Monaco.U
   return monaco.Uri.from({ scheme: 'dr', authority: side, path: `/${oid ?? 'none'}/${path}` })
 }
 
+/** Which version of which file a model holds (the inverse of `modelUri`); null for a model that isn't one of ours. */
+export function parseModelUri(uri: Monaco.Uri): { side: Side; oid: string | null; path: string } | null {
+  const m = uri.scheme === 'dr' ? /^\/([0-9a-f]{40}|none)\/(.+)$/.exec(uri.path) : null
+  if (!m || (uri.authority !== 'base' && uri.authority !== 'head')) return null
+  return { side: uri.authority, oid: m[1] === 'none' ? null : m[1], path: m[2] }
+}
+
 type SideText = { kind: 'text'; text: string; meta: TextMeta } | { kind: 'tooLarge'; bytes: number }
 
 const inflight = new Map<string, Promise<SideText>>()

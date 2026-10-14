@@ -1316,6 +1316,47 @@ kbd {
   background: var(--syn-functions);
 }
 
+/* The sticky header: the scopes around an editor's first visible line, over its top lines (`monaco/sticky.ts`). */
+.monaco-editor .tl-sticky {
+  z-index: 4;
+  overflow: hidden;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg);
+  box-shadow: 0 3px 4px -3px rgb(93 74 47 / 25%);
+  color: var(--fg);
+  cursor: default;
+  user-select: none;
+}
+
+.tl-sticky-row {
+  position: relative;
+  height: var(--tl-sticky-line);
+  overflow: hidden;
+  white-space: pre;
+  cursor: pointer;
+}
+
+.tl-sticky-row:hover {
+  background: var(--highlight);
+}
+
+.tl-sticky-num {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: var(--tl-sticky-num);
+  color: var(--disabled);
+  text-align: right;
+}
+
+.tl-sticky-text {
+  position: absolute;
+  top: 0;
+  right: 0;
+  left: var(--tl-sticky-text);
+  overflow: hidden;
+}
+
 /* Comments without a line in the diff, above it. */
 .pane-threads {
   display: flex;

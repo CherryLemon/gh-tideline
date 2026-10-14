@@ -473,6 +473,12 @@ export function getBlob(r: RepoRef, oid: string, signal?: AbortSignal): Promise<
   return request(`${repoBase(r)}/blobs/${oid}`, { signal })
 }
 
+/** The definitions and scopes of one file version, by blob oid (`path` picks the grammar). */
+export async function fileSymbols(r: RepoRef, oid: string, path: string, signal?: AbortSignal): Promise<FileSymbols> {
+  const res = await request(`${repoBase(r)}/blobs/${seg(oid)}/symbols?path=${seg(path)}`, { signal })
+  return (await res.json()) as FileSymbols
+}
+
 export function errorMessage(e: unknown): string {
   if (e instanceof Error) return e.message
   return String(e)
