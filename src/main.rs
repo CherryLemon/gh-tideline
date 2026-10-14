@@ -3,6 +3,9 @@ mod config;
 mod error;
 mod git;
 mod github;
+// The server wires the index up in later commits; until then only its tests use it.
+#[allow(dead_code)]
+mod index;
 mod pr;
 mod server;
 mod state;
