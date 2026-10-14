@@ -440,7 +440,12 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
 
   useEffect(() => {
     if (!diffEditor) return
-    const h = new ZoneHost(diffEditor)
+    // The sticky headers cover the first lines of the editors; cards brought into view stay clear of them.
+    const covered = (ed: Monaco.editor.ICodeEditor) => {
+      const headers = stickies.current
+      return (ed === diffEditor.getOriginalEditor() ? headers?.original : headers?.modified)?.height() ?? 0
+    }
+    const h = new ZoneHost(diffEditor, covered)
     const g = {
       original: new CommentGutter(diffEditor.getOriginalEditor(), (p) => pickRef.current('original', p)),
       modified: new CommentGutter(diffEditor.getModifiedEditor(), (p) => pickRef.current('modified', p)),
@@ -787,12 +792,13 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
   const revealRef = useRef(reveal)
   revealRef.current = reveal
 
-  /** The user clicked a row of a sticky header: they go to its line, as if they had put the caret there. */
-  const revealRow = (side: NavSide, line: number) => {
+  /** The user clicked a row of a sticky header: they go to its line, as if they had put the caret there. False if the file is not shown. */
+  const revealRow = (side: NavSide, line: number): boolean => {
     // While the next file loads, the editor still shows the previous one.
-    if (state.kind !== 'text' && state.kind !== 'single') return
+    if (state.kind !== 'text' && state.kind !== 'single') return false
     reveal({ path: file.path, side, line, column: 1 })
     onCaretRef.current?.()
+    return true
   }
   const revealRowRef = useRef(revealRow)
   revealRowRef.current = revealRow

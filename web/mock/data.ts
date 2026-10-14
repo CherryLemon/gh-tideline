@@ -425,6 +425,66 @@ function hostileSvg(fill: string): Buffer {
   return Buffer.from('\ufeff' + text, 'utf16le')
 }
 
+/**
+ * A changed file whose first hunk is deep inside a method (`drain`): the diff editor hides the unchanged lines above it from line 1,
+ * so a collapsed-region bar sits at the very top of the file, over code that is inside a class and a method.
+ */
+const workerOld = `// Jobs run one after another by a worker, each retried a few times.
+import { log } from './app/util/log'
+
+export interface Job {
+  id: string
+  attempts: number
+  run(): Promise<void>
+}
+
+export class Worker {
+  private readonly queue: Job[] = []
+  private readonly failed: Job[] = []
+
+  constructor(private readonly name: string) {
+    log('worker ' + name + ' started')
+  }
+
+  push(job: Job): void {
+    this.queue.push(job)
+  }
+
+  async drain(): Promise<number> {
+    let done = 0
+${Array.from({ length: 30 }, (_, i) => `    this.warm(${i})\n`).join('')}    while (this.queue.length > 0) {
+      const job = this.queue.shift()!
+      try {
+        await job.run()
+        done += 1
+      } catch (err) {
+        job.attempts += 1
+        if (job.attempts < 3) {
+          this.queue.push(job)
+        } else {
+          this.failed.push(job)
+        }
+      }
+    }
+    return done
+  }
+
+  private warm(step: number): void {
+    log('warm ' + step)
+  }
+
+  report(): string {
+    return this.name + ': ' + this.failed.length + ' failed'
+  }
+}
+`
+const workerNew = workerOld
+  .replace(
+    'if (job.attempts < 3) {\n          this.queue.push(job)',
+    "if (job.attempts < 5) {\n          log('retry ' + job.id)\n          this.queue.push(job)",
+  )
+  .replace("' failed'\n", "' failed, ' + this.queue.length + ' waiting'\n")
+
 const specs: Spec[] = [
   { path: 'src/app/main.ts', status: 'M', old: mainOld, new: mainNew },
   { path: 'src/app/util/strings.ts', status: 'A', new: strings },
@@ -459,6 +519,7 @@ const specs: Spec[] = [
   { path: 'pnpm-lock.yaml', status: 'M', old: lockfile('2.0.0', 300), new: lockfile('2.1.0', 305), generated: true },
   { path: 'Cargo.lock', status: 'M', old: cargoLock('0.3.0'), new: cargoLock('0.4.0'), generated: true },
   { path: 'dist/app.min.js', status: 'A', new: minified(9), generated: true },
+  { path: 'worker.ts', status: 'M', old: workerOld, new: workerNew },
 ]
 
 function buildFiles(): MockChangedFile[] {
@@ -612,6 +673,22 @@ export const DEFAULTS: Entry[] = [
 ${registryDefaults}]
 `
 
+/** A 25,000-line source file under the highlighting limit (1 MiB): what a jump far down a file costs the sticky header. */
+function longSource(): string {
+  const out: string[] = ['// A long file of small functions. Unchanged in this pull request.', '']
+  for (let i = 0; out.length < 25_000; i++) {
+    out.push(`export function field${i}(input: string, limit = ${i % 50}): string {`)
+    out.push(`  const parts = input.split(',').map((part) => part.trim())`)
+    out.push('  if (parts.length > limit) {')
+    out.push(`    return parts.slice(0, limit).join(';') // keep ${i}`)
+    out.push('  }')
+    out.push("  return parts.join(';')")
+    out.push('}')
+    out.push('')
+  }
+  return out.join('\n') + '\n'
+}
+
 /** Files the PR doesn't touch: content (blob) or a commit (gitlink). */
 function unchangedSpecs(): Array<{ path: string; content?: string | Buffer; commit?: string; mode?: string }> {
   const out: Array<{ path: string; content?: string | Buffer; commit?: string; mode?: string }> = []
@@ -633,6 +710,7 @@ function unchangedSpecs(): Array<{ path: string; content?: string | Buffer; comm
   out.push({ path: 'data/archive/snapshot.bin', content: fakeBinary(5_400_000, 11) })
   out.push({ path: 'scripts/deploy.sh', content: '#!/bin/sh\nset -eu\necho deploy\n', mode: '100755' })
   out.push({ path: 'src/app/util/registry.ts', content: registryTs })
+  out.push({ path: 'src/app/util/schema.ts', content: longSource() })
   return out
 }
 

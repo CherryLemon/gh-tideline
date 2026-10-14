@@ -99,7 +99,11 @@ export class ZoneHost {
   private readonly observer: ResizeObserver
   private readonly disposables: Monaco.IDisposable[] = []
 
-  constructor(private readonly diff: DiffEditorT) {
+  /** `topInset`: how far down the first lines of an editor are covered by something over its code (a sticky header). */
+  constructor(
+    private readonly diff: DiffEditorT,
+    private readonly topInset: (ed: CodeEditorT) => number = () => 0,
+  ) {
     this.observer = new ResizeObserver((entries) => this.onResize(entries))
     for (const ed of [diff.getOriginalEditor(), diff.getModifiedEditor()]) {
       this.disposables.push(ed.onDidLayoutChange(() => this.layoutWidths(ed)))
@@ -355,11 +359,16 @@ export class ZoneHost {
   private scrollToShow(ed: CodeEditorT, top: number, bottom: number, wins: 'top' | 'bottom' = 'top'): void {
     const info = ed.getLayoutInfo()
     const height = info.height - info.horizontalScrollbarHeight
-    const scroll = ed.getScrollTop()
     const showBottom = (from: number) => (bottom > from + height - REVEAL_MARGIN ? bottom - height + REVEAL_MARGIN : from)
-    const showTop = (from: number) => (top < from + REVEAL_MARGIN ? top - REVEAL_MARGIN : from)
-    const next = Math.max(0, wins === 'top' ? showTop(showBottom(scroll)) : showBottom(showTop(scroll)))
-    if (next !== scroll) ed.setScrollTop(next)
+    // What covers the top of the code depends on where the code is scrolled to: look again from where it ended up.
+    for (let round = 0; round < 3; round++) {
+      const scroll = ed.getScrollTop()
+      const inset = this.topInset(ed) + REVEAL_MARGIN
+      const showTop = (from: number) => (top < from + inset ? top - inset : from)
+      const next = Math.max(0, wins === 'top' ? showTop(showBottom(scroll)) : showBottom(showTop(scroll)))
+      if (next === scroll) return
+      ed.setScrollTop(next)
+    }
   }
 
   /**

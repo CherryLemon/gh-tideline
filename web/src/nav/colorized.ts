@@ -10,7 +10,7 @@ export interface TextRun {
 const TOKEN_CLASSES = /^(?:mtk\d+|mtk[ibus])(?: (?:mtk\d+|mtk[ibus]))*$/
 
 /**
- * The runs of text in the HTML `monaco.editor.colorizeModelLine` returns. The markup is parsed into an inert document
+ * The runs of text in the HTML `monaco.editor.colorize` returns for a line. The markup is parsed into an inert document
  * (nothing in it runs or loads) and only its text and token classes are kept, so what comes out cannot carry an element
  * or an attribute of the repository's making. Monaco writes spaces as no-break spaces; they are spaces again here.
  */
