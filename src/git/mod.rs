@@ -11,6 +11,8 @@
 //! dropped; callers detach mutating work into a task that owns the lock guard instead.
 
 pub mod parse;
+#[cfg(test)]
+pub(crate) mod testing;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::OsStr;
@@ -892,27 +894,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::testing::{git_in, temp_dir};
     use super::*;
-
-    fn temp_dir(name: &str) -> PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "gh-tideline-test-{name}-{}-{nanos}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    async fn git_in(dir: &Path, args: &[&str]) -> String {
-        let mut full = vec!["-C", dir.to_str().unwrap()];
-        full.extend_from_slice(args);
-        let out = run_git(None, None, &full, None).await.unwrap();
-        String::from_utf8(out).unwrap().trim().to_string()
-    }
 
     /// Creates a work-tree repo with the given files committed; returns the head commit.
     async fn make_repo(dir: &Path, files: &[(&str, &str)]) -> String {

@@ -1,7 +1,10 @@
 //! Opening a PR: GitHub metadata + cache-repo fetch + diff, with a short in-memory cache.
 
+pub mod nav;
 pub mod review;
 pub mod target;
+#[cfg(test)]
+pub(crate) mod testing;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -15,6 +18,7 @@ use crate::git::{
     ChangedFile, GitAuth, GitFailure, ObjectLookup, Repo, RepoGuard, Repos, TreeEntry,
 };
 use crate::github::{Github, Tokens, ViewedState};
+use crate::index::db::IndexDb;
 use crate::state::{PrKey, StateDb};
 
 const CACHE_TTL: Duration = Duration::from_secs(30);
@@ -150,6 +154,9 @@ pub struct PrService {
     tokens: Tokens,
     /// None if the state database could not be opened; viewed marks still work.
     state: Option<StateDb>,
+    /// None if the index database could not be opened; a file's symbols are then parsed on demand,
+    /// without a cache, and nothing else of code navigation works.
+    index: Option<IndexDb>,
     cache: Mutex<HashMap<PrKey, CacheSlot>>,
     /// Detached work after a response (see [`PrService::set_viewed`]), awaited on shutdown.
     bookkeeping: Mutex<tokio::task::JoinSet<()>>,
@@ -162,12 +169,13 @@ fn git_err(e: GitFailure) -> AppError {
 }
 
 impl PrService {
-    pub fn new(repos: Repos, state: Option<StateDb>) -> Self {
+    pub fn new(repos: Repos, state: Option<StateDb>, index: Option<IndexDb>) -> Self {
         PrService {
             repos,
             github: Github::new(),
             tokens: Tokens::default(),
             state,
+            index,
             cache: Default::default(),
             bookkeeping: Default::default(),
             review_writes: Default::default(),
@@ -852,7 +860,7 @@ mod tests {
     async fn open_at_serves_a_snapshot_of_that_head_past_its_ttl() {
         // Never touched: a cache hit reads neither the repo nor GitHub.
         let root = std::env::temp_dir().join("tideline-open-at-unused");
-        let service = Arc::new(PrService::new(Repos::new(root), None));
+        let service = Arc::new(PrService::new(Repos::new(root), None, None));
         let key = PrKey {
             host: "github.com".to_string(),
             owner: "o".to_string(),
