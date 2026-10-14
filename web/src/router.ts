@@ -5,31 +5,56 @@ import { newEntryId, pushedEntry, readEntry, replacedEntry, type NavEntryState }
 const NAV_EVENT = 'dr:navigate'
 
 /**
+ * The state given to an entry the app didn't make, until it is stored in the entry. The browser limits how often the
+ * history may be written (by ignoring the write, or by throwing), so the entry may stay without one for a while: it keeps this id.
+ */
+let unstored: NavEntryState | null = null
+
+/** The entry shown, read without writing the history (React reads it while it renders): one without a state of ours gets `unstored`. */
+function shownEntry(): NavEntryState {
+  return readEntry(history.state) ?? (unstored ??= { id: newEntryId(), depth: 0 })
+}
+
+/**
  * The history entry shown. An entry the app didn't make (the page's first, or one from an older version)
  * gets its state here, so every entry the app looks at has an id and a depth.
  */
 export function currentEntry(): NavEntryState {
   const entry = readEntry(history.state)
   if (entry) return entry
-  const first = { id: newEntryId(), depth: 0 }
-  history.replaceState(first, '')
+  const first = shownEntry()
+  try {
+    history.replaceState(first, '')
+  } catch {
+    return first
+  }
+  if (readEntry(history.state)) unstored = null
   return first
 }
 
 /**
  * Change the URL (pushState by default) and notify subscribers. A push is a new entry, even to the same URL;
- * `pos` is the place it lands on, which the page reveals. A replace keeps the entry's id.
+ * `pos` is the place it lands on, which the page reveals. A replace keeps the entry's id. If the browser refuses
+ * (it limits how often the history may be written), the URL stays and nobody is notified.
  */
 export function navigate(url: string, replace = false, pos?: NavPos): void {
   const entry = currentEntry()
-  if (replace) history.replaceState(replacedEntry(entry, pos), '', url)
-  else history.pushState(pushedEntry(entry, newEntryId(), pos), '', url)
+  try {
+    if (replace) history.replaceState(replacedEntry(entry, pos), '', url)
+    else history.pushState(pushedEntry(entry, newEntryId(), pos), '', url)
+  } catch {
+    return
+  }
   window.dispatchEvent(new Event(NAV_EVENT))
 }
 
 /** Records where the caret is in the entry shown, for when the user comes back to it. Same URL and id, nobody is notified. */
 export function rememberPos(pos: NavPos): void {
-  history.replaceState(replacedEntry(currentEntry(), pos), '')
+  try {
+    history.replaceState(replacedEntry(currentEntry(), pos), '')
+  } catch {
+    // The browser limits how often the history may be written: this place goes unrecorded.
+  }
 }
 
 function subscribe(cb: () => void): () => void {
@@ -45,7 +70,7 @@ function snapshot(): string {
   return location.pathname + location.search
 }
 
-const entryIdSnapshot = (): string => currentEntry().id
+const entryIdSnapshot = (): string => shownEntry().id
 
 /**
  * Current `pathname + search` and the id of the history entry, re-rendering on pushState/replaceState via

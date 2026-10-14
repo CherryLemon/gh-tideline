@@ -76,6 +76,9 @@ const DOUBLE_SHIFT_MS = 350
 /** How long the caret rests before it is recorded in the history entry (the browser limits how often the history may be written). */
 const CARET_REMEMBER_MS = 1000
 
+/** How long a Back counts as on its way: the browser answers within milliseconds, unless it had nowhere to go. */
+const BACK_IN_FLIGHT_MS = 1000
+
 /** The head tree of one head: its entries, or why listing it failed. */
 type Listing = { head: string; entries: TreeEntry[]; error: null } | { head: string; entries: null; error: string; stale: boolean }
 
@@ -721,21 +724,38 @@ function PrView({ repo, data, search, entryId, refreshing, onRefresh }: ViewProp
   )
 
   // The caret is also recorded once it has rested for a moment, for the ways out of an entry that don't pass through goTo:
-  // the browser's own Back, a reload. And as the page goes (pagehide is too late for a reload to keep it).
-  const caretTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  // the browser's own Back, a reload. And as the page goes (pagehide is too late for a reload to keep it): listened for only
+  // while a write is due, since some browsers don't keep a page with such a listener for Back. `entry`: where the caret was
+  // moved; a write due after the user has left it is dropped, as the caret then belongs to another entry.
+  const caretWrite = useRef<{ entry: string; timer: ReturnType<typeof setTimeout> } | null>(null)
+  const writeCaret = useCallback(() => {
+    const due = caretWrite.current
+    if (!due) return
+    clearTimeout(due.timer)
+    caretWrite.current = null
+    window.removeEventListener('beforeunload', writeCaret)
+    if (due.entry === currentEntry().id) rememberCaret()
+  }, [rememberCaret])
   const caretMoved = useCallback(() => {
-    clearTimeout(caretTimer.current)
-    caretTimer.current = setTimeout(rememberCaret, CARET_REMEMBER_MS)
-  }, [rememberCaret])
-  useEffect(() => () => clearTimeout(caretTimer.current), [])
-  useEffect(() => {
-    window.addEventListener('beforeunload', rememberCaret)
-    return () => window.removeEventListener('beforeunload', rememberCaret)
-  }, [rememberCaret])
+    const due = caretWrite.current
+    if (due) clearTimeout(due.timer)
+    else window.addEventListener('beforeunload', writeCaret)
+    caretWrite.current = { entry: currentEntry().id, timer: setTimeout(writeCaret, CARET_REMEMBER_MS) }
+  }, [writeCaret])
+  useEffect(
+    () => () => {
+      clearTimeout(caretWrite.current?.timer)
+      caretWrite.current = null
+      window.removeEventListener('beforeunload', writeCaret)
+    },
+    [writeCaret],
+  )
 
   // Arriving at a history entry that has a place (Back, Forward, a reload, or a jump that came with one): reveal it. A pane
   // that isn't there yet, or isn't showing the file, gets it queued.
   useLayoutEffect(() => {
+    // A place still queued from an earlier arrival, never shown because the user moved on, isn't this one's.
+    if (pendingJump.current && 'pos' in pendingJump.current) pendingJump.current = null
     const pos = currentEntry().pos
     if (!pos || pos.path !== requested) return
     if (pane.current) pane.current.reveal(pos)
@@ -833,6 +853,14 @@ function PrView({ repo, data, search, entryId, refreshing, onRefresh }: ViewProp
 
   useEffect(() => {
     let lastShift = 0
+    // The depth the Backs asked for will end at, until their popstates are in (history.back() is asynchronous: a second press
+    // would still see the depth of the entry shown, and two quick presses at depth 1 would leave the app). Forward isn't counted:
+    // with no entry ahead it does nothing, and a count that waited for it would let a Back pass the first entry.
+    let backTo: number | null = null
+    let backAt = 0
+    const onPopState = () => {
+      if (backTo !== null && currentEntry().depth <= backTo) backTo = null
+    }
     const onKeyDown = (e: KeyboardEvent) => {
       const { neighbor, openFile, dialogOpen, toggleCurrentViewed, commentHere, rememberCaret } = nav.current
       // In a comment box (or any text field) keys are text, but Ctrl+P (the box keeps its draft).
@@ -894,10 +922,15 @@ function PrView({ repo, data, search, entryId, refreshing, onRefresh }: ViewProp
         // only the browser's own button leaves the app.
         consume()
         const back = e.key === 'ArrowLeft'
-        if (e.repeat || (back && currentEntry().depth === 0)) return
+        const now = performance.now()
+        const depth = backTo !== null && now - backAt < BACK_IN_FLIGHT_MS ? backTo : currentEntry().depth
+        if (e.repeat || (back && depth === 0)) return
         rememberCaret()
-        if (back) history.back()
-        else history.forward()
+        if (back) {
+          backTo = depth - 1
+          backAt = now
+          history.back()
+        } else history.forward()
         return
       }
       if (plain && !e.shiftKey && isLetterKey(e, 'v') && !e.repeat) {
@@ -911,7 +944,11 @@ function PrView({ repo, data, search, entryId, refreshing, onRefresh }: ViewProp
       }
     }
     window.addEventListener('keydown', onKeyDown, true)
-    return () => window.removeEventListener('keydown', onKeyDown, true)
+    window.addEventListener('popstate', onPopState)
+    return () => {
+      window.removeEventListener('keydown', onKeyDown, true)
+      window.removeEventListener('popstate', onPopState)
+    }
   }, [])
 
   const startResize = (e: React.MouseEvent) => {

@@ -26,6 +26,7 @@ import {
   type Placement,
 } from '../threads'
 import { isChanged } from '../tree'
+import { isTypingTarget } from '../viewed'
 import { ImageDiff, ImageView } from './ImageDiff'
 import { PaneThreads } from './PaneThreads'
 
@@ -67,12 +68,14 @@ export interface DiffPaneHandle {
   focus(): void
   /**
    * The caret as a place in the app: on the side focused last (in a diff), or in the plain editor. Null when no
-   * text is shown, or when the user hasn't put the caret anywhere in this file yet.
+   * text is shown, or when the user hasn't put the caret anywhere in this file yet. A place of this file that
+   * `reveal` has queued is the caret already: the editor holds something else until it is shown.
    */
   position(): NavPos | null
   /**
-   * Puts the caret on `pos` (unfolding what hides it), brings it into view and focuses its editor. If its file's
-   * text isn't ready yet it is queued through `pendingJump`; a file without text (an image, a binary) ignores it.
+   * Puts the caret on `pos` (unfolding what hides it), brings it into view and focuses its editor, unless the user is
+   * typing elsewhere by then. If its file's text isn't ready yet it is queued through `pendingJump` (also while the
+   * file waits to be loaded on request); a file without text (an image, a binary) ignores it.
    */
   reveal(pos: NavPos): void
 }
@@ -116,7 +119,7 @@ interface Props {
   /** Absent while the threads haven't been read. */
   review?: PaneReview
   onChangeInfo(info: ChangeInfo | null): void
-  /** The user moved the caret (mouse or keyboard), not a reveal or F7. */
+  /** The user moved the caret (mouse, keyboard or F7), not a reveal. */
   onCaret?(): void
 }
 
@@ -230,9 +233,10 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
   /**
    * Where a reveal put the caret, until the user acts: cards and unfolded lines that arrive later, and the diff
    * editor aligning its two sides, can push it out of place, so each change of the layout brings it back. Once
-   * the caret has been scrolled to the middle it is kept there, else it is only kept in view.
+   * the caret has been scrolled to the middle it is kept there, else it is only kept in view. `since`: when it
+   * began (`performance.now()`), so that the input which led to the reveal doesn't end it (see the effect below).
    */
-  const settle = useRef<{ editor: EditorT; at: Monaco.IPosition; centered: boolean } | null>(null)
+  const settle = useRef<{ editor: EditorT; at: Monaco.IPosition; centered: boolean; since: number } | null>(null)
   const onChangeInfoRef = useRef(onChangeInfo)
   onChangeInfoRef.current = onChangeInfo
   const onCaretRef = useRef(onCaret)
@@ -317,6 +321,8 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
       editor.revealLineInCenterIfOutsideViewport(line)
       editor.focus()
       reportChangeInfo()
+      // Monaco reports a caret set from code as such, not as the user's.
+      onCaretRef.current?.()
     },
     [reportChangeInfo],
   )
@@ -405,11 +411,14 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
       // from within the event: Monaco is laying out then, and its line numbers end up a few pixels off the text.
       let frame = 0
       const later = () => {
+        if (!settle.current) return
         cancelAnimationFrame(frame)
         frame = requestAnimationFrame(keepSettled)
       }
       ed.getModifiedEditor().onDidContentSizeChange(later)
       ed.getOriginalEditor().onDidContentSizeChange(later)
+      // The diff editor itself never says it is gone; the editors in it do.
+      ed.getModifiedEditor().onDidDispose(() => cancelAnimationFrame(frame))
       setDiffEditor(ed)
     },
     [keepSettled],
@@ -529,7 +538,9 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
           onChangeInfoRef.current({ index: null, total: 0 })
         } else if (res.kind !== 'text') {
           detach()
-          if (pendingJump.current?.path === file.path) pendingJump.current = null
+          // A place stays queued for a file that waits to be loaded on request; any other move would surface much later.
+          const pj = pendingJump.current
+          if (pj?.path === file.path && !(res.kind === 'deferred' && 'pos' in pj)) pendingJump.current = null
           setState(res)
         } else {
           detachSingle()
@@ -625,15 +636,21 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
     keepSettled()
   }, [placed, placement, draftPlacement, host, keepSettled])
 
-  // Scrolling, clicking or typing ends the hold on the caret's place.
+  // Scrolling or clicking in the pane, and typing, end the hold on the caret's place. Not the input the reveal came from: it
+  // may still be on its way when the reveal runs, so it counts only if it is newer than the hold (whichever listener is first).
   useEffect(() => {
-    const release = () => {
-      settle.current = null
+    const pane = root.current
+    if (!pane) return
+    const release = (e: Event) => {
+      if (settle.current && e.timeStamp > settle.current.since) settle.current = null
     }
-    const types = ['wheel', 'pointerdown', 'keydown'] as const
-    for (const type of types) window.addEventListener(type, release, { capture: true, passive: true })
+    window.addEventListener('keydown', release, { capture: true, passive: true })
+    pane.addEventListener('wheel', release, { capture: true, passive: true })
+    pane.addEventListener('pointerdown', release, { capture: true, passive: true })
     return () => {
-      for (const type of types) window.removeEventListener(type, release, { capture: true })
+      window.removeEventListener('keydown', release, { capture: true })
+      pane.removeEventListener('wheel', release, { capture: true })
+      pane.removeEventListener('pointerdown', release, { capture: true })
     }
   }, [])
 
@@ -684,17 +701,22 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
     editor.setPosition(at)
     // Only if it is out of view, so Back to a file keeps the scroll position it had.
     const centered = centerIfOutside(editor, at)
-    editor.focus()
+    // A reveal that waited for its file isn't worth taking the focus from a box or a dialog the user has gone to since.
+    const active = document.activeElement
+    if (!isTypingTarget(active) && !active?.closest('[role="dialog"]')) editor.focus()
     lastSide.current = side
     fresh.current = false
     navIndex.current = null
     if (editor === singleRef.current) return true
-    settle.current = { editor, at, centered }
+    settle.current = { editor, at, centered, since: performance.now() }
     reportChangeInfo()
     return true
   }
 
   const position = (): NavPos | null => {
+    // A place queued by `reveal` is the caret as far as the user goes; the editor holds something else until it is shown.
+    const queued = pendingJump.current
+    if (queued && 'pos' in queued && queued.path === file.path) return queued.pos
     if (fresh.current) return null
     const ed = editorRef.current
     let editor: EditorT | null = null
@@ -714,8 +736,9 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
 
   const reveal = (pos: NavPos) => {
     if (showPos(pos)) return
-    // No text to put a caret in: an image, a binary file, one too large to load, a submodule, a failed load.
-    if (pos.path === file.path && state.kind !== 'loading' && state.kind !== 'text' && state.kind !== 'single') return
+    // No text to put a caret in: an image, a binary file, a submodule, a failed load. (A file too large to load automatically
+    // keeps the place until it is loaded.)
+    if (pos.path === file.path && state.kind !== 'loading' && state.kind !== 'text' && state.kind !== 'single' && state.kind !== 'deferred') return
     pendingJump.current = { path: pos.path, pos }
   }
   const revealRef = useRef(reveal)
