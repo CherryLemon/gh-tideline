@@ -526,7 +526,11 @@ export class MockIndex {
     const name = query.get('name') ?? ''
     if (sub !== 'index') {
       if (!path || Buffer.byteLength(path) > 4096 || /[\x00-\x1f\x7f]/.test(path)) return failure(400, 'bad_request', 'invalid path')
-      if (!name || Buffer.byteLength(name) > 256 || /[\s\x00-\x1f\x7f]/.test(name)) return failure(400, 'bad_request', 'invalid name')
+      // As the server: no whitespace but the single spaces of a C++ operator's name (`operator new[]`).
+      const spaced = /^operator( [^ ]+)+$/.test(name)
+      if (!name || Buffer.byteLength(name) > 256 || /[\x00-\x1f\x7f]/.test(name) || /[^\S ]/.test(name) || (name.includes(' ') && !spaced)) {
+        return failure(400, 'bad_request', 'invalid name')
+      }
     }
     if (head !== pull.head) return failure(409, 'stale_head', 'the pull request head has moved')
     if (this.unavailable) return failure(503, 'index_unavailable', 'the index database could not be opened')

@@ -33,19 +33,26 @@ fn check_path(path: Option<&str>) -> Result<&str, AppError> {
     }
 }
 
-/// A name to look up: 1 to 256 bytes without whitespace or control characters.
+/// A name to look up: 1 to 256 bytes without whitespace or control characters, but for the single spaces the index keeps
+/// in the name of a C++ operator (`operator new[]`, `operator co_await`).
 fn check_name(name: Option<&str>) -> Result<&str, AppError> {
     match name {
-        Some(name)
-            if (1..=MAX_NAME_BYTES).contains(&name.len())
-                && !name.chars().any(|c| c.is_whitespace() || c.is_control()) =>
-        {
-            Ok(name)
-        }
+        Some(name) if (1..=MAX_NAME_BYTES).contains(&name.len()) && is_name(name) => Ok(name),
         _ => Err(AppError::bad_request(
             "name must be 1 to 256 bytes without whitespace or control characters",
         )),
     }
+}
+
+fn is_name(name: &str) -> bool {
+    if name
+        .chars()
+        .any(|c| c.is_control() || (c.is_whitespace() && c != ' '))
+    {
+        return false;
+    }
+    !name.contains(' ')
+        || (name.starts_with("operator ") && name.split(' ').all(|word| !word.is_empty()))
 }
 
 /// An answer that is never cached: what the index holds changes as builds go on.
@@ -697,7 +704,8 @@ mod tests {
     }
 
     #[test]
-    fn a_name_is_one_to_256_bytes_without_whitespace_or_control_characters() {
+    fn a_name_is_one_to_256_bytes_without_whitespace_or_control_characters_but_the_spaces_of_an_operator()
+     {
         for name in [
             "a",
             "parse",
@@ -705,6 +713,8 @@ mod tests {
             "_x1",
             "$scope",
             "operator()",
+            "operator new[]",
+            "operator co_await",
             &"n".repeat(256),
             &"é".repeat(128),
         ] {
@@ -715,6 +725,11 @@ mod tests {
             Some(""),
             Some("a b"),
             Some(" a"),
+            Some("operator "),
+            Some("operator  new"),
+            Some("operator new "),
+            Some("operator\tnew"),
+            Some("operators new"),
             Some("a\tb"),
             Some("a\nb"),
             Some("a\u{a0}b"),
