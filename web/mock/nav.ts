@@ -1,6 +1,6 @@
-// The mock of GET /blobs/{oid}/symbols. A few regular expressions per language stand in for the server's tree-sitter tags: at
-// most one definition per line, with the kinds the server reports, and an extent found by matching braces (by indentation in
-// Python). Good enough for the fixtures; it does not parse anything.
+// The mock of GET /blobs/{oid}/symbols, and of the repository index built on it. A few regular expressions per language stand in
+// for the server's tree-sitter tags: at most one definition per line, with the kinds the server reports, and an extent found by
+// matching braces (by indentation in Python). Good enough for the fixtures; it does not parse anything.
 
 export interface MockSymbol {
   name: string
@@ -263,4 +263,287 @@ export function fileSymbols(path: string, content: Buffer): MockFileSymbols {
   if (text.charCodeAt(0) === 0xfeff) text = text.slice(1)
   const symbols = language === 'python' ? pythonSymbols(text) : braceSymbols(text, language)
   return { language, tooLarge: false, symbols: symbols.sort((a, b) => a.startLine - b.startLine || a.column - b.column) }
+}
+
+// --- The index: build jobs, definitions and references ----------------------------------------------------------------------
+
+export type NavSide = 'head' | 'base'
+type IndexState = 'missing' | 'queued' | 'building' | 'ready' | 'failed' | 'cancelled'
+type IndexPhase = 'listing' | 'fetching' | 'parsing' | 'saving'
+
+export interface MockIndexStatus {
+  commit: string
+  state: IndexState
+  phase: IndexPhase | null
+  done: number
+  total: number
+  cancelling: boolean
+  message: string | null
+}
+
+export interface MockHit {
+  path: string
+  line: number
+  column: number
+  endColumn: number
+  kind: string
+  snippet: string
+  snippetColumn: number
+  tier: 'file' | 'dir' | 'other'
+}
+
+export interface MockNavResult {
+  language: string | null
+  commit: string
+  name: string
+  hits: MockHit[]
+  truncated: boolean
+}
+
+/** A commit of the pull request: its tree, as `git ls-tree -r` lists it. */
+export interface NavCommit {
+  sha: string
+  tree: ReadonlyArray<{ path: string; oid: string }>
+}
+
+/** What the index routes need to know of the pull request at the time of a request. */
+export interface NavPull {
+  /** The head the pull request has now: a request for another one is stale. */
+  head: string
+  commits: Record<NavSide, NavCommit>
+}
+
+export interface MockResponse {
+  status: number
+  body: unknown
+}
+
+/** How much of a build each phase takes, in order. The files are counted while they are fetched and parsed. */
+const PHASES: Array<[IndexPhase, number]> = [
+  ['listing', 0.1],
+  ['fetching', 0.45],
+  ['parsing', 0.35],
+  ['saving', 0.1],
+]
+/** A job waits this long before it starts building. */
+const QUEUED_MS = 80
+/** A job that is told to stop takes this long to. */
+const CANCEL_MS = 100
+/** A build that is to fail does so at this share of its time. */
+const FAIL_AT = 0.4
+const MAX_DEFINITIONS = 200
+const MAX_REFERENCES = 1000
+const MAX_SNIPPET = 200
+
+interface Job {
+  startedAt: number
+  durationMs: number
+  /** The files the build counts. */
+  files: number
+  /** When the job was told to stop. */
+  cancelledAt: number | null
+  /** The message of the failure this build ends in. */
+  failure: string | null
+}
+
+/** A file of a commit, read for a look-up. */
+interface Parsed {
+  text: string
+  lines: string[]
+  language: string
+  symbols: MockSymbol[]
+  /** The lines with comments and strings blanked: only code is left to look for names in. */
+  code?: string[]
+}
+
+const response = (status: number, body: unknown): MockResponse => ({ status, body })
+const failure = (status: number, code: string, message: string) => response(status, { error: { code, message } })
+
+/** Lookups match within a family of languages: JavaScript and TypeScript see each other. */
+const familyOf = (language: string) => (language === 'typescript' || language === 'tsx' || language === 'javascript' ? 'ecma' : language)
+
+const dirOf = (path: string) => path.slice(0, path.lastIndexOf('/') + 1)
+
+/** The number of leading directories two paths have in common. */
+function commonDirs(a: string, b: string): number {
+  const x = dirOf(a).split('/')
+  const y = dirOf(b).split('/')
+  let n = 0
+  while (n < x.length - 1 && n < y.length - 1 && x[n] === y[n]) n++
+  return n
+}
+
+const TIERS = ['file', 'dir', 'other']
+
+const tierOf = (path: string, from: string): MockHit['tier'] => (path === from ? 'file' : dirOf(path) === dirOf(from) ? 'dir' : 'other')
+
+const byPath = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0)
+
+/** The line, trimmed and cut like the server does, and the column of the name in it. */
+function snippetOf(line: string, column: number): { snippet: string; snippetColumn: number } {
+  let snippet = line.trim()
+  if (snippet.length > MAX_SNIPPET) {
+    // Not in the middle of a character made of two UTF-16 units.
+    const high = (snippet.charCodeAt(MAX_SNIPPET - 1) & 0xfc00) === 0xd800
+    snippet = snippet.slice(0, high ? MAX_SNIPPET - 1 : MAX_SNIPPET)
+  }
+  return { snippet, snippetColumn: column - (line.length - line.trimStart().length) }
+}
+
+const escapeRegExp = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+
+/** The builds of the index of a pull request's commits, and the looking up of names in the commits that are built. */
+export class MockIndex {
+  private readonly jobs = new Map<string, Job>()
+  private readonly parsed = new Map<string, Parsed | null>()
+  private durationMs = 1500
+  private nextFailure: string | null = null
+  private unavailable = false
+
+  constructor(private readonly blob: (oid: string) => Buffer | undefined) {}
+
+  /** Test hook: every commit unindexed again; the builds to come take `durationMs`. */
+  reset(options: { durationMs?: unknown; unavailable?: unknown } | null): void {
+    const ms = options?.durationMs
+    this.jobs.clear()
+    this.durationMs = typeof ms === 'number' && ms >= 0 && ms <= 60_000 ? ms : 1500
+    this.nextFailure = null
+    this.unavailable = options?.unavailable === true
+  }
+
+  /** Test hook: the next build to start fails, part of the way through. */
+  failNext(message: string): void {
+    this.nextFailure = message
+  }
+
+  private statusOf(job: Job | undefined, commit: string, now: number): MockIndexStatus {
+    const idle = { commit, phase: null, done: 0, total: 0, cancelling: false, message: null }
+    if (!job) return { ...idle, state: 'missing' }
+    if (job.cancelledAt !== null && now - job.cancelledAt >= CANCEL_MS) return { ...idle, state: 'cancelled' }
+    // The progress stops when the job is told to.
+    const elapsed = (job.cancelledAt ?? now) - job.startedAt
+    const share = job.durationMs > 0 ? elapsed / job.durationMs : 1
+    if (job.failure !== null && share >= FAIL_AT) return { ...idle, state: 'failed', message: job.failure }
+    if (share >= 1) return { ...idle, state: 'ready' }
+    const cancelling = job.cancelledAt !== null
+    if (elapsed < QUEUED_MS) return { ...idle, state: 'queued', cancelling }
+    let from = 0
+    for (const [phase, span] of PHASES) {
+      if (share < from + span) {
+        const counted = phase === 'fetching' || phase === 'parsing'
+        return { ...idle, state: 'building', cancelling, phase, done: counted ? Math.floor(((share - from) / span) * job.files) : 0, total: counted ? job.files : 0 }
+      }
+      from += span
+    }
+    return { ...idle, state: 'building', cancelling, phase: 'saving' }
+  }
+
+  private status(key: string, commit: NavCommit): MockIndexStatus {
+    return this.statusOf(this.jobs.get(key), commit.sha, Date.now())
+  }
+
+  /** Starts a build, or joins the one under way; a commit that is built answers at once. */
+  private start(key: string, commit: NavCommit): MockIndexStatus {
+    const now = Date.now()
+    const current = this.statusOf(this.jobs.get(key), commit.sha, now)
+    // A job that is stopping is not joined: the build that follows its cancel is a new one.
+    if ((current.state === 'ready' || current.state === 'queued' || current.state === 'building') && !current.cancelling) return current
+    const files = commit.tree.filter((e) => languageOf(e.path) && this.blob(e.oid)).length
+    this.jobs.set(key, { startedAt: now, durationMs: this.durationMs, files, cancelledAt: null, failure: this.nextFailure })
+    this.nextFailure = null
+    return this.statusOf(this.jobs.get(key), commit.sha, now)
+  }
+
+  private cancel(key: string, commit: NavCommit): MockIndexStatus {
+    const job = this.jobs.get(key)
+    const now = Date.now()
+    const current = this.statusOf(job, commit.sha, now)
+    if (job && job.cancelledAt === null && (current.state === 'queued' || current.state === 'building')) job.cancelledAt = now
+    return this.statusOf(job, commit.sha, now)
+  }
+
+  /** The file of a tree entry, read once; null for one that is gone or too big. */
+  private file(entry: { path: string; oid: string }, language: string): Parsed | null {
+    const key = `${entry.oid}:${language}`
+    if (!this.parsed.has(key)) {
+      const blob = this.blob(entry.oid)
+      const found = blob ? fileSymbols(entry.path, blob) : null
+      let text = blob && found && !found.tooLarge ? blob.toString('utf8') : ''
+      if (text.charCodeAt(0) === 0xfeff) text = text.slice(1)
+      this.parsed.set(key, found && !found.tooLarge ? { text, lines: text.split('\n'), language, symbols: found.symbols } : null)
+    }
+    return this.parsed.get(key) ?? null
+  }
+
+  /** Where the definitions of a name are, nearest `from` first. */
+  private definitions(commit: NavCommit, from: string, name: string, family: string): MockHit[] {
+    const hits: Array<MockHit & { near: number }> = []
+    for (const entry of commit.tree) {
+      const language = languageOf(entry.path)
+      const file = language && familyOf(language) === family ? this.file(entry, language) : null
+      if (!file?.text.includes(name)) continue
+      for (const s of file.symbols) {
+        if (s.name !== name || s.kind === 'implementation') continue
+        const { snippet, snippetColumn } = snippetOf(file.lines[s.line - 1] ?? '', s.column)
+        hits.push({ path: entry.path, line: s.line, column: s.column, endColumn: s.endColumn, kind: s.kind, snippet, snippetColumn, tier: tierOf(entry.path, from), near: commonDirs(entry.path, from) })
+      }
+    }
+    hits.sort((a, b) => TIERS.indexOf(a.tier) - TIERS.indexOf(b.tier) || b.near - a.near || byPath(a.path, b.path) || a.line - b.line)
+    return hits.slice(0, MAX_DEFINITIONS).map(({ near: _, ...hit }) => hit)
+  }
+
+  /** Where a name is used: the identifiers of that name in the code that are not a definition's name. */
+  private references(commit: NavCommit, from: string, name: string, family: string): { hits: MockHit[]; truncated: boolean } {
+    const word = new RegExp(`(?<![\\p{L}\\p{N}_$])${escapeRegExp(name)}(?![\\p{L}\\p{N}_$])`, 'gu')
+    const hits: MockHit[] = []
+    for (const entry of commit.tree) {
+      const language = languageOf(entry.path)
+      const file = language && familyOf(language) === family ? this.file(entry, language) : null
+      if (!file?.text.includes(name)) continue
+      file.code ??= blank(file.text, file.language).split('\n')
+      file.code.forEach((code, n) => {
+        for (const m of code.matchAll(word)) {
+          const column = m.index + 1
+          const at = (s: MockSymbol) => s.line === n + 1 && s.column === column
+          if (file.symbols.some((s) => s.name === name && s.kind !== 'implementation' && at(s))) continue
+          const kind = file.symbols.some((s) => s.kind === 'implementation' && at(s)) ? 'implementation' : code[m.index + name.length] === '(' ? 'call' : 'reference'
+          const { snippet, snippetColumn } = snippetOf(file.lines[n] ?? '', column)
+          hits.push({ path: entry.path, line: n + 1, column, endColumn: column + name.length, kind, snippet, snippetColumn, tier: tierOf(entry.path, from) })
+        }
+      })
+    }
+    hits.sort((a, b) => TIERS.indexOf(a.tier) - TIERS.indexOf(b.tier) || byPath(a.path, b.path) || a.line - b.line || a.column - b.column)
+    return { hits: hits.slice(0, MAX_REFERENCES), truncated: hits.length > MAX_REFERENCES }
+  }
+
+  /** The routes `/pulls/{n}/index`, `/definitions` and `/references`; null for a method they don't have. */
+  handle(method: string, sub: 'index' | 'definitions' | 'references', n: number, query: URLSearchParams, body: unknown, pull: NavPull): MockResponse | null {
+    const asked = method === 'POST' ? ((body ?? {}) as Record<string, unknown>) : { head: query.get('head'), side: query.get('side') }
+    const { head, side } = asked
+    if (typeof head !== 'string' || !/^[0-9a-f]{40}$/.test(head)) return failure(400, 'bad_request', 'head must be 40 hexadecimal digits')
+    if (side !== 'head' && side !== 'base') return failure(400, 'bad_request', 'side must be head or base')
+    const path = query.get('path') ?? ''
+    const name = query.get('name') ?? ''
+    if (sub !== 'index') {
+      if (!path || Buffer.byteLength(path) > 4096 || /[\x00-\x1f\x7f]/.test(path)) return failure(400, 'bad_request', 'invalid path')
+      if (!name || Buffer.byteLength(name) > 256 || /[\s\x00-\x1f\x7f]/.test(name)) return failure(400, 'bad_request', 'invalid name')
+    }
+    if (head !== pull.head) return failure(409, 'stale_head', 'the pull request head has moved')
+    if (this.unavailable) return failure(503, 'index_unavailable', 'the index database could not be opened')
+    const commit = pull.commits[side]
+    const key = `${n}:${head}:${side}`
+    if (sub === 'index') {
+      if (method === 'POST') return response(200, this.start(key, commit))
+      if (method === 'GET') return response(200, this.status(key, commit))
+      if (method === 'DELETE') return response(200, this.cancel(key, commit))
+      return null
+    }
+    if (method !== 'GET') return null
+    const language = languageOf(path)
+    // A file the index has no language for needs no index.
+    if (!language) return response(200, { language: null, commit: commit.sha, name, hits: [], truncated: false } satisfies MockNavResult)
+    if (this.status(key, commit).state !== 'ready') return failure(409, 'index_missing', 'the commit has not been indexed')
+    const found = sub === 'definitions' ? { hits: this.definitions(commit, path, name, familyOf(language)), truncated: false } : this.references(commit, path, name, familyOf(language))
+    return response(200, { language, commit: commit.sha, name, ...found } satisfies MockNavResult)
+  }
 }

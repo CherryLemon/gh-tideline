@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
+import type { ChangedFile } from '../api'
 import type { LineChange } from '../threads'
-import { mapLine } from './targets'
+import { mapLine, resolveTarget } from './targets'
 
 /** A change as Monaco reports it: original range, then modified range (end 0: nothing on that side). */
 function change(os: number, oe: number, ms: number, me: number): LineChange {
@@ -154,5 +155,76 @@ describe('mapLine', () => {
       expect(toOriginal(changes, 3)).toBe(1)
       expect(toOriginal(changes, 4)).toBe(3)
     })
+  })
+})
+
+function file(path: string, extra: Partial<ChangedFile> = {}): ChangedFile {
+  return { path, status: 'M', oldOid: 'a', newOid: 'b', oldMode: '100644', newMode: '100644', binary: false, generated: false, ...extra }
+}
+
+describe('resolveTarget', () => {
+  const modified = file('src/main.ts')
+  const added = file('src/new.ts', { status: 'A', oldOid: null })
+  const deleted = file('src/gone.ts', { status: 'D', newOid: null })
+  const renamed = file('src/Button.tsx', { status: 'R', oldPath: 'src/Btn.tsx' })
+  const copied = file('templates/email.html', { status: 'C', oldPath: 'templates/base.html' })
+  const files = [modified, added, deleted, renamed, copied]
+  const tree = new Set(['src/main.ts', 'src/new.ts', 'src/Button.tsx', 'templates/email.html', 'templates/base.html', 'src/util/log.ts'])
+
+  it('finds the changed file for a place in the head', () => {
+    expect(resolveTarget('src/main.ts', 'head', files, tree)).toEqual({ path: 'src/main.ts', side: 'head' })
+    expect(resolveTarget('src/new.ts', 'head', files, tree)).toEqual({ path: 'src/new.ts', side: 'head' })
+    expect(resolveTarget('src/Button.tsx', 'head', files, tree)).toEqual({ path: 'src/Button.tsx', side: 'head' })
+    expect(resolveTarget('templates/email.html', 'head', files, tree)).toEqual({ path: 'templates/email.html', side: 'head' })
+  })
+
+  it('finds the changed file for a place in the base, on its base side', () => {
+    expect(resolveTarget('src/main.ts', 'base', files, tree)).toEqual({ path: 'src/main.ts', side: 'base' })
+    expect(resolveTarget('src/gone.ts', 'base', files, tree)).toEqual({ path: 'src/gone.ts', side: 'base' })
+  })
+
+  it('maps the old path of a renamed file to the file, on its base side', () => {
+    expect(resolveTarget('src/Btn.tsx', 'base', files, tree)).toEqual({ path: 'src/Button.tsx', side: 'base' })
+    expect(resolveTarget('src/Btn.tsx', 'head', files, tree)).toBeNull()
+  })
+
+  it('has a deleted file on the base side only', () => {
+    expect(resolveTarget('src/gone.ts', 'head', files, tree)).toBeNull()
+  })
+
+  it('has an added file on the head side only', () => {
+    expect(resolveTarget('src/new.ts', 'base', files, tree)).toBeNull()
+  })
+
+  it('does not take a renamed file for the one that has its new path in the base', () => {
+    expect(resolveTarget('src/Button.tsx', 'base', files, tree)).toBeNull()
+  })
+
+  it('takes a file copied from for the file itself, not for its copy', () => {
+    expect(resolveTarget('templates/base.html', 'base', files, tree)).toEqual({ path: 'templates/base.html', side: 'head' })
+    expect(resolveTarget('templates/base.html', 'head', files, tree)).toEqual({ path: 'templates/base.html', side: 'head' })
+    expect(resolveTarget('templates/email.html', 'base', files, tree)).toBeNull()
+  })
+
+  it('opens an unchanged file at the head, from either side', () => {
+    expect(resolveTarget('src/util/log.ts', 'head', files, tree)).toEqual({ path: 'src/util/log.ts', side: 'head' })
+    expect(resolveTarget('src/util/log.ts', 'base', files, tree)).toEqual({ path: 'src/util/log.ts', side: 'head' })
+  })
+
+  it('finds no file the pull request does not have', () => {
+    expect(resolveTarget('src/other.ts', 'head', files, tree)).toBeNull()
+    expect(resolveTarget('src/other.ts', 'base', files, tree)).toBeNull()
+  })
+
+  it('takes an unchanged file to be there while the head tree is not listed', () => {
+    expect(resolveTarget('src/util/log.ts', 'head', files, null)).toEqual({ path: 'src/util/log.ts', side: 'head' })
+    expect(resolveTarget('src/util/log.ts', 'base', files, null)).toEqual({ path: 'src/util/log.ts', side: 'head' })
+    // Changed files need no listing.
+    expect(resolveTarget('src/Btn.tsx', 'base', files, null)).toEqual({ path: 'src/Button.tsx', side: 'base' })
+  })
+
+  it('works for a pull request without changes', () => {
+    expect(resolveTarget('a.ts', 'head', [], new Set(['a.ts']))).toEqual({ path: 'a.ts', side: 'head' })
+    expect(resolveTarget('b.ts', 'head', [], new Set(['a.ts']))).toBeNull()
   })
 })

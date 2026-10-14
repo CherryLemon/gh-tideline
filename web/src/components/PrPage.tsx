@@ -45,6 +45,7 @@ import { usePersistentState } from '../storage'
 import { ViewedSync, isTypingTarget, nextUnviewed, viewedMap } from '../viewed'
 import { fileCounts, threadsForFile, type DraftPanelReason, type LineAnchor, type LineDraft, type PanelReason } from '../threads'
 import { useReview, type ReviewRead } from '../useReview'
+import { useCodeNav } from '../useCodeNav'
 import { boxText, draftKey, draftStoreFor, editKey, lostDrafts, replyKey, type DraftTarget, type DraftView } from '../drafts'
 import { postDelete, postDiscard, postReply, postSubmit, postThread, threadRequest, type ReadDeps } from '../compose'
 import { stamp, type ReviewStore } from '../review'
@@ -52,6 +53,8 @@ import { MarkdownContext, markdownRenderer } from '../markdown'
 import { DiffPane, type ChangeInfo, type DiffPaneHandle, type PaneReview, type PendingJump } from './DiffPane'
 import { FileTree, type ListingState, type TreeScope } from './FileTree'
 import { FileFinder } from './FileFinder'
+import { IndexDialog } from './IndexDialog'
+import { NavPopup } from './NavPopup'
 import { Toast, type ToastMessage } from './Toast'
 import { ThreadActionsContext, ThreadCard, anchorLines, type ThreadActions } from './ThreadCard'
 import { Composer } from './Composer'
@@ -521,8 +524,6 @@ function PrView({ repo, data, search, entryId, refreshing, onRefresh }: ViewProp
   // Shown while its summary box is open: a submit that worked closes the box, and the dialog with
   // it, in the same render that makes the page usable again (focus goes back to the button).
   const reviewShown = reviewOpen && reviewView !== undefined && snapshot !== null
-  // Global shortcuts stay off while one is open.
-  const dialogOpen = finderOpen || reviewShown
   // New commits shown behind the dialog (its toast's Refresh): look at them before submitting. A
   // submit on its way first ends (refused at the old head, it leaves the dialog open).
   const reviewSending = reviewView?.sending ?? false
@@ -724,6 +725,13 @@ function PrView({ repo, data, search, entryId, refreshing, onRefresh }: ViewProp
     [rememberCaret],
   )
 
+  const codeNav = useCodeNav({ repo, prNumber: pr.number, head, files, tree: entryByPath, goTo, showToast, onRefresh, entryId })
+  const { dismiss: dismissCodeNav } = codeNav
+  // Global shortcuts stay off while a dialog or a list is open.
+  const dialogOpen = finderOpen || reviewShown || codeNav.open
+  // The page behind a modal dialog can't be reached.
+  const modalShown = reviewShown || codeNav.index !== null
+
   // The caret is also recorded once it has rested for a moment, for the ways out of an entry that don't pass through goTo:
   // the browser's own Back, a reload. And as the page goes (pagehide is too late for a reload to keep it): listened for only
   // while a write is due, since some browsers don't keep a page with such a listener for Back. `entry`: where the caret was
@@ -742,7 +750,9 @@ function PrView({ repo, data, search, entryId, refreshing, onRefresh }: ViewProp
     if (due) clearTimeout(due.timer)
     else window.addEventListener('beforeunload', writeCaret)
     caretWrite.current = { entry: currentEntry().id, timer: setTimeout(writeCaret, CARET_REMEMBER_MS) }
-  }, [writeCaret])
+    // The user has moved on from the name a look-up was started for.
+    dismissCodeNav()
+  }, [writeCaret, dismissCodeNav])
   useEffect(
     () => () => {
       clearTimeout(caretWrite.current?.timer)
@@ -846,10 +856,17 @@ function PrView({ repo, data, search, entryId, refreshing, onRefresh }: ViewProp
     }
   }
 
+  /** Ctrl+B: the definitions of the name at the caret. */
+  const goToDefinition = () => {
+    const source = pane.current?.navSource()
+    if (source) codeNav.request(source)
+    else showToast('Put the caret on a name to go to its definition')
+  }
+
   // Keep the latest navigation state for the window-level key handler.
-  const nav = useRef({ neighbor, openFile, dialogOpen, toggleCurrentViewed, commentHere, rememberCaret })
+  const nav = useRef({ neighbor, openFile, dialogOpen, toggleCurrentViewed, commentHere, goToDefinition, rememberCaret })
   useLayoutEffect(() => {
-    nav.current = { neighbor, openFile, dialogOpen, toggleCurrentViewed, commentHere, rememberCaret }
+    nav.current = { neighbor, openFile, dialogOpen, toggleCurrentViewed, commentHere, goToDefinition, rememberCaret }
   })
 
   useEffect(() => {
@@ -863,7 +880,7 @@ function PrView({ repo, data, search, entryId, refreshing, onRefresh }: ViewProp
       if (backTo !== null && currentEntry().depth <= backTo) backTo = null
     }
     const onKeyDown = (e: KeyboardEvent) => {
-      const { neighbor, openFile, dialogOpen, toggleCurrentViewed, commentHere, rememberCaret } = nav.current
+      const { neighbor, openFile, dialogOpen, toggleCurrentViewed, commentHere, goToDefinition, rememberCaret } = nav.current
       // In a comment box (or any text field) keys are text, but Ctrl+P (the box keeps its draft).
       const typing = isTypingTarget(e.target)
       if (e.key === 'Shift') {
@@ -900,6 +917,12 @@ function PrView({ repo, data, search, entryId, refreshing, onRefresh }: ViewProp
       if (typing) {
         // Neither Monaco's accessible diff viewer (from its find box) nor Chrome's caret browsing.
         if (e.key === 'F7' && plain) consume()
+        return
+      }
+      if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && isLetterKey(e, 'b')) {
+        // Not the browser's either (Firefox opens its bookmarks).
+        consume()
+        if (!e.repeat) goToDefinition()
         return
       }
       if (e.key === 'F7' && plain) {
@@ -972,7 +995,7 @@ function PrView({ repo, data, search, entryId, refreshing, onRefresh }: ViewProp
 
   return (
     <div className="app" style={{ '--tree-width': `${treeWidth}px` } as React.CSSProperties}>
-      <header className="topbar" inert={reviewShown}>
+      <header className="topbar" inert={modalShown}>
         <a className="home-link" href="/" title="Home">
           Tideline
         </a>
@@ -1029,7 +1052,7 @@ function PrView({ repo, data, search, entryId, refreshing, onRefresh }: ViewProp
         </button>
       </header>
 
-      <div className="main" inert={reviewShown}>
+      <div className="main" inert={modalShown}>
         <aside className="sidebar">
           <FileTree
             rows={rows}
@@ -1076,6 +1099,7 @@ function PrView({ repo, data, search, entryId, refreshing, onRefresh }: ViewProp
                 review={paneReview}
                 onChangeInfo={setChangeInfo}
                 onCaret={caretMoved}
+                onGoTo={codeNav.request}
               />
             </ThreadActionsContext.Provider>
           ) : unresolved ? (
@@ -1091,7 +1115,7 @@ function PrView({ repo, data, search, entryId, refreshing, onRefresh }: ViewProp
         </section>
       </div>
 
-      <footer className="statusbar" inert={reviewShown}>
+      <footer className="statusbar" inert={modalShown}>
         <span className="status-item" data-testid="change-info">
           {changeInfo
             ? changeInfo.total === 0
@@ -1106,6 +1130,7 @@ function PrView({ repo, data, search, entryId, refreshing, onRefresh }: ViewProp
         <span className="hint"><kbd>F7</kbd> next change</span>
         <span className="hint"><kbd>Shift+F7</kbd> previous</span>
         <span className="hint"><kbd>Alt+↓</kbd>/<kbd>Alt+↑</kbd> next/previous file</span>
+        <span className="hint"><kbd>Ctrl+B</kbd> go to definition</span>
         <span className="hint"><kbd>Ctrl+Alt+←</kbd>/<kbd>→</kbd> back/forward</span>
         <span className="hint"><kbd>Shift Shift</kbd>/<kbd>Ctrl+P</kbd> find file</span>
         <span className="hint"><kbd>v</kbd> viewed</span>
@@ -1122,6 +1147,8 @@ function PrView({ repo, data, search, entryId, refreshing, onRefresh }: ViewProp
           }}
         />
       )}
+      {codeNav.index && <IndexDialog {...codeNav.index} />}
+      {codeNav.list && <NavPopup key={codeNav.list.id} {...codeNav.list.props} />}
       {reviewShown && (
         <ReviewDialog
           drafts={drafts}

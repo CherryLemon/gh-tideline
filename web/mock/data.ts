@@ -689,6 +689,49 @@ function longSource(): string {
   return out.join('\n') + '\n'
 }
 
+/** What the look-ups of the code navigation find: `log` is defined twice (a choice), `slugify` is used in several files, `ping` in more than a list shows. */
+const logTs = `/** Writes a line to the log. */
+export function log(message: string): void {
+  console.log(message)
+}
+
+export function warn(message: string): void {
+  console.warn('warning: ' + message)
+}
+`
+
+const legacyLogJs = `// The logger of the legacy client, kept until the client is gone.
+function log(message) {
+  console.log('[legacy] ' + message)
+}
+
+module.exports = { log: log }
+`
+
+const titlesTs = `import { slugify, truncate } from './strings'
+
+export function pageSlug(title: string): string {
+  return slugify(truncate(title, 60))
+}
+
+export function feedSlugs(titles: string[]): string[] {
+  return titles.map((title) => slugify(title))
+}
+
+export function anchorFor(heading: string): string {
+  return '#' + slugify(heading)
+}
+`
+
+const pingsTs = `// Generated: one call of ping per line.
+export function ping(n: number): number {
+  return n + 1
+}
+
+export const pings = [
+${Array.from({ length: 1100 }, (_, i) => `  ping(${i}),\n`).join('')}]
+`
+
 /** Files the PR doesn't touch: content (blob) or a commit (gitlink). */
 function unchangedSpecs(): Array<{ path: string; content?: string | Buffer; commit?: string; mode?: string }> {
   const out: Array<{ path: string; content?: string | Buffer; commit?: string; mode?: string }> = []
@@ -711,6 +754,10 @@ function unchangedSpecs(): Array<{ path: string; content?: string | Buffer; comm
   out.push({ path: 'scripts/deploy.sh', content: '#!/bin/sh\nset -eu\necho deploy\n', mode: '100755' })
   out.push({ path: 'src/app/util/registry.ts', content: registryTs })
   out.push({ path: 'src/app/util/schema.ts', content: longSource() })
+  out.push({ path: 'src/app/util/log.ts', content: logTs })
+  out.push({ path: 'src/legacy/log.js', content: legacyLogJs })
+  out.push({ path: 'src/app/util/titles.ts', content: titlesTs })
+  out.push({ path: 'src/gen/pings.ts', content: pingsTs })
   return out
 }
 
@@ -726,6 +773,15 @@ function buildTree(): MockTreeEntry[] {
 }
 
 export const tree: MockTreeEntry[] = buildTree()
+
+/** `git ls-tree -r` of the merge base: the changed files as they were, and the unchanged ones. */
+function buildBaseTree(): MockTreeEntry[] {
+  const changed = new Set(files.map((f) => f.path))
+  const before = files.filter((f) => f.oldOid !== null).map((f) => ({ path: f.oldPath ?? f.path, mode: f.oldMode, oid: f.oldOid! }))
+  return [...before, ...tree.filter((e) => !changed.has(e.path))].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
+}
+
+export const baseTree: MockTreeEntry[] = buildBaseTree()
 
 /** Paths whose PUT /viewed fails: a GitHub error, and a head that moved meanwhile (409). */
 export const VIEWED_FAILS = 'data/big.csv'

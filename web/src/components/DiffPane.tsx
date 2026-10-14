@@ -8,6 +8,7 @@ import { SANDY_BEACH_THEME } from '../monaco/theme'
 import { ZoneHost } from '../monaco/zones'
 import { CommentGutter, type PickedLines } from '../monaco/gutter'
 import { StickyHeader, type StickyHost } from '../monaco/sticky'
+import { NavLinks, caretAnchor, sourceAt, type NavSource } from '../monaco/links'
 import { setSymbolsRepo } from '../monaco/symbols'
 import { LIMITS, isGitlink, shortSha } from '../degrade'
 import { formatBytes, loadFile, loadUnchanged, models, prefetchFile, type LoadedFile, type SideInfo } from '../monaco/files'
@@ -80,6 +81,8 @@ export interface DiffPaneHandle {
    * file waits to be loaded on request); a file without text (an image, a binary) ignores it.
    */
   reveal(pos: NavPos): void
+  /** The name at the caret, as the source of a look-up of its definitions (Ctrl+B); null when the caret is not on one. */
+  navSource(): NavSource | null
 }
 
 /** The review threads of the file shown, and how to draw them. */
@@ -125,6 +128,8 @@ interface Props {
   onChangeInfo(info: ChangeInfo | null): void
   /** The user moved the caret (mouse, keyboard or F7), not a reveal. */
   onCaret?(): void
+  /** The user Ctrl+clicked a name: a look-up of its definitions is asked for. */
+  onGoTo?(source: NavSource): void
 }
 
 type PaneState =
@@ -195,7 +200,7 @@ function centerIfOutside(editor: EditorT, at: Monaco.IPosition): boolean {
 }
 
 export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
-  { repo, file, provisional = false, nextFile, sideBySide, stickyHeader, ignoreTrimWhitespace, pendingJump, headerActions, review, onChangeInfo, onCaret },
+  { repo, file, provisional = false, nextFile, sideBySide, stickyHeader, ignoreTrimWhitespace, pendingJump, headerActions, review, onChangeInfo, onCaret, onGoTo },
   ref,
 ) {
   const editorRef = useRef<DiffEditorT | null>(null)
@@ -245,6 +250,8 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
   onChangeInfoRef.current = onChangeInfo
   const onCaretRef = useRef(onCaret)
   onCaretRef.current = onCaret
+  const onGoToRef = useRef(onGoTo)
+  onGoToRef.current = onGoTo
   /** The thread cards in the diff editor. */
   const [host, setHost] = useState<ZoneHost | null>(null)
   /** Bumped when the diff editor has a new diff, so the cards are placed against it. */
@@ -391,6 +398,7 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
       focus: () => focusRef.current(),
       position: () => positionRef.current(),
       reveal: (pos: NavPos) => revealRef.current(pos),
+      navSource: () => navSourceRef.current(),
     }),
     [step],
   )
@@ -507,6 +515,20 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
     })
     setSingleReady(true)
   }, [])
+
+  // Ctrl+click on a name asks for its definitions.
+  useEffect(() => {
+    if (!diffEditor) return
+    const activate = (source: NavSource) => onGoToRef.current?.(source)
+    const links = [new NavLinks(diffEditor.getOriginalEditor(), activate), new NavLinks(diffEditor.getModifiedEditor(), activate)]
+    return () => links.forEach((l) => l.dispose())
+  }, [diffEditor])
+  useEffect(() => {
+    const ed = singleRef.current
+    if (!singleReady || !ed) return
+    const links = new NavLinks(ed, (source) => onGoToRef.current?.(source))
+    return () => links.dispose()
+  }, [singleReady])
 
   /** Take the models off the diff editor, keeping its view state; the caller updates in-use models. */
   const detachDiff = useCallback(() => {
@@ -781,6 +803,20 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
   }
   const positionRef = useRef(position)
   positionRef.current = position
+
+  /** The name at the caret that `position` reads. */
+  const navSource = (): NavSource | null => {
+    const ed = editorRef.current
+    let editor: EditorT | null = null
+    if (state.kind === 'single' && attached === 'single' && singlePath.current === file.path) editor = singleRef.current
+    else if (ed && state.kind === 'text' && attached === 'diff' && shownPath.current === file.path) {
+      editor = sideBySide && lastSide.current === 'original' ? ed.getOriginalEditor() : ed.getModifiedEditor()
+    }
+    const caret = editor?.getPosition()
+    return editor && caret ? sourceAt(editor, caret, caretAnchor(editor)) : null
+  }
+  const navSourceRef = useRef(navSource)
+  navSourceRef.current = navSource
 
   const reveal = (pos: NavPos) => {
     if (showPos(pos)) return
