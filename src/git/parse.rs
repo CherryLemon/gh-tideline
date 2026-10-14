@@ -1,8 +1,11 @@
-//! Parsers for NUL-separated git plumbing output.
+//! Parsers for git plumbing output: NUL-separated records, `cat-file --batch` records and
+//! newline-separated lists.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::Serialize;
+
+use super::is_oid;
 
 pub const ZERO_OID: &str = "0000000000000000000000000000000000000000";
 pub const GITLINK_MODE: &str = "160000";
@@ -176,7 +179,7 @@ pub fn parse_check_attr(out: &[u8]) -> HashMap<String, Vec<(String, String)>> {
 /// Splits the next `git cat-file --batch` record off `out`: `Ok(None)` for a
 /// `<name> missing` / `<name> ambiguous` line, else `(oid, type, contents)`.
 #[allow(clippy::type_complexity)]
-fn next_batch_record<'a>(
+pub(crate) fn next_batch_record<'a>(
     out: &mut &'a [u8],
 ) -> Result<Option<(&'a str, &'a str, &'a [u8])>, String> {
     let nl = out
@@ -199,7 +202,7 @@ fn next_batch_record<'a>(
     let size: usize = size
         .parse()
         .map_err(|_| format!("bad cat-file header: {header:?}"))?;
-    if out.len() < size + 1 || out[size] != b'\n' {
+    if out.len() <= size || out[size] != b'\n' {
         return Err("cat-file output truncated: short contents".into());
     }
     let data = &out[..size];
@@ -217,6 +220,87 @@ pub fn parse_batch_object(out: &[u8]) -> Result<super::ObjectLookup, String> {
             data: data.to_vec(),
         },
     })
+}
+
+/// Parses `git cat-file --batch` output for a list of objects into `(oid, contents)` for each
+/// blob, in output order. Missing objects and objects of other types are skipped.
+pub fn parse_batch_blobs(out: &[u8]) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let mut rest = out;
+    let mut blobs = Vec::new();
+    while !rest.is_empty() {
+        if let Some((oid, "blob", data)) = next_batch_record(&mut rest)? {
+            blobs.push((oid.to_string(), data.to_vec()));
+        }
+    }
+    Ok(blobs)
+}
+
+/// Parses `git cat-file --batch-check='%(objectname) %(objectsize)'` output into `oid -> size`.
+/// `<name> missing` and `<name> ambiguous` lines are skipped, as in [`next_batch_record`].
+pub fn parse_object_sizes(out: &[u8]) -> Result<HashMap<String, u64>, String> {
+    let mut sizes = HashMap::new();
+    for line in out.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
+        if line.ends_with(b" missing") || line.ends_with(b" ambiguous") {
+            continue;
+        }
+        let bad = || format!("bad cat-file line: {:?}", String::from_utf8_lossy(line));
+        let line = std::str::from_utf8(line).map_err(|_| bad())?;
+        let (oid, size) = line.split_once(' ').ok_or_else(bad)?;
+        sizes.insert(oid.to_string(), size.parse().map_err(|_| bad())?);
+    }
+    Ok(sizes)
+}
+
+/// Parses `git rev-list --objects --no-walk --missing=print --no-object-names` output into the
+/// OIDs of the objects that are missing locally. A present object is printed as `<oid>`, a
+/// missing one as `?<oid>`; any other line is an error.
+pub fn parse_missing_objects(out: &[u8]) -> Result<HashSet<String>, String> {
+    let out = std::str::from_utf8(out).map_err(|_| "rev-list output is not UTF-8")?;
+    let mut missing = HashSet::new();
+    for line in out.split_terminator('\n') {
+        let (oid, is_missing) = match line.strip_prefix('?') {
+            Some(oid) => (oid, true),
+            None => (line, false),
+        };
+        if !is_oid(oid) {
+            return Err(format!("bad rev-list line: {line:?}"));
+        }
+        if is_missing {
+            missing.insert(oid.to_string());
+        }
+    }
+    Ok(missing)
+}
+
+/// Whether the stderr of a failed `git cat-file` says that it died on an object that a tree
+/// promises but the clone never fetched: `fatal: could not fetch <oid> from promisor remote`.
+pub fn is_unfetched_object_error(stderr: &str) -> bool {
+    stderr.lines().any(|line| {
+        line.strip_prefix("fatal: could not fetch ")
+            .and_then(|rest| rest.strip_suffix(" from promisor remote"))
+            .is_some_and(is_oid)
+    })
+}
+
+/// The entries of `oids` that `listing` names, in the order of `oids` and with their repeats.
+/// `listing` is `git cat-file --batch-check=%(objectname) --batch-all-objects` output: one OID
+/// per line, in any order, repeats allowed.
+pub fn listed_oids(oids: &[String], listing: &[u8]) -> Result<Vec<String>, String> {
+    let listing = std::str::from_utf8(listing).map_err(|_| "cat-file listing is not UTF-8")?;
+    let mut local: HashMap<&str, bool> = oids.iter().map(|oid| (oid.as_str(), false)).collect();
+    for line in listing.split_terminator('\n') {
+        if !is_oid(line) {
+            return Err(format!("bad cat-file line: {line:?}"));
+        }
+        if let Some(found) = local.get_mut(line) {
+            *found = true;
+        }
+    }
+    Ok(oids
+        .iter()
+        .filter(|oid| local[oid.as_str()])
+        .cloned()
+        .collect())
 }
 
 /// Parses `git cat-file --batch` output for a list of trees and returns the OIDs of their
@@ -547,5 +631,222 @@ mod tests {
             vec!["11".repeat(20), "55".repeat(20)]
         );
         assert!(gitattributes_in_trees(format!("{A} tree 5\n100644 x\n").as_bytes()).is_err());
+    }
+
+    #[test]
+    fn missing_objects_are_the_question_mark_lines() {
+        // Captured verbatim from `git rev-list --objects --no-walk --missing=print
+        // --no-object-names` (git 2.43) on a blob-less clone with two of four blobs fetched: the
+        // commit, its trees and the fetched blobs come bare, the other blobs as `?<oid>`.
+        let out = "c51fe0c261dd96e681500d433d7dcb10f2896150\n700fed341f332807aefa8ad97cddf5cc9ecfd652\n5626abf0f72e58d7a153368ba57db4c673c0e171\n89ccbb93e4ade2cbb83d93c4af3b33bff1175add\nc84124ea9e02701fc1038a635a8604b62ebf2c75\n30c4a80d8dd59a2fcbf86cd5fd0973dbb8bc6d6c\n?8510665149157c2bc901848c3e0b746954e9cbd9\n?f719efd430d52bcfc8566a43b2eb655688d38871\n";
+        let want: HashSet<String> = [
+            "8510665149157c2bc901848c3e0b746954e9cbd9",
+            "f719efd430d52bcfc8566a43b2eb655688d38871",
+        ]
+        .map(String::from)
+        .into();
+        assert_eq!(parse_missing_objects(out.as_bytes()).unwrap(), want);
+
+        // A repeated OID is one entry, the last newline is optional, nothing is no output.
+        assert_eq!(
+            parse_missing_objects(format!("{A}\n?{B}\n?{B}").as_bytes()).unwrap(),
+            HashSet::from([B.to_string()])
+        );
+        assert!(parse_missing_objects(b"").unwrap().is_empty());
+        assert!(
+            parse_missing_objects(format!("{A}\n{B}\n").as_bytes())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn malformed_missing_object_lines_are_errors() {
+        let upper = format!("?{}\n", "A".repeat(40));
+        for bad in [
+            "\n",
+            "?\n",
+            "??1111111111111111111111111111111111111111\n",
+            "?abc\n",
+            "? 1111111111111111111111111111111111111111\n",
+            "?11111111111111111111111111111111111111111\n",
+            "1111111111111111111111111111111111111111\n\n2222222222222222222222222222222222222222\n",
+            // Without `--no-object-names` every present object comes with a name.
+            "1111111111111111111111111111111111111111 path\n",
+            "?1111111111111111111111111111111111111111 path\n",
+            upper.as_str(),
+        ] {
+            assert!(parse_missing_objects(bad.as_bytes()).is_err(), "{bad:?}");
+        }
+        assert!(parse_missing_objects(b"?\xff\xff\n").is_err());
+    }
+
+    #[test]
+    fn object_size_lines() {
+        // Captured from `git cat-file --batch-check='%(objectname) %(objectsize)'` (git 2.43).
+        let out = "5626abf0f72e58d7a153368ba57db4c673c0e171 4\n1234567890123456789012345678901234567891 missing\n2bdf67abb163a4ffb2d7f3f0880c9fe5068ce782 6\n";
+        let sizes = parse_object_sizes(out.as_bytes()).unwrap();
+        assert_eq!(sizes.len(), 2);
+        assert_eq!(sizes["5626abf0f72e58d7a153368ba57db4c673c0e171"], 4);
+        assert_eq!(sizes["2bdf67abb163a4ffb2d7f3f0880c9fe5068ce782"], 6);
+
+        let sizes = parse_object_sizes(format!("{A} 0\n{B} 5000000000").as_bytes()).unwrap();
+        assert_eq!((sizes[A], sizes[B]), (0, 5_000_000_000));
+        // `ambiguous` is skipped like `missing`, as `next_batch_record` does.
+        let sizes =
+            parse_object_sizes(format!("{A} 1\n{B} ambiguous\n{C} missing\n").as_bytes()).unwrap();
+        assert_eq!(sizes, HashMap::from([(A.to_string(), 1)]));
+        assert!(parse_object_sizes(b"").unwrap().is_empty());
+        assert!(
+            parse_object_sizes(format!("{A} missing\n").as_bytes())
+                .unwrap()
+                .is_empty()
+        );
+        for bad in [
+            format!("{A}\n"),
+            format!("{A} big\n"),
+            format!("{A} -1\n"),
+            format!("{A} 1 2\n"),
+            format!("{A} 4\n{B} \n"),
+        ] {
+            assert!(parse_object_sizes(bad.as_bytes()).is_err(), "{bad:?}");
+        }
+    }
+
+    /// Appends one `git cat-file --batch` record.
+    fn batch_record(out: &mut Vec<u8>, oid: &str, kind: &str, data: &[u8]) {
+        out.extend_from_slice(format!("{oid} {kind} {}\n", data.len()).as_bytes());
+        out.extend_from_slice(data);
+        out.push(b'\n');
+    }
+
+    #[test]
+    fn batch_blobs_skip_missing_objects_and_other_types() {
+        // Captured from `git cat-file --batch` (git 2.43): a blob, an object git has never
+        // heard of, a blob.
+        let out = "5626abf0f72e58d7a153368ba57db4c673c0e171 blob 4\none\n\n1234567890123456789012345678901234567891 missing\n2bdf67abb163a4ffb2d7f3f0880c9fe5068ce782 blob 6\nthree\n\n";
+        assert_eq!(
+            parse_batch_blobs(out.as_bytes()).unwrap(),
+            vec![
+                (
+                    "5626abf0f72e58d7a153368ba57db4c673c0e171".to_string(),
+                    b"one\n".to_vec()
+                ),
+                (
+                    "2bdf67abb163a4ffb2d7f3f0880c9fe5068ce782".to_string(),
+                    b"three\n".to_vec()
+                ),
+            ]
+        );
+
+        // Contents that look like records, are empty or binary come back byte for byte.
+        let (d, e, f, g) = (
+            "4".repeat(40),
+            "5".repeat(40),
+            "6".repeat(40),
+            "7".repeat(40),
+        );
+        let lookalike = format!("{B} blob 3\nxyz\n{C} missing\n");
+        let binary: &[u8] = b"\0\xff\xfe\r\n\n\0";
+        let mut out = Vec::new();
+        batch_record(&mut out, A, "blob", b"ab\n");
+        out.extend_from_slice(format!("{B} missing\n{C} ambiguous\n").as_bytes());
+        batch_record(&mut out, &d, "tree", b"100644 x\0--------------------");
+        batch_record(&mut out, &e, "commit", b"tree 1\n\nmessage\n");
+        batch_record(&mut out, &f, "blob", lookalike.as_bytes());
+        batch_record(&mut out, &g, "blob", b"");
+        batch_record(&mut out, A, "blob", binary);
+        let got = parse_batch_blobs(&out).unwrap();
+        let expected = [
+            (A, b"ab\n".as_slice()),
+            (f.as_str(), lookalike.as_bytes()),
+            (g.as_str(), b"".as_slice()),
+            (A, binary),
+        ];
+        assert_eq!(got.len(), expected.len());
+        for ((oid, data), (want_oid, want_data)) in got.iter().zip(expected) {
+            assert_eq!((oid.as_str(), data.as_slice()), (want_oid, want_data));
+        }
+        assert!(parse_batch_blobs(b"").unwrap().is_empty());
+        assert!(
+            parse_batch_blobs(format!("{A} missing\n").as_bytes())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn truncated_batch_blobs_are_an_error() {
+        let mut one = Vec::new();
+        batch_record(&mut one, A, "blob", b"abcdef");
+        let mut two = one.clone();
+        batch_record(&mut two, B, "blob", b"ghijkl");
+        // Cut anywhere inside the second record: the header, the contents, the newline after them.
+        for cut in one.len() + 1..two.len() {
+            assert!(parse_batch_blobs(&two[..cut]).is_err(), "cut at {cut}");
+        }
+        // Cut between the records, the output is just shorter.
+        assert_eq!(parse_batch_blobs(&two[..one.len()]).unwrap().len(), 1);
+        assert!(parse_batch_blobs(format!("{A} blob 3").as_bytes()).is_err());
+        assert!(parse_batch_blobs(format!("{A} blob x\nabc\n").as_bytes()).is_err());
+        assert!(parse_batch_blobs(b"garbage\n").is_err());
+        // A size that no output can have is an error, not an overflow of `size + 1`.
+        for size in [usize::MAX, usize::MAX - 1] {
+            assert!(parse_batch_blobs(format!("{A} blob {size}\nabc\n").as_bytes()).is_err());
+        }
+    }
+
+    #[test]
+    fn promisor_fetch_failure_is_recognized() {
+        // Captured from `git cat-file --batch` under `-c protocol.allow=never` (git 2.43);
+        // `run_git` trims the final newline.
+        let stderr = "fatal: transport 'file' not allowed\nfatal: could not fetch f719efd430d52bcfc8566a43b2eb655688d38871 from promisor remote";
+        assert!(is_unfetched_object_error(stderr));
+        assert!(is_unfetched_object_error(&format!(
+            "fatal: could not fetch {A} from promisor remote\n"
+        )));
+        for other in [
+            "",
+            "fatal: transport 'file' not allowed",
+            "fatal: not a git repository: 'nowhere.git'",
+            "fatal: could not fetch HEAD from promisor remote",
+            "fatal: could not fetch  from promisor remote",
+            "fatal: could not fetch",
+        ] {
+            assert!(!is_unfetched_object_error(other), "{other:?}");
+        }
+    }
+
+    #[test]
+    fn listed_oids_keep_the_order_and_repeats_of_the_input() {
+        let oids = [A, B, C, B, A, C, B].map(String::from);
+        // In any order, with repeats; objects that are not asked for do not matter.
+        let listing = format!("{C}\n{A}\n{C}\n{}\n{A}\n", "9".repeat(40));
+        assert_eq!(
+            listed_oids(&oids, listing.as_bytes()).unwrap(),
+            [A, C, A, C].map(String::from)
+        );
+        assert_eq!(
+            listed_oids(&oids, format!("{B}\n{A}\n{C}").as_bytes()).unwrap(),
+            oids
+        );
+        assert!(listed_oids(&oids, b"").unwrap().is_empty());
+        assert!(listed_oids(&[], listing.as_bytes()).unwrap().is_empty());
+        assert!(
+            listed_oids(&oids, format!("{}\n", "9".repeat(40)).as_bytes())
+                .unwrap()
+                .is_empty()
+        );
+        // Any line that is no OID means the output is not what we think it is.
+        for bad in [
+            "\n".to_string(),
+            "garbage\n".to_string(),
+            format!("{A} missing\n"),
+            format!("{A}\n\n{B}\n"),
+            format!("{A}\n{}\n", "B".repeat(40)),
+        ] {
+            assert!(listed_oids(&oids, bad.as_bytes()).is_err(), "{bad:?}");
+        }
+        assert!(listed_oids(&oids, b"\xff\n").is_err());
     }
 }

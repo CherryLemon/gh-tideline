@@ -707,6 +707,37 @@ impl Repo {
         })
     }
 
+    /// Objects of `commit`'s tree that are missing locally, i.e. its blobs that were not fetched
+    /// yet. `rev-list --objects --no-walk --missing=print` prints them as `?<oid>` and never
+    /// fetches by itself (`protocol.allow=never` is a second safeguard); it does not descend
+    /// into gitlinks, so submodules are never listed. Needs no lock. An unknown `commit` is an
+    /// error.
+    #[allow(dead_code)] // The index build uses it (not wired in yet).
+    pub async fn missing_objects(&self, commit: &str) -> Result<HashSet<String>, GitFailure> {
+        debug_assert!(is_oid(commit));
+        let out = self
+            .git(
+                None,
+                &[
+                    "-c",
+                    "protocol.allow=never",
+                    "rev-list",
+                    "--objects",
+                    "--no-walk",
+                    "--missing=print",
+                    "--no-object-names",
+                    "--end-of-options",
+                    commit,
+                ],
+                None,
+            )
+            .await?;
+        parse::parse_missing_objects(&out).map_err(|e| GitFailure {
+            command: "rev-list".into(),
+            stderr: e,
+        })
+    }
+
     /// Records the OIDs of a pull request's files (blob vs gitlink) for [`Repo::known_oid`].
     pub fn remember_oids<'a>(&self, oids: impl IntoIterator<Item = (&'a str, bool)>) {
         let mut known = self.shared.known.lock().expect("known OIDs poisoned");
@@ -763,6 +794,100 @@ impl Repo {
             Err(e) => Err(e),
         }
     }
+
+    /// Sizes of the objects among `oids` that are local (`cat-file --batch-check`); the others
+    /// are left out of the map. Needs no lock and never fetches. `oids` must satisfy [`is_oid`];
+    /// an unfetched blob among them costs two more git runs (see `cat_file_local_with`).
+    #[allow(dead_code)] // The index build uses it (not wired in yet).
+    pub async fn object_sizes(&self, oids: &[String]) -> Result<HashMap<String, u64>, GitFailure> {
+        let out = self
+            .cat_file_local("--batch-check=%(objectname) %(objectsize)", oids)
+            .await?;
+        parse::parse_object_sizes(&out).map_err(|e| GitFailure {
+            command: "cat-file --batch-check".into(),
+            stderr: e,
+        })
+    }
+
+    /// Contents of the blobs among `oids` that are local (`cat-file --batch`), in `oids` order;
+    /// missing objects and objects of other types are left out. Needs no lock and never
+    /// fetches. The output is buffered, so the caller bounds the total size (see
+    /// [`Repo::object_sizes`]). `oids` must satisfy [`is_oid`]; an unfetched blob among them
+    /// costs two more git runs (see `cat_file_local_with`).
+    #[allow(dead_code)] // The index build uses it (not wired in yet).
+    pub async fn read_blobs(&self, oids: &[String]) -> Result<Vec<(String, Vec<u8>)>, GitFailure> {
+        let out = self.cat_file_local("--batch", oids).await?;
+        parse::parse_batch_blobs(&out).map_err(|e| GitFailure {
+            command: "cat-file --batch".into(),
+            stderr: e,
+        })
+    }
+
+    /// Runs `cat-file <mode>` over `oids` without a lock and returns its stdout.
+    async fn cat_file_local(&self, mode: &str, oids: &[String]) -> Result<Vec<u8>, GitFailure> {
+        cat_file_local_with(mode, oids, |args, stdin| async move {
+            self.git(None, &args, stdin).await
+        })
+        .await
+    }
+}
+
+/// Runs `git cat-file <mode>` over `oids` (one per line on stdin) by calling `run(args, stdin)`
+/// and returns its stdout. Every run carries `-c protocol.allow=never`: git 2.43 has no
+/// `--no-lazy-fetch`, and this stops it from fetching a missing object.
+///
+/// Git prints `<oid> missing` for an object it knows nothing about, but for a blob that a tree
+/// of the partial clone promises and that was never fetched it dies with `could not fetch <oid>
+/// from promisor remote`, and [`run_git`] drops the output of a failed run. After such a
+/// failure the local objects are listed once (`--batch-all-objects` names only what is in the
+/// repo and never fetches), the OIDs that are not among them are dropped as missing, and the
+/// run is repeated on the rest; if that fails too, its error is returned. That is at most three
+/// runs however many OIDs are unfetched. The failed run pays git's scan of the promisor packs
+/// (0.6 s in a clone of microsoft/vscode) and the listing grows with the object store, so
+/// callers should still pass fetched OIDs ([`Repo::missing_objects`] lists the others).
+async fn cat_file_local_with<F, Fut>(
+    mode: &str,
+    oids: &[String],
+    mut run: F,
+) -> Result<Vec<u8>, GitFailure>
+where
+    F: FnMut(Vec<String>, Option<Vec<u8>>) -> Fut,
+    Fut: Future<Output = Result<Vec<u8>, GitFailure>>,
+{
+    debug_assert!(oids.iter().all(|oid| is_oid(oid)));
+    if oids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let cat_file = |tail: &[&str]| -> Vec<String> {
+        let mut args = ["-c", "protocol.allow=never", "cat-file"]
+            .map(String::from)
+            .to_vec();
+        args.extend(tail.iter().map(|arg| arg.to_string()));
+        args
+    };
+    let lines = |list: &[String]| Some(format!("{}\n", list.join("\n")).into_bytes());
+    // Success and every other failure are the result; only an unfetched blob goes on below.
+    match run(cat_file(&[mode]), lines(oids)).await {
+        Err(e) if parse::is_unfetched_object_error(&e.stderr) => {}
+        result => return result,
+    }
+    let listing = run(
+        cat_file(&[
+            "--batch-check=%(objectname)",
+            "--batch-all-objects",
+            "--unordered",
+        ]),
+        None,
+    )
+    .await?;
+    let local = parse::listed_oids(oids, &listing).map_err(|e| GitFailure {
+        command: "cat-file --batch-all-objects".into(),
+        stderr: e,
+    })?;
+    if local.is_empty() {
+        return Ok(Vec::new());
+    }
+    run(cat_file(&[mode]), lines(&local)).await
 }
 
 #[cfg(test)]
@@ -1122,5 +1247,405 @@ mod tests {
             ObjectLookup::Missing
         ));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    const LIB_V1: &str = "pub fn one() {}\n";
+    const LIB_V2: &str = "pub fn one() {}\npub fn two() {}\n";
+    const HELPERS: &str = "pub fn help() {}\n";
+    const BINARY: &[u8] = b"\0\x01\xff\xfe\r\n\n\0tail";
+    const UNKNOWN: &str = "1234567890123456789012345678901234567891";
+
+    /// Over 1 MiB, the size from which the index leaves a file out.
+    fn big_rs() -> String {
+        "// filler line\n".repeat(80_000)
+    }
+
+    /// A source repo with two commits and the blob-less cache repo a pull request from the first
+    /// (`base`) to the second (`head`) leaves behind: both commits and their trees, no blobs.
+    /// Besides plain files the commits hold a path with a space, a subdirectory, two paths with
+    /// one content, a binary file, a file over 1 MiB and a gitlink.
+    struct PartialClone {
+        dir: PathBuf,
+        origin: PathBuf,
+        repo: Repo,
+        auth: GitAuth,
+        base: String,
+        head: String,
+    }
+
+    impl PartialClone {
+        async fn new(name: &str) -> PartialClone {
+            let dir = temp_dir(name);
+            let origin = dir.join("origin");
+            std::fs::create_dir_all(&origin).unwrap();
+            let base = make_repo(
+                &origin,
+                &[
+                    ("README.md", "readme\n"),
+                    ("src/lib.rs", LIB_V1),
+                    ("src/util/helpers.rs", HELPERS),
+                    ("dir with space/a b.py", "print('a b')\n"),
+                    ("same-1.txt", "same\n"),
+                    ("same-2.txt", "same\n"),
+                ],
+            )
+            .await;
+            std::fs::write(origin.join("src/lib.rs"), LIB_V2).unwrap();
+            std::fs::write(origin.join("big.rs"), big_rs()).unwrap();
+            std::fs::write(origin.join("data.bin"), BINARY).unwrap();
+            std::fs::remove_file(origin.join("README.md")).unwrap();
+            git_in(&origin, &["add", "-A"]).await;
+            let sub = "1234567890123456789012345678901234567890";
+            git_in(
+                &origin,
+                &[
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    &format!("160000,{sub},vendor/lib"),
+                ],
+            )
+            .await;
+            git_in(
+                &origin,
+                &[
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@example.com",
+                    "commit",
+                    "-qm",
+                    "second",
+                ],
+            )
+            .await;
+            let head = git_in(&origin, &["rev-parse", "HEAD"]).await;
+            git_in(&origin, &["config", "uploadpack.allowFilter", "true"]).await;
+            git_in(
+                &origin,
+                &["config", "uploadpack.allowAnySHA1InWant", "true"],
+            )
+            .await;
+
+            let repo = repo_at(
+                dir.join("cache/o/r.git"),
+                format!("file://{}", origin.display()),
+            );
+            let auth = GitAuth {
+                host: "example.invalid".into(),
+                token: "unused".into(),
+            };
+            let guard = repo.lock().await.unwrap();
+            repo.fetch_commits(&guard, &auth, 1, &base, &head)
+                .await
+                .unwrap();
+            drop(guard);
+            PartialClone {
+                dir,
+                origin,
+                repo,
+                auth,
+                base,
+                head,
+            }
+        }
+
+        /// The OID of `path` in `commit`, from the source repo.
+        async fn oid(&self, commit: &str, path: &str) -> String {
+            git_in(&self.origin, &["rev-parse", &format!("{commit}:{path}")]).await
+        }
+
+        /// The blobs of `commit`'s tree (not its gitlinks), from the source repo.
+        async fn blobs(&self, commit: &str) -> HashSet<String> {
+            let listing = git_in(
+                &self.origin,
+                &[
+                    "ls-tree",
+                    "-r",
+                    "--format=%(objecttype) %(objectname)",
+                    commit,
+                ],
+            )
+            .await;
+            listing
+                .lines()
+                .filter_map(|line| line.strip_prefix("blob "))
+                .map(String::from)
+                .collect()
+        }
+
+        /// Fetches blobs the way the index build does.
+        async fn fetch(&self, oids: &[&str]) {
+            let oids: Vec<String> = oids.iter().map(|oid| oid.to_string()).collect();
+            let guard = self.repo.lock().await.unwrap();
+            self.repo
+                .fetch_blobs(&guard, &self.auth, &oids)
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_objects_lists_the_unfetched_blobs() {
+        let pc = PartialClone::new("missing-objects").await;
+        let (base, head) = (pc.base.clone(), pc.head.clone());
+        // Five blobs in base (README, lib, helpers, a b.py, `same` for two paths); six in head
+        // (no README; the new lib, big.rs and data.bin). The gitlink is no blob.
+        let (base_blobs, head_blobs) = (pc.blobs(&base).await, pc.blobs(&head).await);
+        assert_eq!((base_blobs.len(), head_blobs.len()), (5, 6));
+
+        // The blob-less clone has none of them.
+        assert_eq!(pc.repo.missing_objects(&base).await.unwrap(), base_blobs);
+        assert_eq!(pc.repo.missing_objects(&head).await.unwrap(), head_blobs);
+
+        // Fetching shrinks the set of every commit whose tree has the blob.
+        let lib_v1 = pc.oid(&base, "src/lib.rs").await;
+        let big = pc.oid(&head, "big.rs").await;
+        pc.fetch(&[&lib_v1, &big]).await;
+        let (mut want_base, mut want_head) = (base_blobs.clone(), head_blobs.clone());
+        want_base.remove(&lib_v1);
+        want_head.remove(&big);
+        assert_eq!(pc.repo.missing_objects(&base).await.unwrap(), want_base);
+        assert_eq!(pc.repo.missing_objects(&head).await.unwrap(), want_head);
+
+        let helpers = pc.oid(&head, "src/util/helpers.rs").await;
+        assert_eq!(helpers, pc.oid(&base, "src/util/helpers.rs").await);
+        pc.fetch(&[&helpers]).await;
+        want_base.remove(&helpers);
+        want_head.remove(&helpers);
+        assert_eq!(pc.repo.missing_objects(&base).await.unwrap(), want_base);
+        assert_eq!(pc.repo.missing_objects(&head).await.unwrap(), want_head);
+
+        // With every blob present, nothing is missing.
+        let all: Vec<&str> = base_blobs.union(&head_blobs).map(String::as_str).collect();
+        pc.fetch(&all).await;
+        assert!(pc.repo.missing_objects(&base).await.unwrap().is_empty());
+        assert!(pc.repo.missing_objects(&head).await.unwrap().is_empty());
+
+        // A commit the repo does not have is an error, not a fetch.
+        assert!(pc.repo.missing_objects(UNKNOWN).await.is_err());
+        std::fs::remove_dir_all(&pc.dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn object_sizes_and_blobs_skip_missing_objects() {
+        let pc = PartialClone::new("blob-reads").await;
+        let (base, head) = (pc.base.clone(), pc.head.clone());
+        let big_rs = big_rs();
+        assert!(big_rs.len() > 1 << 20);
+        let helpers = pc.oid(&head, "src/util/helpers.rs").await;
+        let lib_v2 = pc.oid(&head, "src/lib.rs").await;
+        let big = pc.oid(&head, "big.rs").await;
+        let bin = pc.oid(&head, "data.bin").await;
+        pc.fetch(&[&helpers, &lib_v2, &big, &bin]).await;
+        // In trees of the clone but never fetched, so git cannot read them.
+        let readme = pc.oid(&base, "README.md").await;
+        let lib_v1 = pc.oid(&base, "src/lib.rs").await;
+        let same = pc.oid(&head, "same-1.txt").await;
+        let tree = git_in(&pc.origin, &["rev-parse", &format!("{head}^{{tree}}")]).await;
+        let present: Vec<(&String, &[u8])> = vec![
+            (&helpers, HELPERS.as_bytes()),
+            (&big, big_rs.as_bytes()),
+            (&bin, BINARY),
+            (&lib_v2, LIB_V2.as_bytes()),
+        ];
+
+        // Unfetched blobs first, last, repeated and next to each other; an object git has never
+        // heard of; and a tree, which is local but no blob.
+        let oids: Vec<String> = [
+            &readme, &helpers, &big, &lib_v1, &same, UNKNOWN, &bin, &readme, &tree, &lib_v2, &same,
+        ]
+        .map(String::from)
+        .into();
+        let mut sizes = pc.repo.object_sizes(&oids).await.unwrap();
+        let blobs = pc.repo.read_blobs(&oids).await.unwrap();
+        assert!(sizes.remove(&tree).is_some_and(|size| size > 0));
+        let want_sizes: HashMap<String, u64> = present
+            .iter()
+            .map(|(oid, data)| (oid.to_string(), data.len() as u64))
+            .collect();
+        assert_eq!(sizes, want_sizes);
+        // In `oids` order, byte for byte (the comparison avoids printing a megabyte on failure).
+        let got: Vec<&str> = blobs.iter().map(|(oid, _)| oid.as_str()).collect();
+        let want: Vec<&str> = present.iter().map(|(oid, _)| oid.as_str()).collect();
+        assert_eq!(got, want);
+        for ((oid, data), (_, want_data)) in blobs.iter().zip(&present) {
+            assert!(data == want_data, "contents of {oid}");
+        }
+
+        // Nothing local at all.
+        let none = vec![
+            readme.clone(),
+            UNKNOWN.to_string(),
+            lib_v1.clone(),
+            same.clone(),
+        ];
+        assert!(pc.repo.object_sizes(&none).await.unwrap().is_empty());
+        assert!(pc.repo.read_blobs(&none).await.unwrap().is_empty());
+
+        // Git dies on the first of 50,000 lines of input, long before it has read them all.
+        let mut many = vec![readme.clone()];
+        many.extend(std::iter::repeat_n(helpers.clone(), 50_000));
+        let sizes = pc.repo.object_sizes(&many).await.unwrap();
+        assert_eq!(sizes.len(), 1);
+        assert_eq!(sizes[&helpers], HELPERS.len() as u64);
+
+        // An empty list does not even start git: the repo does not exist.
+        let nowhere = repo_at(pc.dir.join("nowhere.git"), String::new());
+        assert!(nowhere.object_sizes(&[]).await.unwrap().is_empty());
+        assert!(nowhere.read_blobs(&[]).await.unwrap().is_empty());
+        assert!(nowhere.object_sizes(&none).await.is_err());
+        std::fs::remove_dir_all(&pc.dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn blob_reads_never_fetch() {
+        let pc = PartialClone::new("no-fetch").await;
+        let (base, head) = (pc.base.clone(), pc.head.clone());
+        let helpers = pc.oid(&head, "src/util/helpers.rs").await;
+        let readme = pc.oid(&base, "README.md").await;
+        let same = pc.oid(&head, "same-1.txt").await;
+        pc.fetch(&[&helpers]).await;
+        let mut want_missing = pc.blobs(&head).await;
+        want_missing.remove(&helpers);
+        let stats = git_in(&pc.repo.git_dir, &["count-objects", "-v"]).await;
+        let oids = vec![readme, helpers.clone(), same];
+
+        // First while the source repo can serve the missing blobs, so a lazy fetch would
+        // succeed and show; then with the source gone, so that it would fail.
+        for reachable in [true, false] {
+            if !reachable {
+                std::fs::rename(&pc.origin, pc.dir.join("origin-moved")).unwrap();
+            }
+            let missing = pc.repo.missing_objects(&head).await.unwrap();
+            assert_eq!(missing, want_missing, "reachable: {reachable}");
+            let sizes = pc.repo.object_sizes(&oids).await.unwrap();
+            let want = HashMap::from([(helpers.clone(), HELPERS.len() as u64)]);
+            assert_eq!(sizes, want, "reachable: {reachable}");
+            let blobs = pc.repo.read_blobs(&oids).await.unwrap();
+            let want = vec![(helpers.clone(), HELPERS.as_bytes().to_vec())];
+            assert_eq!(blobs, want, "reachable: {reachable}");
+            let now = git_in(&pc.repo.git_dir, &["count-objects", "-v"]).await;
+            assert_eq!(now, stats, "reachable: {reachable}");
+        }
+        std::fs::remove_dir_all(&pc.dir).unwrap();
+    }
+
+    fn failure(command: &str, stderr: &str) -> GitFailure {
+        GitFailure {
+            command: command.into(),
+            stderr: stderr.into(),
+        }
+    }
+
+    /// Runs `cat_file_local_with` against canned git replies, in order. Returns its result and
+    /// the arguments and stdin of every run it asked for.
+    async fn fake_cat_file(
+        oids: &[String],
+        replies: Vec<Result<Vec<u8>, GitFailure>>,
+    ) -> (
+        Result<Vec<u8>, GitFailure>,
+        Vec<(Vec<String>, Option<String>)>,
+    ) {
+        let mut replies = replies.into_iter();
+        let mut runs = Vec::new();
+        let result = cat_file_local_with("--batch", oids, |args, stdin| {
+            runs.push((args, stdin.map(|bytes| String::from_utf8(bytes).unwrap())));
+            std::future::ready(replies.next().expect("one run too many"))
+        })
+        .await;
+        (result, runs)
+    }
+
+    #[tokio::test]
+    async fn local_cat_file_runs_at_most_three_times() {
+        let [a, b, c, d] = ["a", "b", "c", "d"].map(|digit| digit.repeat(40));
+        let oids: Vec<String> = [&a, &b, &c, &b, &d, &a].into_iter().cloned().collect();
+        let lines = |list: &[&String]| Some(list.iter().map(|oid| format!("{oid}\n")).collect());
+        let args = |tail: &[&str]| -> Vec<String> {
+            ["-c", "protocol.allow=never", "cat-file"]
+                .iter()
+                .chain(tail)
+                .map(|arg| arg.to_string())
+                .collect()
+        };
+        let listing_args = args(&[
+            "--batch-check=%(objectname)",
+            "--batch-all-objects",
+            "--unordered",
+        ]);
+        let died = failure(
+            "cat-file --batch",
+            &format!(
+                "fatal: transport 'file' not allowed\nfatal: could not fetch {b} from promisor remote"
+            ),
+        );
+        // Of these only `b` is not local, whatever the order and repeats of the listing.
+        let listing = format!("{d}\n{a}\n{c}\n{a}\n").into_bytes();
+
+        // Nothing unfetched: one run, whose output is the result.
+        let (result, runs) = fake_cat_file(&oids, vec![Ok(b"all".to_vec())]).await;
+        assert_eq!(result.unwrap(), b"all");
+        assert_eq!(
+            runs,
+            [(args(&["--batch"]), lines(&[&a, &b, &c, &b, &d, &a]))]
+        );
+
+        // An unfetched blob: the failed run, the listing, then the run again on the OIDs that
+        // are local, in their order and with their repeats.
+        let replies = vec![Err(died.clone()), Ok(listing.clone()), Ok(b"rest".to_vec())];
+        let (result, runs) = fake_cat_file(&oids, replies).await;
+        assert_eq!(result.unwrap(), b"rest");
+        assert_eq!(
+            runs,
+            [
+                (args(&["--batch"]), lines(&[&a, &b, &c, &b, &d, &a])),
+                (listing_args.clone(), None),
+                (args(&["--batch"]), lines(&[&a, &c, &d, &a])),
+            ]
+        );
+
+        // The run again fails too, with the same kind of error: no fourth run (the fake panics
+        // on one) and the error of the last run.
+        let last = failure(
+            "cat-file --batch",
+            &format!("fatal: could not fetch {d} from promisor remote"),
+        );
+        let replies = vec![Err(died.clone()), Ok(listing.clone()), Err(last.clone())];
+        let (result, runs) = fake_cat_file(&oids, replies).await;
+        assert_eq!(result.unwrap_err().stderr, last.stderr);
+        assert_eq!(runs.len(), 3);
+
+        // The listing fails or is no list of OIDs: no run after it.
+        let broken = failure(
+            "cat-file --batch-check=%(objectname)",
+            "fatal: listing failed",
+        );
+        let (result, runs) = fake_cat_file(&oids, vec![Err(died.clone()), Err(broken)]).await;
+        assert_eq!(result.unwrap_err().stderr, "fatal: listing failed");
+        assert_eq!(runs.len(), 2);
+        let replies = vec![Err(died.clone()), Ok(b"garbage\n".to_vec())];
+        let (result, runs) = fake_cat_file(&oids, replies).await;
+        assert_eq!(result.unwrap_err().command, "cat-file --batch-all-objects");
+        assert_eq!(runs.len(), 2);
+
+        // None of the OIDs is local: nothing left to read.
+        let (result, runs) = fake_cat_file(&oids, vec![Err(died), Ok(Vec::new())]).await;
+        assert!(result.unwrap().is_empty());
+        assert_eq!(runs.len(), 2);
+
+        // Any other failure is the result, without a listing.
+        let other = failure(
+            "cat-file --batch",
+            "fatal: not a git repository: 'nowhere.git'",
+        );
+        let (result, runs) = fake_cat_file(&oids, vec![Err(other.clone())]).await;
+        assert_eq!(result.unwrap_err().stderr, other.stderr);
+        assert_eq!(runs.len(), 1);
+
+        // No OIDs, no git.
+        let (result, runs) = fake_cat_file(&[], Vec::new()).await;
+        assert!(result.unwrap().is_empty());
+        assert!(runs.is_empty());
     }
 }
