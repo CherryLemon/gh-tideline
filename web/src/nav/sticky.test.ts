@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { SymbolInfo } from '../api'
-import { type LineEdges, type LineRange, lineBelow, nextBar, rowsBeforeBar, sameLines, scrollToUncover, stickyLines } from './sticky'
+import { type LineEdges, type LineRange, lineBelow, MAX_ROWS, nextBar, rowsBeforeBar, sameLines, scrollToUncover, stickyLines } from './sticky'
+import { enclosingScopes } from './symbols'
 
 function sym(name: string, kind: string, startLine: number, endLine: number, extra: Partial<SymbolInfo> = {}): SymbolInfo {
   return { name, kind, line: startLine, column: 1, endColumn: 1 + name.length, startLine, endLine, ...extra }
@@ -168,6 +169,140 @@ describe('stickyLines: the rows cover the first lines', () => {
     expect(pinned(deep, 50, 2)).toEqual(['e', 'f'])
     expect(pinned(deep, 50, 0)).toEqual([])
   })
+
+  it('draws no row for the line right under the rows, nor for a later one', () => {
+    // b starts on line 20, where a1 and a2 end. Line 21 is in C and b, which two rows hold; but two rows leave 20 under them, and
+    // the row of b would show it twice. Without b there is one row, with 19 under it, a line that a1 and a2 are in as well.
+    const list = [sym('C', 'class', 1, 100), sym('a1', 'function', 5, 20), sym('a2', 'function', 6, 20), sym('b', 'function', 20, 40)]
+    expect(pinned(list, 17)).toEqual(['C', 'a1', 'a2'])
+    expect(pinned(list, 18)).toEqual(['C'])
+    expect(pinned(list, 19)).toEqual(['C', 'b'])
+    // s33 starts on line 92, where the others end. The one row it needs leaves 91 under it, a line before its name.
+    const ends = [sym('s21', 'function', 62, 92), sym('s22', 'function', 63, 92), sym('s32', 'function', 89, 92), sym('s33', 'function', 92, 108)]
+    expect(pinned(ends, 90, 3)).toEqual([])
+  })
+
+  it('draws no row for a scope named on the line under the rows, though its decorators are above it', () => {
+    // handle has decorators on the lines 4 and 5, and its name on 6. With the top at 5 the one row of Service leaves line 6 under it:
+    // a row for handle would show that line twice. At 6, line 7 is in handle as well, which takes a second row.
+    const list = [sym('Service', 'class', 1, 60), sym('handle', 'method', 4, 30, { line: 6 })]
+    expect(pinned(list, 4)).toEqual(['Service'])
+    expect(pinned(list, 5)).toEqual(['Service'])
+    expect(pinned(list, 6)).toEqual(['Service', 'handle'])
+  })
+
+  it('goes on dropping rows while the line under the rest is not below all their names', () => {
+    // p, q and r end on line 23, where y starts: the scopes of line 24 are x and y. The two rows leave 22 under them, before the name
+    // of y; the one row that is left leaves 21 under it, the line x is named on.
+    const list = [sym('p', 'class', 1, 23), sym('q', 'class', 2, 23), sym('r', 'class', 3, 23), sym('x', 'function', 21, 60), sym('y', 'function', 23, 60)]
+    expect(pinned(list, 20)).toEqual([])
+    // One line further, x is the row: 22 is under it, and y is named after that.
+    expect(pinned(list, 21)).toEqual(['x'])
+    expect(pinned(list, 22)).toEqual(['x', 'y'])
+  })
+})
+
+/** A small seeded generator (a linear congruential one), so that the cases are the same on every run. */
+function seeded(seed: number) {
+  let state = seed
+  const next = () => {
+    state = (Math.imul(state, 1664525) + 1013904223) >>> 0
+    return state / 2 ** 32
+  }
+  return { int: (n: number) => Math.floor(next() * n), chance: (p: number) => next() < p }
+}
+type Random = ReturnType<typeof seeded>
+
+const DATA = ['constant', 'field', 'variable', 'property']
+const CODE = ['class', 'function', 'method']
+
+/**
+ * Definitions on the lines `from` to `to` that nest, deeper than the header has rows. Some are named after decorator lines, some
+ * on the line of the one around them, some hold data. A sibling can start on the line where the one before it ends, as `} else {` does.
+ */
+function randomSymbols(rnd: Random, from: number, to: number, depth = 0, out: SymbolInfo[] = []): SymbolInfo[] {
+  let cursor = from
+  for (let n = 0; cursor <= to && depth < 7 && out.length < 60 && rnd.chance(n === 0 ? 0.85 : 0.5); n++) {
+    const startLine = cursor + rnd.int(3)
+    if (startLine > to) break
+    const endLine = startLine === to || rnd.chance(0.05) ? startLine : rnd.chance(0.5) ? to : startLine + 1 + rnd.int(to - startLine)
+    const line = rnd.chance(0.25) ? startLine + rnd.int(Math.min(3, endLine - startLine) + 1) : startLine
+    const kind = rnd.chance(0.2) ? DATA[rnd.int(DATA.length)] : CODE[rnd.int(CODE.length)]
+    out.push(sym(`s${out.length}`, kind, startLine, endLine, { line, column: 1 + rnd.int(40) }))
+    if (endLine > startLine) randomSymbols(rnd, line, endLine, depth + 1, out)
+    cursor = endLine + (rnd.chance(0.4) ? 0 : 1 + rnd.int(3))
+  }
+  return out
+}
+
+/**
+ * The `lineAt` of a view on a file of `lineCount` lines, as the editor works it out (`lineBelow` over the bottoms of the lines): a few
+ * lines from a random one, hidden stretches between them, zones (a bar, a card) of some height above some, and part of a line
+ * scrolled off above the first. Under a zone the same line is the one below any number of rows, and it moves on past hidden lines.
+ */
+function randomView(rnd: Random, symbols: readonly SymbolInfo[], lineCount: number): (rows: number) => number | undefined {
+  const ranges: LineRange[] = []
+  const bottoms: Record<number, number> = {}
+  let y = rnd.chance(0.5) ? 0 : rnd.int(20)
+  // Most views start close to where a definition starts or ends, as that is where the rows change.
+  let line = 1 + rnd.int(lineCount)
+  if (symbols.length > 0 && rnd.chance(0.7)) {
+    const s = symbols[rnd.int(symbols.length)]
+    line = Math.min(lineCount, Math.max(1, [s.startLine, s.line, s.endLine][rnd.int(3)] + rnd.int(7) - 3))
+  }
+  for (let n = rnd.chance(0.25) ? 1 + rnd.int(4) : 5 + rnd.int(12); n > 0 && line <= lineCount; n--) {
+    if (rnd.chance(0.12)) y += [24, 40, 80, 160][rnd.int(4)]
+    y += 20
+    bottoms[line] = y
+    const last = ranges[ranges.length - 1]
+    if (last && last.endLineNumber === line - 1) last.endLineNumber = line
+    else ranges.push({ startLineNumber: line, endLineNumber: line })
+    line += rnd.chance(0.15) ? 2 + rnd.int(20) : 1
+  }
+  return (rows) => lineBelow(ranges, (l) => bottoms[l], rows * 20)
+}
+
+describe('stickyLines: random files and views', () => {
+  it('draws scopes that the line under the rows is in and is named below, and no more rows than there is room for', () => {
+    const rnd = seeded(20241015)
+    const seen = { rows: [0, 0, 0, 0, 0], deep: 0, short: 0, repeated: 0, hidden: 0 }
+    for (let i = 0; i < 10000; i++) {
+      const label = `case ${i}`
+      const lineCount = 20 + rnd.int(100)
+      const symbols = randomSymbols(rnd, 1, lineCount)
+      const lineAt = randomView(rnd, symbols, lineCount)
+      const maxLines = rnd.chance(0.5) ? MAX_ROWS : rnd.int(MAX_ROWS + 1)
+      const drawn = stickyLines(symbols, lineAt, maxLines)
+
+      // The rows leave a line of the view below them, and are no more than it leaves room for.
+      let room = -1
+      while (room < maxLines && lineAt(room + 1) !== undefined) room++
+      expect(drawn.length, `${label}: rows`).toBeLessThanOrEqual(Math.max(0, room))
+      const under = lineAt(drawn.length)
+      if (under === undefined) {
+        expect(drawn, label).toEqual([])
+        continue
+      }
+      drawn.forEach((s, k) => {
+        const row = `${label}: ${s.name} (${s.startLine}-${s.endLine}, named on ${s.line}) over line ${under}`
+        expect(s.startLine < under && under <= s.endLine, `${row}: holds it`).toBe(true)
+        expect(s.line < under, `${row}: named above it`).toBe(true)
+        expect(DATA.includes(s.kind), `${row}: is no data`).toBe(false)
+        if (k > 0) expect(s.line, `${row}: comes after the row above`).toBeGreaterThan(drawn[k - 1].line)
+      })
+
+      // What the case is made of, to see that the cases are not all easy ones.
+      seen.rows[drawn.length]++
+      const lines = Array.from({ length: room + 1 }, (_, rows) => lineAt(rows) as number)
+      if (enclosingScopes(symbols, lines[0]).filter((s) => s.line < lines[0] && !DATA.includes(s.kind)).length > MAX_ROWS) seen.deep++
+      if (room < maxLines) seen.short++
+      if (lines.some((line, k) => k > 1 && line === lines[k - 1])) seen.repeated++
+      if (lines.some((line, k) => k > 0 && line > lines[k - 1] + 1)) seen.hidden++
+    }
+    // Cases of every kind came up, not only trivial ones.
+    expect(seen.rows.slice(1).every((count) => count > 150), `rows: ${seen.rows}`).toBe(true)
+    expect(Math.min(seen.deep, seen.short, seen.repeated, seen.hidden), JSON.stringify(seen)).toBeGreaterThan(300)
+  })
 })
 
 /**
@@ -265,7 +400,8 @@ describe('nextBar: the bar of hidden lines that rows would cover', () => {
   })
 
   it('does not take a card, a filler or deleted lines between two lines in view for a bar', () => {
-    const cards = layout(100, [], { 50: 80, 51: 20 })
+    // The card under line 1 is above line 2, which is the first in view once line 1 is partly scrolled off.
+    const cards = layout(100, [], { 1: 40, 50: 80, 51: 20 })
     for (let scrollTop = 0; scrollTop <= 2000; scrollTop += 5) expect(bar(scrollTop, 200, cards), `scroll ${scrollTop}`).toBeUndefined()
   })
 
@@ -274,6 +410,15 @@ describe('nextBar: the bar of hidden lines that rows would cover', () => {
     expect(bar(0, 200, card)).toEqual({ top: 4, bottom: 84 })
     expect(bar(83, 200, card)).toEqual({ top: 4, bottom: 84 })
     expect(bar(84, 200, card)).toBeUndefined()
+  })
+
+  it('finds a bar after one hidden line that follows a line wrapped over several rows', () => {
+    // Line 2 wraps over three rows, from 24 to 84. Line 3 is hidden and drawn at the last of them: its top is not that of line 2,
+    // but its bottom is. The bar is the zone from 84 to 108, and line 4 is under it.
+    const at = (values: number[]) => (line: number) => values[line - 1]
+    const wrapped: LineEdges = { top: at([4, 24, 64, 108]), zonesTop: at([4, 24, 64, 84]), bottom: at([24, 84, 84, 128]) }
+    const ranges = [{ startLineNumber: 1, endLineNumber: 2 }, { startLineNumber: 4, endLineNumber: 4 }]
+    expect(nextBar(ranges, wrapped, 0, 4)).toEqual({ top: 84, bottom: 108 })
   })
 
   it('finds none without lines in view, or where no lines are hidden and nothing is above the first', () => {
@@ -324,12 +469,25 @@ describe('the rows over the lines of an editor that hides some', () => {
     return stickyLines(symbols, (rows) => lineBelow(ranges, worker.edges.bottom, scrollTop + rows * 20), maxRows).map((s) => s.name)
   }
 
-  it('leaves the bar in the middle uncovered at any scroll position', () => {
-    for (let scrollTop = 0; scrollTop <= 220; scrollTop++) {
-      const rows = header(scrollTop).length
-      const bar = nextBar(worker.visible(scrollTop, 144), worker.edges, scrollTop, 4)
-      if (bar && rows > 0) expect(rows * 20 + gap, `scroll ${scrollTop}`).toBeLessThanOrEqual(bar.top - scrollTop)
+  /** The bars of `worker`, from where it is built: the zones at 4 to 28 and 188 to 212, each with 6px of handle above. */
+  const bars = [{ top: 4, bottom: 28 }, { top: 188, bottom: 212 }]
+
+  it('leaves the bars and their handles uncovered at any scroll position', () => {
+    let checked = 0
+    const content = worker.edges.bottom(80)
+    // Views of 89px or less are left out: a bar can be under their last line, which `nextBar` does not look for.
+    for (const height of [96, 144, 230, 300]) {
+      for (let scrollTop = 0; scrollTop + height <= content; scrollTop++) {
+        const rows = header(scrollTop, height).length
+        for (const bar of bars) {
+          // The rows and their 1px rule must end above the handle of a bar that is not wholly above the view or under it.
+          if (rows === 0 || bar.bottom <= scrollTop || bar.top - 6 >= scrollTop + height) continue
+          checked++
+          expect(rows * 20 + 1, `scroll ${scrollTop} of ${height}`).toBeLessThanOrEqual(bar.top - 6 - scrollTop)
+        }
+      }
     }
+    expect(checked).toBeGreaterThan(250)
   })
 
   it('has fewer rows as the bar comes up to the top, then none, and comes whole when it is gone', () => {

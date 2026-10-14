@@ -13,7 +13,12 @@ type EditorT = Monaco.editor.ICodeEditor
 
 /** A line longer than this is cut and left uncolored: the header holds names, and a minified file is one huge line. */
 const MAX_ROW_CHARS = 1000
-/** Monaco draws the handle for dragging the top edge of a bar of unchanged lines this many pixels above the view zone it is in. */
+/**
+ * Monaco draws the handle for dragging the top edge of a bar of unchanged lines this many pixels above the view zone it is in.
+ * In monaco-editor 0.57 the bar is a 24px zone after the line before the hidden ones (vs/editor/browser/widget/diffEditor/features/
+ * hideUnchangedRegionsFeature.js ~137), and `.diff-hidden-lines` is moved 10px up with its `.top` handle 4px back down (diffEditor/
+ * style.css ~12 and ~54). Check them, and the hidden lines of `LineEdges`, on an upgrade.
+ */
 const BAR_REACH = 6
 /** Waits before asking again for symbols that could not be fetched (a server that was busy or restarting); then it gives up. */
 const RETRY_MS = [2000, 8000]

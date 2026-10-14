@@ -13,12 +13,18 @@ export interface LineRange {
   endLineNumber: number
 }
 
-/** Where the lines of an editor are, in pixels from the top of its content. A line it hides is drawn where the line before it is. */
+/**
+ * Where the lines of an editor are, in pixels from the top of its content. A line it hides is drawn at the end of the line shown
+ * before it, or at the first line shown if none is: `nextBar` goes by that. This is how monaco-editor 0.57 does it, in
+ * `convertModelPositionToViewPosition` (vs/editor/common/viewModel/viewModelLines.js ~621), which `getTopForLineNumber` and
+ * `getBottomForLineNumber` (vs/editor/browser/widget/codeEditor/codeEditorWidget.js ~441, ~461) are made of: check it on an upgrade.
+ */
 export interface LineEdges {
-  /** The top of `line`, under the view zones (bars, cards) above it. */
+  /** The top of `line`, under the view zones (bars, cards) above it; of its first row, if it wraps. */
   top(line: number): number
   /** The top of the view zones above `line`: the bottom of the line drawn before it, or the padding at the top of the content. */
   zonesTop(line: number): number
+  /** The bottom of `line`, of its last row if it wraps. */
   bottom(line: number): number
 }
 
@@ -49,8 +55,11 @@ function scopesAround(symbols: readonly SymbolInfo[], line: number, maxLines: nu
  * the first line below them is in: `lineAt(n)` is that line when `n` rows are pinned (for 0, the first line in view), or undefined
  * where the view ends. More rows move it down, and a scope can end under them, so the fewest rows `n` whose scopes need no more than
  * `n` are used: a scope is pinned while some of its body shows below the rows, not when only its last line is under them, and one
- * whose name is under them still gets its row. Only those scopes are drawn, and they can be fewer than `n`: the line right under
- * the rows can be the last line of a scope that has no row.
+ * whose name is under them still gets its row.
+ * Those scopes can be fewer than `n`, and then the rows leave an earlier line under them than the one they were worked out for: a
+ * scope named on that line or after it is not drawn, as its row would show that line twice or one that is not reached yet. That
+ * moves the line up again, so it goes on until no such scope is left. What is drawn is then in the line under the rows, with its
+ * name above it, but the line can be in more scopes than that (it can be the last line of one that has no row).
  * There are at most `maxLines` rows, and no more than the view has lines below; with less room the innermost scopes are kept.
  */
 export function stickyLines(symbols: readonly SymbolInfo[], lineAt: (rows: number) => number | undefined, maxLines = MAX_ROWS): SymbolInfo[] {
@@ -62,8 +71,14 @@ export function stickyLines(symbols: readonly SymbolInfo[], lineAt: (rows: numbe
   }
   const room = lines.length - 1
   for (let rows = 0; rows <= room; rows++) {
-    const scopes = scopesAround(symbols, lines[rows], room)
-    if (scopes.length <= rows) return scopes
+    let scopes = scopesAround(symbols, lines[rows], room)
+    if (scopes.length > rows) continue
+    for (;;) {
+      const under = lines[scopes.length]
+      const named = scopes.filter((s) => s.line < under)
+      if (named.length === scopes.length) return named
+      scopes = named
+    }
   }
   return []
 }
@@ -89,14 +104,19 @@ export function lineBelow(ranges: readonly LineRange[], bottom: (line: number) =
  * that comes after lines the editor hides, or over the first line of the content. The diff editor puts a bar where it hides the
  * unchanged lines, between its changes and above the first one, and a card at the top of the content is a zone like it.
  * A zone between two lines the editor shows (a card, a filler, the deleted lines of an inline diff) is no bar.
+ * A card under the last line before a bar is taken for a part of it, and the rows stay above both. That is not met in use, as
+ * the lines a card hangs on and the one after are kept in view (`ZoneHost.reveal`): it takes dragging the edge of the bar up to
+ * the card's line.
  */
 export function nextBar(ranges: readonly LineRange[], edges: LineEdges, scrollTop: number, paddingTop: number): Span | undefined {
   for (const { startLineNumber: line } of ranges) {
     const top = edges.zonesTop(line)
     const bottom = edges.top(line)
     if (bottom <= top || bottom <= scrollTop) continue
-    // No line is above this one, or the line before it is hidden, which puts it where the one before that is.
-    if (top <= paddingTop || (line >= 3 && edges.top(line - 1) === edges.top(line - 2))) return { top, bottom }
+    // No line is above this one, or the line before it is hidden, which puts it where the one before that is. They have the same
+    // bottom: not the same top, if that line wraps, as a hidden line is drawn at the last row of the line before it. Not for line 2:
+    // the editor takes line 0 for line 1, so those would always have the same bottom, and a card under line 1 would be a bar.
+    if (top <= paddingTop || (line >= 3 && edges.bottom(line - 1) === edges.bottom(line - 2))) return { top, bottom }
   }
   return undefined
 }
