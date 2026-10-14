@@ -93,10 +93,15 @@ describe('identifierAt', () => {
 
   describe('Rust raw identifiers', () => {
     it('gives the name without r# and covers all of it', () => {
-      const text = 'let r#type = 1;'
+      const text = 'foo r#type = 1;'
       for (const column of [5, 6, 7, 8, 10, 11]) expect(at(text, column, 'rust')).toBe('type@5-11')
-      expect(at(text, 4, 'rust')).toBe('let@1-4')
+      expect(at(text, 4, 'rust')).toBe('foo@1-4')
       expect(at(text, 12, 'rust')).toBeNull()
+    })
+
+    it('is a name also when what follows the r# is a keyword', () => {
+      expect(at('let r#fn = r#match;', 6, 'rust')).toBe('fn@5-9')
+      expect(at('let r#fn = r#match;', 14, 'rust')).toBe('match@12-19')
     })
 
     it('starts the name after the r#', () => {
@@ -105,10 +110,96 @@ describe('identifierAt', () => {
     })
 
     it('does not treat other r# as one', () => {
-      expect(at('bar#type', 6, 'rust')).toBe('type@5-9')
+      expect(at('bar#name', 6, 'rust')).toBe('name@5-9')
       expect(at('x = r#"raw"#', 6, 'rust')).toBe('r@5-6')
       expect(at('r# = 1', 1, 'rust')).toBe('r@1-2')
       expect(at('let r#type = 1', 8, 'python')).toBe('type@7-11')
+    })
+  })
+
+  describe('keywords', () => {
+    it('are no names', () => {
+      expect(at('export const total = 1', 3)).toBeNull()
+      expect(at('export const total = 1', 10)).toBeNull()
+      expect(at('export const total = 1', 15)).toBe('total@14-19')
+      expect(at('  if (ok) return value', 4)).toBeNull()
+      expect(at('  if (ok) return value', 14)).toBeNull()
+      expect(at('  if (ok) return value', 20)).toBe('value@18-23')
+      expect(at('x = flag ? null : new Map()', 13)).toBeNull()
+      expect(at('x = flag ? null : new Map()', 21)).toBeNull()
+      expect(at('x = flag ? null : new Map()', 25)).toBe('Map@23-26')
+    })
+
+    it('are also those at either end of the word, as the caret has it', () => {
+      expect(at('if (ok)', 1)).toBeNull()
+      expect(at('if (ok)', 3)).toBeNull()
+    })
+
+    it('are names when they only look like one', () => {
+      expect(at('export_all(returned, iffy)', 3)).toBe('export_all@1-11')
+      expect(at('export_all(returned, iffy)', 14)).toBe('returned@12-20')
+      expect(at('export_all(returned, iffy)', 23)).toBe('iffy@22-26')
+      expect(at('Return(Export)', 2)).toBe('Return@1-7')
+    })
+
+    it('are those of the language of the file', () => {
+      expect(at('self.total = None', 2, 'python')).toBe('self@1-5')
+      expect(at('self.total = None', 14, 'python')).toBeNull()
+      expect(at('self.total = None', 2, 'rust')).toBeNull()
+      expect(at('x = none', 5, 'python')).toBe('none@5-9')
+      expect(at('func main() {', 2, 'go')).toBeNull()
+      expect(at('func main() {', 8, 'go')).toBe('main@6-10')
+      expect(at('func main() {', 2, 'rust')).toBe('func@1-5')
+      expect(at('if err != nil {', 12, 'go')).toBe('nil@11-14')
+      expect(at('public static void main(String[] args) {', 3, 'java')).toBeNull()
+      expect(at('public static void main(String[] args) {', 15, 'java')).toBeNull()
+      expect(at('public static void main(String[] args) {', 23, 'java')).toBe('main@20-24')
+      expect(at('final var record = null;', 3, 'java')).toBeNull()
+      expect(at('final var record = null;', 9, 'java')).toBe('var@7-10')
+      expect(at('final var record = null;', 13, 'java')).toBe('record@11-17')
+      expect(at('static int total;', 3, 'c')).toBeNull()
+      expect(at('static int total;', 9, 'c')).toBeNull()
+      expect(at('struct node *new = list->class;', 16, 'c')).toBe('new@14-17')
+      expect(at('struct node *new = list->class;', 29, 'c')).toBe('class@26-31')
+      expect(at('class Foo : public Bar {', 3, 'cpp')).toBeNull()
+      expect(at('class Foo : public Bar {', 15, 'cpp')).toBeNull()
+      expect(at('auto p = new Foo(nullptr);', 12, 'cpp')).toBeNull()
+      expect(at('auto p = new Foo(nullptr);', 22, 'cpp')).toBeNull()
+    })
+
+    it('are not those of a language that is not known', () => {
+      expect(at('export default total', 3, 'plaintext')).toBe('export@1-7')
+      expect(at('return value', 3, 'json')).toBe('return@1-7')
+    })
+
+    it('leave out the words that only some places make one', () => {
+      expect(at('type Total = string', 2)).toBe('type@1-5')
+      expect(at("import { get } from './store'", 10)).toBe('get@10-13')
+      expect(at("import { get } from './store'", 17)).toBe('from@16-20')
+      expect(at('async function load() {}', 3)).toBe('async@1-6')
+      expect(at('match value:', 3, 'python')).toBe('match@1-6')
+      expect(at('union Value { a: u8 }', 3, 'rust')).toBe('union@1-6')
+      expect(at('void run() override', 17, 'cpp')).toBe('override@12-20')
+      expect(at('struct Foo final : Bar {}', 13, 'cpp')).toBe('final@12-17')
+    })
+
+    it('leave out the operator of C++, which operator== is looked up by', () => {
+      expect(at('bool operator==(const Foo&) const;', 8, 'cpp')).toBe('operator@6-14')
+    })
+
+    it('are names after a dot in JavaScript and TypeScript, where a property may be called one', () => {
+      expect(at('cache.delete(key)', 8)).toBe('delete@7-13')
+      expect(at('promise.catch(fail).finally(done)', 10, 'javascript')).toBe('catch@9-14')
+      expect(at('promise.catch(fail).finally(done)', 23, 'javascript')).toBe('finally@21-28')
+      expect(at('options?.default', 12)).toBe('default@10-17')
+      expect(at('  .delete(key)', 6)).toBe('delete@4-10')
+    })
+
+    it('are no names after the three dots of a spread, or a dot in another language', () => {
+      expect(at('[...this.items]', 6)).toBeNull()
+      expect(at('f(...new Set())', 7)).toBeNull()
+      expect(at('self.None', 7, 'python')).toBeNull()
+      expect(at('Foo.class', 6, 'java')).toBeNull()
     })
   })
 

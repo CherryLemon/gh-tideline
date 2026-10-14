@@ -31,6 +31,47 @@ const DOLLAR_LANGUAGES = new Set(['javascript', 'typescript', 'java'])
 const WORD_AT_START = new RegExp(`^[${ID_CHARS}]+`, 'u')
 const WORD_AT_END = new RegExp(`[${ID_CHARS}]$`, 'u')
 
+const words = (list: string) => new Set(list.trim().split(/\s+/))
+
+const ECMASCRIPT_KEYWORDS = words(`
+  await break case catch class const continue debugger default delete do else enum export extends false finally for function if implements
+  import in instanceof interface let new null package private protected public return static super switch this throw true try typeof var
+  void while with yield`)
+const C_KEYWORDS = `
+  auto break case char const continue default do double else enum extern float for goto if inline int long register return short signed
+  sizeof static struct switch typedef union unsigned void volatile while`
+
+/**
+ * The words each language (by Monaco's id) reserves, that are never a name: a lookup of `return` finds nothing, or, if some class
+ * has a method of that name, the wrong thing. Words that are keywords only where they stand (`type`, `from`, `get`, `match`, `union`,
+ * `operator`, which `operator==` is looked up by) are names elsewhere, and are left out.
+ */
+const KEYWORDS: Record<string, ReadonlySet<string> | undefined> = {
+  javascript: ECMASCRIPT_KEYWORDS,
+  typescript: ECMASCRIPT_KEYWORDS,
+  rust: words(`
+    as async await break const continue crate dyn else enum extern false fn for if impl in let loop match mod move mut pub ref return self
+    Self static struct super trait true type unsafe use where while`),
+  go: words(`
+    break case chan const continue default defer else fallthrough for func go goto if import interface map package range return select
+    struct switch type var`),
+  python: words(`
+    False None True and as assert async await break class continue def del elif else except finally for from global if import in is lambda
+    nonlocal not or pass raise return try while with yield`),
+  java: words(`
+    abstract assert boolean break byte case catch char class continue default do double else enum extends false final finally float for if
+    implements import instanceof int interface long native new null package private protected public return short static strictfp super
+    switch synchronized this throw throws transient true try void volatile while`),
+  c: words(`${C_KEYWORDS} restrict`),
+  cpp: words(`
+    ${C_KEYWORDS} alignas alignof and and_eq asm bitand bitor bool catch char8_t char16_t char32_t class compl concept const_cast consteval
+    constexpr constinit co_await co_return co_yield decltype delete dynamic_cast explicit export false friend mutable namespace new noexcept
+    not not_eq nullptr or or_eq private protected public reinterpret_cast requires static_assert static_cast template this thread_local
+    throw true try typeid typename using virtual wchar_t xor xor_eq`),
+}
+/** JavaScript and TypeScript let a property be called what a keyword is: `map.delete(key)`. */
+const PROPERTY_LANGUAGES = new Set(['javascript', 'typescript'])
+
 /** How far from the position a name is looked for; a longer one is no name worth a lookup (a minified line, a blob of letters). */
 const REACH = 300
 /** The most the server takes in a name. */
@@ -46,21 +87,29 @@ interface Span {
 
 /**
  * The identifier at `position`. Like the word at a caret, it may touch either end of the identifier. Null when there is
- * none: no word, a number, a name in a comment or a string, or an absurdly long word. A Rust raw identifier (`r#type`)
- * is the name without the `r#`, and covers it.
+ * none: no word, a number, a keyword, a name in a comment or a string, or an absurdly long word. A Rust raw identifier
+ * (`r#type`) is the name without the `r#`, and covers it.
  */
 export function identifierAt(source: IdentifierSource, position: { lineNumber: number; column: number }): Identifier | null {
   const text = source.getLineContent(position.lineNumber)
-  const word = wordAt(text, position.column - 1, DOLLAR_LANGUAGES.has(source.getLanguageId()) ? WORD_WITH_DOLLAR : WORD)
+  const language = source.getLanguageId()
+  const word = wordAt(text, position.column - 1, DOLLAR_LANGUAGES.has(language) ? WORD_WITH_DOLLAR : WORD)
   if (!word) return null
-  const raw = source.getLanguageId() === 'rust' ? rawIdentifier(text, word) : null
+  const raw = language === 'rust' ? rawIdentifier(text, word) : null
   const covered = raw?.covered ?? word
   const name = text.slice(raw?.name.start ?? word.start, raw?.name.end ?? word.end)
   // `3.14`, `0xff`, `1_000`: the words of a number begin with a digit.
   if (/^\p{Nd}/u.test(name) || encoder.encode(name).length > MAX_NAME_BYTES) return null
+  // A raw identifier is the way to name what the keyword is, and a property of an object can be called one.
+  if (!raw && KEYWORDS[language]?.has(name) && !(PROPERTY_LANGUAGES.has(language) && afterDot(text, word.start))) return null
   const kind = source.tokenKindAt?.(position.lineNumber, (raw?.name.start ?? word.start) + 1) ?? 'code'
   if (kind !== 'code') return null
   return { name, line: position.lineNumber, column: covered.start + 1, endColumn: covered.end + 1, nameColumn: (raw?.name.start ?? word.start) + 1 }
+}
+
+/** Whether the offset follows a single dot (`a.b`, `a?.b`): not the three of a spread, in `...this`. */
+function afterDot(text: string, at: number): boolean {
+  return text[at - 1] === '.' && text[at - 2] !== '.'
 }
 
 /** The word that holds the offset `at` or ends there; null if there is none or it runs past what is looked at. */

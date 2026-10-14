@@ -1,4 +1,4 @@
-import { useEffect, useId, useLayoutEffect, useRef, useState } from 'react'
+import { memo, useEffect, useId, useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react'
 import type { NavHit } from '../api'
 import { focusWhenShown } from '../focus'
 
@@ -24,20 +24,91 @@ const GAP = 4
 const FLIP = 24
 /** Rows PageUp and PageDown move by. */
 const PAGE = 8
+/** A name further along its line than this many characters is brought into view: the row shows the line from its start, and the end of what is too long for it is cut off. */
+const NAME_REACH = 32
+/** What is kept in front of such a name. */
+const NAME_LEAD = 16
 
 /** The line of a hit, with the name in it marked (the index counts the columns in UTF-16 units, as the page's strings do). */
 function Snippet({ hit }: { hit: NavHit }) {
   const at = hit.snippetColumn - 1
   const end = at + hit.endColumn - hit.column
   if (at < 0 || end <= at || end > hit.snippet.length) return <>{hit.snippet}</>
+  let from = at > NAME_REACH ? at - NAME_LEAD : 0
+  // Not in the middle of a character outside the BMP.
+  if (from > 0 && hit.snippet.charCodeAt(from) >= 0xdc00 && hit.snippet.charCodeAt(from) <= 0xdfff) from++
   return (
     <>
-      {hit.snippet.slice(0, at)}
+      {from > 0 && '…'}
+      {hit.snippet.slice(from, at)}
       <mark>{hit.snippet.slice(at, end)}</mark>
       {hit.snippet.slice(end)}
     </>
   )
 }
+
+/**
+ * Which row is active. It lives outside the state of the list, and each row asks for whether it is the one: moving it draws
+ * the two rows that change, where a state of the list would draw all of a list of a thousand.
+ */
+interface ActiveRow {
+  get(): number
+  set(index: number): void
+  subscribe(listener: () => void): () => void
+}
+
+function createActiveRow(): ActiveRow {
+  let index = 0
+  const listeners = new Set<() => void>()
+  return {
+    get: () => index,
+    set(next) {
+      if (next === index) return
+      index = next
+      for (const listener of listeners) listener()
+    },
+    subscribe(listener) {
+      listeners.add(listener)
+      return () => void listeners.delete(listener)
+    },
+  }
+}
+
+interface RowsProps {
+  id: string
+  hits: readonly NavHit[]
+  activeRow: ActiveRow
+  onPick(hit: NavHit): void
+}
+
+/** A place in the list. */
+function Row({ id, index, hit, activeRow, onPick }: Omit<RowsProps, 'hits'> & { index: number; hit: NavHit }) {
+  const active = useSyncExternalStore(activeRow.subscribe, () => activeRow.get() === index)
+  const slash = hit.path.lastIndexOf('/') + 1
+  return (
+    <div
+      id={id}
+      className={`nav-popup-item${active ? ' is-active' : ''}`}
+      role="option"
+      aria-selected={active}
+      title={`${hit.path}:${hit.line}`}
+      onMouseMove={() => activeRow.set(index)}
+      onClick={() => onPick(hit)}
+    >
+      <span className="nav-popup-file">{hit.path.slice(slash)}</span>
+      <span className="nav-popup-dir muted">{hit.path.slice(0, slash)}</span>
+      <span className="nav-popup-line muted">:{hit.line}</span>
+      <code className="nav-popup-snippet">
+        <Snippet hit={hit} />
+      </code>
+    </div>
+  )
+}
+
+/** The rows. Memoized: the list moving its active row does not draw them again. */
+const Rows = memo(function Rows({ id, hits, activeRow, onPick }: RowsProps) {
+  return hits.map((hit, i) => <Row key={i} id={`${id}-${i}`} index={i} hit={hit} activeRow={activeRow} onPick={onPick} />)
+})
 
 /**
  * A list of places to choose one from, anchored at the click that asked for it, like a menu: the first row is active
@@ -48,7 +119,8 @@ export function NavPopup({ title, hits, empty, note, anchor, onPick, onClose }: 
   const id = useId()
   const root = useRef<HTMLDivElement>(null)
   const list = useRef<HTMLDivElement>(null)
-  const [active, setActive] = useState(0)
+  const [activeRow] = useState(createActiveRow)
+  const active = useSyncExternalStore(activeRow.subscribe, activeRow.get)
   const [place, setPlace] = useState({ left: anchor.x, top: anchor.y + GAP })
   // Read while rendering, before the list takes focus: focus goes back there on closing (the editor).
   const [opener] = useState(() => document.activeElement)
@@ -95,7 +167,7 @@ export function NavPopup({ title, hits, empty, note, anchor, onPick, onClose }: 
     if (e.nativeEvent.isComposing || e.keyCode === 229 || e.ctrlKey || e.altKey || e.metaKey) return
     const move = (to: number) => {
       e.preventDefault()
-      setActive(Math.max(0, Math.min(to, hits.length - 1)))
+      activeRow.set(Math.max(0, Math.min(to, hits.length - 1)))
     }
     switch (e.key) {
       case 'ArrowDown':
@@ -146,28 +218,7 @@ export function NavPopup({ title, hits, empty, note, anchor, onPick, onClose }: 
           aria-activedescendant={`${id}-${active}`}
           tabIndex={-1}
         >
-          {hits.map((hit, i) => {
-            const slash = hit.path.lastIndexOf('/') + 1
-            return (
-              <div
-                key={i}
-                id={`${id}-${i}`}
-                className={`nav-popup-item${i === active ? ' is-active' : ''}`}
-                role="option"
-                aria-selected={i === active}
-                title={`${hit.path}:${hit.line}`}
-                onMouseMove={() => setActive(i)}
-                onClick={() => onPick(hit)}
-              >
-                <span className="nav-popup-file">{hit.path.slice(slash)}</span>
-                <span className="nav-popup-dir muted">{hit.path.slice(0, slash)}</span>
-                <span className="nav-popup-line muted">:{hit.line}</span>
-                <code className="nav-popup-snippet">
-                  <Snippet hit={hit} />
-                </code>
-              </div>
-            )
-          })}
+          <Rows id={id} hits={hits} activeRow={activeRow} onPick={onPick} />
         </div>
       ) : (
         <div className="nav-popup-empty muted">{empty ?? 'Nothing found'}</div>

@@ -45,9 +45,14 @@ describe('choose', () => {
 
   it('asks for usages when the click is on the name of a definition of the file', () => {
     const symbols = [symbol('other', 3, 8), symbol('parse', 30, 17)]
-    expect(choose(click, symbols, result(hit('src/a.rs', 1)))).toEqual({ kind: 'usages' })
-    expect(choose(click, symbols, result())).toEqual({ kind: 'usages' })
-    expect(choose({ ...click, column: 18 }, symbols, result())).toEqual({ kind: 'usages' })
+    expect(choose(click, symbols, result(hit('src/a.rs', 1)))).toEqual({ kind: 'usages', name: 'parse' })
+    expect(choose(click, symbols, result())).toEqual({ kind: 'usages', name: 'parse' })
+    expect(choose({ ...click, column: 18 }, symbols, result())).toEqual({ kind: 'usages', name: 'parse' })
+  })
+
+  it('asks for the usages of the name the definition has, which the word clicked may be a part of', () => {
+    const symbols = [symbol('operator==', 30, 17)]
+    expect(choose({ ...click, name: 'operator' }, symbols, result())).toEqual({ kind: 'usages', name: 'operator==' })
   })
 
   it('does not take a name on another line or another column for the definition', () => {
@@ -57,7 +62,7 @@ describe('choose', () => {
 
   it('asks for usages when a definition the index found is where the click is', () => {
     const atClick = hit('src/main.rs', 30, { column: 17, endColumn: 22, tier: 'file' })
-    expect(choose(click, [], result(atClick, hit('src/a.rs', 1)))).toEqual({ kind: 'usages' })
+    expect(choose(click, [], result(atClick, hit('src/a.rs', 1)))).toEqual({ kind: 'usages', name: 'parse' })
     // Not another file's definition at the same place, nor one on the line next to it.
     expect(choose(click, [], result(hit('src/other.rs', 30, { column: 17, endColumn: 22 })))).toEqual({
       kind: 'jump',
@@ -69,7 +74,7 @@ describe('choose', () => {
 
   it('does not depend on the side', () => {
     const symbols = [symbol('parse', 30, 17)]
-    expect(choose({ ...click, side: 'base' }, symbols, result())).toEqual({ kind: 'usages' })
+    expect(choose({ ...click, side: 'base' }, symbols, result())).toEqual({ kind: 'usages', name: 'parse' })
     expect(choose({ ...click, side: 'base' }, [], result(hit('src/parse.rs', 12))).kind).toBe('jump')
   })
 
@@ -84,12 +89,12 @@ describe('choose', () => {
 
     it('asks for usages wherever on the name of a definition the click is', () => {
       const symbols = [symbol('parse', 30, 17)]
-      for (const column of [17, 19, 21, 22]) expect(choose(clicked(column), symbols, result(hit('src/a.rs', 1)))).toEqual({ kind: 'usages' })
+      for (const column of [17, 19, 21, 22]) expect(choose(clicked(column), symbols, result(hit('src/a.rs', 1)))).toEqual({ kind: 'usages', name: 'parse' })
     })
 
     it('asks for usages when the index found the definition under the click, also at the end of the name', () => {
       const atClick = hit('src/main.ts', 30, { column: 17, endColumn: 22, tier: 'file' })
-      expect(choose(clicked(22), [], result(atClick, hit('src/a.ts', 1)))).toEqual({ kind: 'usages' })
+      expect(choose(clicked(22), [], result(atClick, hit('src/a.ts', 1)))).toEqual({ kind: 'usages', name: 'parse' })
     })
 
     it('starts the click at the name of a Rust raw identifier, as the index does', () => {
@@ -97,7 +102,16 @@ describe('choose', () => {
       const id = identifierAt({ getLanguageId: () => 'rust', getLineContent: () => raw }, { lineNumber: 30, column: 5 })
       const click = clickOn('src/main.rs', 'head', id!)
       expect(click).toEqual({ path: 'src/main.rs', side: 'head', line: 30, column: 6, name: 'type' })
-      expect(choose(click, [symbol('type', 30, 6)], result())).toEqual({ kind: 'usages' })
+      expect(choose(click, [symbol('type', 30, 6)], result())).toEqual({ kind: 'usages', name: 'type' })
+    })
+
+    it('asks for the usages of a C++ operator by its whole name, from a click on the word operator', () => {
+      const operator = 'bool operator==(const A&) const;'
+      const id = identifierAt({ getLanguageId: () => 'cpp', getLineContent: () => operator }, { lineNumber: 30, column: 8 })
+      const click = clickOn('src/a.h', 'head', id!)
+      expect(click).toEqual({ path: 'src/a.h', side: 'head', line: 30, column: 6, name: 'operator' })
+      // The index names the definition `operator==`, from where the word starts to the end of the `==`.
+      expect(choose(click, [symbol('operator==', 30, 6)], result())).toEqual({ kind: 'usages', name: 'operator==' })
     })
 
     it('takes the place of the name from the end of it too, for a use of a name', () => {

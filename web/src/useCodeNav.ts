@@ -1,7 +1,8 @@
 // Looking up a name: Ctrl+click or Ctrl+B on a name asks the server for its definitions, building the index of the
 // repository at that commit first when it has none (behind a dialog with progress that can be cancelled), and then goes
 // to the one definition, or lists them to choose from. On the name of a definition itself it lists the places that use
-// the name instead. One look-up at a time: a new one, a move of the caret, or leaving the history entry ends the one under way.
+// the name instead. One look-up at a time: a new one, a move of the caret, going to a text field or a dialog, or leaving
+// the history entry ends the one under way, and what it has not found yet is not shown.
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { flushSync } from 'react-dom'
 import {
@@ -23,19 +24,18 @@ import {
 import type { IndexProgress } from './components/IndexDialog'
 import type { NavPopupProps } from './components/NavPopup'
 import type { NavSource } from './monaco/links'
+import { createBuilds, withIndex } from './nav/build'
 import { choose } from './nav/choose'
 import { getSymbols } from './nav/symbols'
 import { resolveTarget } from './nav/targets'
-import { usagesText } from './nav/usages'
+import { declarationsText, usagesText } from './nav/usages'
 import { fileQuery } from './router'
-
-/** A look-up that takes shorter than this to get its index shows no dialog: one that is built already is no wait. */
-const GRACE_MS = 300
-const POLL_MS = 300
-/** Times a look-up builds the index again: a job that vanished (the server restarted) or an index that went missing. */
-const MAX_BUILDS = 3
+import { isTypingTarget } from './viewed'
 
 const UNSUPPORTED = "Go to definition doesn't support this file type"
+
+/** The builds of indexes this page has asked the server to stop, which the next look-up of the same commit waits for. */
+const builds = createBuilds()
 
 export interface CodeNavDeps {
   repo: RepoRef
@@ -60,6 +60,8 @@ export interface CodeNav {
   dismiss(): void
   /** Whether the look-up shows something: shortcuts of the page stay off. */
   open: boolean
+  /** Whether a look-up is waiting for the server, with no dialog of its own to say so. */
+  looking: boolean
   /** The dialog for the index being built; shown once a look-up has waited for it for a moment. */
   index: (IndexProgress & { onCancel(): void; onRetry(): void; onClose(): void }) | null
   /** The list to choose from; `id` is new for each. */
@@ -71,23 +73,18 @@ interface Run {
   abort: AbortController
 }
 
-const sleep = (ms: number, signal: AbortSignal) =>
-  new Promise<void>((resolve) => {
-    if (signal.aborted) return resolve()
-    const done = () => {
-      clearTimeout(timer)
-      signal.removeEventListener('abort', done)
-      resolve()
-    }
-    const timer = setTimeout(done, ms)
-    signal.addEventListener('abort', done, { once: true })
-  })
+/** Whether the user is at a text field or in a dialog of the page, other than the ones a look-up shows: gone to write, or to something else. */
+function elsewhere(): boolean {
+  const active = document.activeElement
+  return isTypingTarget(active) || !!active?.closest('[role="dialog"]:not(.index-dialog, .nav-popup)')
+}
 
 export function useCodeNav(deps: CodeNavDeps): CodeNav {
   const latest = useRef(deps)
   latest.current = deps
   const [index, setIndex] = useState<CodeNav['index']>(null)
   const [list, setList] = useState<CodeNav['list']>(null)
+  const [looking, setLooking] = useState(false)
   const current = useRef<Run | null>(null)
   const listId = useRef(0)
 
@@ -97,9 +94,18 @@ export function useCodeNav(deps: CodeNavDeps): CodeNav {
     run?.abort.abort()
     setIndex(null)
     setList(null)
+    setLooking(false)
   }, [])
   // The look-up belongs to the entry and the head it was made at; and ends with the page.
   useEffect(() => dismiss, [deps.entryId, deps.head, dismiss])
+  // Whoever goes to write something (a comment, the finder's search) has moved on: the answer would take the focus from them.
+  useEffect(() => {
+    const onFocusIn = (e: FocusEvent) => {
+      if (current.current && isTypingTarget(e.target)) dismiss()
+    }
+    document.addEventListener('focusin', onFocusIn, true)
+    return () => document.removeEventListener('focusin', onFocusIn, true)
+  }, [dismiss])
 
   /** Goes to a definition: the dialogs close first, so that the editor takes the focus once the place is shown. */
   const open = useCallback((source: NavSource, hit: NavHit) => {
@@ -107,6 +113,7 @@ export function useCodeNav(deps: CodeNavDeps): CodeNav {
     flushSync(() => {
       setIndex(null)
       setList(null)
+      setLooking(false)
     })
     current.current = null
     const target = resolveTarget(hit.path, source.click.side, files, tree)
@@ -115,68 +122,36 @@ export function useCodeNav(deps: CodeNavDeps): CodeNav {
   }, [])
 
   /** Waits for the index of the commit of `side` to be built, starting its build if need be; false if the look-up is to stop. */
-  const build = useCallback(async (run: Run, side: NavSide): Promise<boolean> => {
-    const { repo, prNumber, head, showToast } = latest.current
-    const { signal } = run.abort
-    const started = performance.now()
-    let shown = false
-    const stop = () => {
-      // The page goes on without it, and so does the build: it is the user's Cancel that stops that.
-      dismiss()
-      void cancelIndex(repo, prNumber, head, side).catch(() => {})
-    }
-    const show = (status: Pick<IndexStatus, 'phase' | 'done' | 'total'>, failure: string | null, onRetry: () => void, onClose: () => void) => {
-      shown = true
-      setIndex({ side, phase: status.phase, done: status.done, total: status.total, failure, onCancel: stop, onRetry, onClose })
-    }
-    let status = await startIndex(repo, prNumber, head, side)
-    for (let builds = 1; !signal.aborted; ) {
-      switch (status.state) {
-        case 'ready':
-          return true
-        case 'failed': {
-          // Until the user decides: the look-up is still theirs to go on with.
-          const retry = await new Promise<boolean>((resolve) => {
-            signal.addEventListener('abort', () => resolve(false), { once: true })
-            show(status, status.message ?? 'Indexing failed', () => resolve(true), () => resolve(false))
-          })
-          if (!retry || signal.aborted) return false
-          status = await startIndex(repo, prNumber, head, side)
-          continue
-        }
-        case 'cancelled':
-          // Not by this page, which would have stopped (another window did).
-          showToast('Indexing was cancelled')
-          return false
-        case 'missing':
-          // The job is gone.
-          if (++builds > MAX_BUILDS) throw new Error('The index could not be built')
-          status = await startIndex(repo, prNumber, head, side)
-          continue
-        default:
-          if (shown || performance.now() - started >= GRACE_MS) show(status, null, () => {}, dismiss)
+  const build = useCallback(
+    (run: Run, side: NavSide): Promise<boolean> => {
+      const { repo, prNumber, head, showToast } = latest.current
+      const key = `${repo.host}/${repo.owner}/${repo.repo}#${prNumber}@${head}:${side}`
+      const stop = () => {
+        // The page goes on without it, and so does the build: it is the user's Cancel that stops that.
+        dismiss()
+        builds.stop(key, () => cancelIndex(repo, prNumber, head, side))
       }
-      await sleep(POLL_MS, signal)
-      if (signal.aborted) return false
-      status = await getIndex(repo, prNumber, head, side, signal)
-    }
-    return false
-  }, [dismiss])
+      const show = (status: Pick<IndexStatus, 'phase' | 'done' | 'total'>, failure: string | null, onRetry: () => void, onClose: () => void) =>
+        setIndex({ side, phase: status.phase, done: status.done, total: status.total, failure, onCancel: stop, onRetry, onClose })
+      return builds.wait(
+        key,
+        { start: () => startIndex(repo, prNumber, head, side), poll: (signal) => getIndex(repo, prNumber, head, side, signal) },
+        {
+          progress: (status) => show(status, null, () => {}, dismiss),
+          failed: (message, retry, close) => show({ phase: null, done: 0, total: 0 }, message, retry, close),
+          notify: showToast,
+        },
+        run.abort.signal,
+      )
+    },
+    [dismiss],
+  )
 
   /** What `get` asks the server, once the index of the commit of `side` is there to answer: built first if it is not; null if the look-up is to stop. */
   const indexed = useCallback(
-    async (run: Run, side: NavSide, get: () => Promise<NavResult>): Promise<NavResult | null> => {
-      for (let builds = 0; ; builds++) {
-        try {
-          return await get()
-        } catch (e) {
-          if (!(e instanceof ApiError && e.code === 'index_missing') || builds >= MAX_BUILDS) throw e
-          if (!(await build(run, side))) return null
-          // The dialog is closed for the look-up that follows.
-          setIndex(null)
-        }
-      }
-    },
+    (run: Run, side: NavSide, get: () => Promise<NavResult>): Promise<NavResult | null> =>
+      // The dialog is closed for the look-up that follows.
+      withIndex(get, () => build(run, side), () => setIndex(null)),
     [build],
   )
 
@@ -185,14 +160,16 @@ export function useCodeNav(deps: CodeNavDeps): CodeNav {
       const { repo, prNumber, head, showToast, onRefresh } = latest.current
       const { signal } = run.abort
       const { click } = source
+      // Whether what comes in is still wanted: not after the look-up was ended, nor with the user at a text field or a dialog.
+      const stale = () => signal.aborted || elsewhere()
       try {
         // The symbols of the file tell a click on a definition's own name from one on a use of the name.
         const file = source.oid === null ? null : await getSymbols(repo, source.oid, click.path).catch(() => null)
-        if (signal.aborted) return
+        if (stale()) return
         if (file?.language === null) return showToast(UNSUPPORTED)
         const query = { head, side: click.side, path: click.path, name: click.name }
         const result = await indexed(run, click.side, () => getDefinitions(repo, prNumber, query, signal))
-        if (!result || signal.aborted) return
+        if (!result || stale()) return
         if (result.language === null) return showToast(UNSUPPORTED)
         const choice = choose(click, file?.symbols ?? [], result)
         switch (choice.kind) {
@@ -201,42 +178,33 @@ export function useCodeNav(deps: CodeNavDeps): CodeNav {
           case 'popup':
             setList({
               id: ++listId.current,
-              props: {
-                title: `Choose declaration of ${click.name} (${choice.hits.length})`,
-                hits: choice.hits,
-                anchor: source.anchor,
-                onPick: (hit) => open(source, hit),
-                onClose: dismiss,
-              },
+              props: { ...declarationsText(click.name, result), hits: choice.hits, anchor: source.anchor, onPick: (hit) => open(source, hit), onClose: dismiss },
             })
             return
           case 'none':
             return showToast(`No definition found for ${click.name}`)
           case 'usages': {
-            // A definition is no place to go to from its own name: the answer is where the name is used.
-            const usages = await indexed(run, click.side, () => getReferences(repo, prNumber, query, signal))
-            if (!usages || signal.aborted) return
+            // A definition is no place to go to from its own name: the answer is where the name is used. By the name the definition has,
+            // which the word clicked may be a part of (`operator` of `operator==`).
+            const named = { ...query, name: choice.name }
+            const usages = await indexed(run, click.side, () => getReferences(repo, prNumber, named, signal))
+            if (!usages || stale()) return
             setList({
               id: ++listId.current,
-              props: {
-                ...usagesText(click.name, usages),
-                hits: usages.hits,
-                anchor: source.anchor,
-                onPick: (hit) => open(source, hit),
-                onClose: dismiss,
-              },
+              props: { ...usagesText(choice.name, usages), hits: usages.hits, anchor: source.anchor, onPick: (hit) => open(source, hit), onClose: dismiss },
             })
             return
           }
         }
       } catch (e) {
-        if (signal.aborted) return
+        if (stale()) return
         if (e instanceof ApiError && e.code === 'stale_head') showToast(e.message, { label: 'Refresh', run: onRefresh })
         else showToast(errorMessage(e))
       } finally {
         if (current.current === run) {
           current.current = null
           setIndex(null)
+          setLooking(false)
         }
       }
     },
@@ -248,10 +216,11 @@ export function useCodeNav(deps: CodeNavDeps): CodeNav {
       dismiss()
       const run: Run = { abort: new AbortController() }
       current.current = run
+      setLooking(true)
       void lookUp(run, source)
     },
     [dismiss, lookUp],
   )
 
-  return { request, dismiss, open: index !== null || list !== null, index, list }
+  return { request, dismiss, open: index !== null || list !== null, looking: looking && index === null, index, list }
 }

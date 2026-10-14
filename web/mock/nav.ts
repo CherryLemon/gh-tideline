@@ -475,8 +475,8 @@ export class MockIndex {
     return this.parsed.get(key) ?? null
   }
 
-  /** Where the definitions of a name are, nearest `from` first. */
-  private definitions(commit: NavCommit, from: string, name: string, family: string): MockHit[] {
+  /** Where the definitions of a name are, nearest `from` first; the first MAX_DEFINITIONS of them. */
+  private definitions(commit: NavCommit, from: string, name: string, family: string): { hits: MockHit[]; truncated: boolean } {
     const hits: Array<MockHit & { near: number }> = []
     for (const entry of commit.tree) {
       const language = languageOf(entry.path)
@@ -489,7 +489,7 @@ export class MockIndex {
       }
     }
     hits.sort((a, b) => TIERS.indexOf(a.tier) - TIERS.indexOf(b.tier) || b.near - a.near || byPath(a.path, b.path) || a.line - b.line)
-    return hits.slice(0, MAX_DEFINITIONS).map(({ near: _, ...hit }) => hit)
+    return { hits: hits.slice(0, MAX_DEFINITIONS).map(({ near: _, ...hit }) => hit), truncated: hits.length > MAX_DEFINITIONS }
   }
 
   /** Where a name is used: the identifiers of that name in the code that are not a definition's name. */
@@ -543,7 +543,7 @@ export class MockIndex {
     // A file the index has no language for needs no index.
     if (!language) return response(200, { language: null, commit: commit.sha, name, hits: [], truncated: false } satisfies MockNavResult)
     if (this.status(key, commit).state !== 'ready') return failure(409, 'index_missing', 'the commit has not been indexed')
-    const found = sub === 'definitions' ? { hits: this.definitions(commit, path, name, familyOf(language)), truncated: false } : this.references(commit, path, name, familyOf(language))
+    const found = sub === 'definitions' ? this.definitions(commit, path, name, familyOf(language)) : this.references(commit, path, name, familyOf(language))
     return response(200, { language, commit: commit.sha, name, ...found } satisfies MockNavResult)
   }
 }

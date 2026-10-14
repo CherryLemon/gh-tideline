@@ -411,7 +411,7 @@ kbd {
 .statusbar {
   display: flex;
   align-items: center;
-  gap: 14px;
+  gap: 12px;
   padding: 0 10px;
   background: var(--second-bg);
   border-top: 1px solid var(--line);
@@ -425,10 +425,31 @@ kbd {
   color: var(--fg);
 }
 
+.status-looking {
+  /* Not shown for a look-up that is quick. */
+  animation: fade-in 0s 300ms both;
+}
+
+/* The shortcuts that don't fit are left out whole, the last first: each line is as high as the bar, so those that wrap are out of sight. */
+.hints {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  align-content: flex-start;
+  gap: 0 12px;
+  min-width: 0;
+  height: 100%;
+  overflow: hidden;
+}
+
 .hint {
   display: inline-flex;
   align-items: center;
   gap: 3px;
+}
+
+.hints > .hint {
+  height: 100%;
 }
 
 /* Tree ------------------------------------------------------------------------- */

@@ -1,9 +1,27 @@
 import { describe, expect, it } from 'vitest'
 import type { NavHit } from '../api'
-import { usagesText } from './usages'
+import { declarationsText, usagesText } from './usages'
 
 const hit = (line: number): NavHit => ({ path: 'src/a.ts', line, column: 1, endColumn: 4, kind: 'call', snippet: 'foo()', snippetColumn: 1, tier: 'file' })
 const hits = (n: number) => Array.from({ length: n }, (_, i) => hit(i + 1))
+
+describe('declarationsText', () => {
+  it('titles the list with the name and the count, and has no note for a list that is complete', () => {
+    expect(declarationsText('parse', { hits: hits(3), truncated: false })).toEqual({ title: 'Choose declaration of parse (3)' })
+    expect(declarationsText('parse', { hits: hits(2), truncated: false }).note).toBeUndefined()
+  })
+
+  it('counts a list the server cut short as "N+" and says so under the rows', () => {
+    expect(declarationsText('new', { hits: hits(200), truncated: true })).toEqual({
+      title: 'Choose declaration of new (200+)',
+      note: 'Only the first 200 declarations are listed',
+    })
+  })
+
+  it('puts the name in as it is', () => {
+    expect(declarationsText('$el_2', { hits: hits(2), truncated: false }).title).toBe('Choose declaration of $el_2 (2)')
+  })
+})
 
 describe('usagesText', () => {
   it('titles the list with the name and the count, and says the usages are matched by name', () => {

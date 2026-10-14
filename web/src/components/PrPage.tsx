@@ -731,6 +731,10 @@ function PrView({ repo, data, search, entryId, refreshing, onRefresh }: ViewProp
   const dialogOpen = finderOpen || reviewShown || codeNav.open
   // The page behind a modal dialog can't be reached.
   const modalShown = reviewShown || codeNav.index !== null
+  // The user has moved on to the finder or the review: the answer of a look-up would come up over it (a comment box ends it by its focus).
+  useEffect(() => {
+    if (finderOpen || reviewShown) dismissCodeNav()
+  }, [finderOpen, reviewShown, dismissCodeNav])
 
   // The caret is also recorded once it has rested for a moment, for the ways out of an entry that don't pass through goTo:
   // the browser's own Back, a reload. And as the page goes (pagehide is too late for a reload to keep it): listened for only
@@ -841,6 +845,9 @@ function PrView({ repo, data, search, entryId, refreshing, onRefresh }: ViewProp
     if (!snapshot) return showToast("The review comments haven't loaded yet")
     if (commentPath === null) return showToast("GitHub's file list doesn't have this path, so it takes no comments")
     switch (pane.current?.commentAtCursor() ?? 'no-diff') {
+      case 'opened':
+        // The user writes now: the answer of a look-up under way would take the focus from the box.
+        return dismissCodeNav()
       case 'no-diff':
         return showToast('Only the lines of a text diff take comments: "Comment on file" takes one on the whole file')
       case 'diff-stopped':
@@ -898,10 +905,12 @@ function PrView({ repo, data, search, entryId, refreshing, onRefresh }: ViewProp
       }
       lastShift = 0
       const plain = !e.altKey && !e.ctrlKey && !e.metaKey
-      const ctrlP = (e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'p'
+      const ctrl = (e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey
+      const ctrlP = ctrl && e.key.toLowerCase() === 'p'
+      const ctrlB = ctrl && isLetterKey(e, 'b')
       if (dialogOpen) {
-        // Nor the browser's print dialog, or caret browsing, over it.
-        if (ctrlP || (e.key === 'F7' && plain)) e.preventDefault()
+        // Nor the browser's print dialog (or its bookmarks, in Firefox), or caret browsing, over it.
+        if (ctrlP || ctrlB || (e.key === 'F7' && plain)) e.preventDefault()
         return
       }
 
@@ -919,7 +928,7 @@ function PrView({ repo, data, search, entryId, refreshing, onRefresh }: ViewProp
         if (e.key === 'F7' && plain) consume()
         return
       }
-      if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && isLetterKey(e, 'b')) {
+      if (ctrlB) {
         // Not the browser's either (Firefox opens its bookmarks).
         consume()
         if (!e.repeat) goToDefinition()
@@ -1126,15 +1135,22 @@ function PrView({ repo, data, search, entryId, refreshing, onRefresh }: ViewProp
         <span className="status-item">
           File {currentIndex >= 0 ? currentIndex + 1 : '–'}/{order.length}
         </span>
+        {codeNav.looking && (
+          <span className="status-item status-looking" role="status">
+            Looking up…
+          </span>
+        )}
         <span className="spacer" />
-        <span className="hint"><kbd>F7</kbd> next change</span>
-        <span className="hint"><kbd>Shift+F7</kbd> previous</span>
-        <span className="hint"><kbd>Alt+↓</kbd>/<kbd>Alt+↑</kbd> next/previous file</span>
-        <span className="hint"><kbd>Ctrl+B</kbd> go to definition</span>
-        <span className="hint"><kbd>Ctrl+Alt+←</kbd>/<kbd>→</kbd> back/forward</span>
-        <span className="hint"><kbd>Shift Shift</kbd>/<kbd>Ctrl+P</kbd> find file</span>
-        <span className="hint"><kbd>v</kbd> viewed</span>
-        <span className="hint"><kbd>c</kbd> comment</span>
+        <span className="hints">
+          <span className="hint"><kbd>F7</kbd> next change</span>
+          <span className="hint"><kbd>Shift+F7</kbd> previous</span>
+          <span className="hint"><kbd>Alt+↓</kbd>/<kbd>↑</kbd> next/previous file</span>
+          <span className="hint"><kbd>Ctrl+B</kbd> definition</span>
+          <span className="hint"><kbd>Ctrl+Alt+←</kbd>/<kbd>→</kbd> back/forward</span>
+          <span className="hint"><kbd>Shift Shift</kbd>/<kbd>Ctrl+P</kbd> find file</span>
+          <span className="hint"><kbd>v</kbd> viewed</span>
+          <span className="hint"><kbd>c</kbd> comment</span>
+        </span>
       </footer>
 
       {finderOpen && (

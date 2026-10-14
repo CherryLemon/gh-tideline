@@ -22,17 +22,19 @@ export function clickOn(path: string, side: NavSide, id: Identifier): Click {
 }
 
 /**
- * - usages: the click is on the name of a definition, so the definition is no place to go to; its usages are the answer;
+ * - usages: the click is on the name of a definition, so the definition is no place to go to; the usages of `name` are the answer
+ *   (the name the definition has, which a click on a word of it (`operator` of `operator==`) is not);
  * - none: the index knows no definition of the name;
  * - jump: one place to go to, or only one in the file clicked in;
  * - popup: several, to choose from, nearest first as the server ranked them.
  */
-export type Choice = { kind: 'usages' } | { kind: 'none' } | { kind: 'jump'; hit: NavHit } | { kind: 'popup'; hits: NavHit[] }
+export type Choice = { kind: 'usages'; name: string } | { kind: 'none' } | { kind: 'jump'; hit: NavHit } | { kind: 'popup'; hits: NavHit[] }
 
 /** `symbols`: those of the file clicked in, at the version shown (empty when they are not known). */
 export function choose(click: Click, symbols: readonly SymbolInfo[], result: NavResult): Choice {
   const onHit = result.hits.some((h) => h.path === click.path && h.line === click.line && h.column <= click.column && click.column < h.endColumn)
-  if (definitionAt(symbols, click.line, click.column) || onHit) return { kind: 'usages' }
+  const definition = definitionAt(symbols, click.line, click.column)
+  if (definition || onHit) return { kind: 'usages', name: definition?.name ?? click.name }
   if (result.hits.length === 0) return { kind: 'none' }
   if (result.hits.length === 1) return { kind: 'jump', hit: result.hits[0] }
   const here = result.hits.filter((h) => h.path === click.path)
