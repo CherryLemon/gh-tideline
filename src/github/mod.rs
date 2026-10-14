@@ -1,5 +1,7 @@
 //! GitHub access: per-host token resolution, hand-written GraphQL query and REST compare.
 
+mod review;
+
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -8,6 +10,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::error::{AppError, ErrorCode};
+
+pub use review::{
+    DiffSide, NewThread, PendingReview, ReviewComment, ReviewState, ReviewThread, ReviewThreads,
+    SubmittedReview, ThreadTarget,
+};
 
 const TOKEN_TTL: Duration = Duration::from_secs(600);
 
@@ -303,6 +310,32 @@ impl Github {
         query: &str,
         variables: serde_json::Value,
     ) -> Result<T, AppError> {
+        self.post_graphql(host, token, query, variables, Op::Read)
+            .await
+    }
+
+    /// Like `graphql`, for mutations: GitHub refusing the write becomes `rejected` (422) with
+    /// GitHub's message, so the UI can say why. Callers must not retry: the write may have
+    /// landed.
+    async fn mutate<T: DeserializeOwned>(
+        &self,
+        host: &str,
+        token: &str,
+        query: &str,
+        variables: serde_json::Value,
+    ) -> Result<T, AppError> {
+        self.post_graphql(host, token, query, variables, Op::Write)
+            .await
+    }
+
+    async fn post_graphql<T: DeserializeOwned>(
+        &self,
+        host: &str,
+        token: &str,
+        query: &str,
+        variables: serde_json::Value,
+        op: Op,
+    ) -> Result<T, AppError> {
         let resp = self
             .http
             .post(graphql_url(host))
@@ -319,24 +352,13 @@ impl Github {
         if !status.is_success() {
             return Err(http_error("GraphQL", status, &text));
         }
+        if op == Op::Write {
+            return write_result(&text);
+        }
         let parsed: GqlResponse<T> = serde_json::from_str(&text)
             .map_err(|e| AppError::github(format!("unexpected GraphQL response: {e}")))?;
         if let Some(errors) = parsed.errors.filter(|e| !e.is_empty()) {
-            let message = errors
-                .iter()
-                .map(|e| e.message.as_str())
-                .collect::<Vec<_>>()
-                .join("; ");
-            return Err(
-                if errors
-                    .iter()
-                    .any(|e| e.kind.as_deref() == Some("NOT_FOUND"))
-                {
-                    AppError::not_found(message)
-                } else {
-                    AppError::github(message)
-                },
-            );
+            return Err(classify_gql_errors(&errors, op));
         }
         parsed
             .data
@@ -396,7 +418,7 @@ impl Github {
     ) -> Result<(), AppError> {
         let query = if viewed { MARK_VIEWED } else { UNMARK_VIEWED };
         let _: serde_json::Value = self
-            .graphql(
+            .mutate(
                 host,
                 token,
                 query,
@@ -450,6 +472,111 @@ impl Github {
         check_oid(&compare.merge_base_commit.sha)?;
         Ok(compare.merge_base_commit.sha)
     }
+
+    /// `text` rendered as GitHub renders a comment in `owner/repo` (`gfm`: `#12` and `@user`
+    /// link there), for a preview. The HTML is GitHub's, sanitized by the client like a
+    /// comment body.
+    pub async fn render_markdown(
+        &self,
+        host: &str,
+        token: &str,
+        owner: &str,
+        repo: &str,
+        text: &str,
+    ) -> Result<String, AppError> {
+        let resp = self
+            .http
+            .post(format!("{}/markdown", rest_base(host)))
+            .bearer_auth(token)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .json(&json!({ "text": text, "mode": "gfm", "context": format!("{owner}/{repo}") }))
+            .send()
+            .await
+            .map_err(|e| AppError::github(format!("markdown request to {host} failed: {e}")))?;
+        let status = resp.status();
+        let html = resp
+            .text()
+            .await
+            .map_err(|e| AppError::github(format!("reading markdown response: {e}")))?;
+        if !status.is_success() {
+            return Err(http_error("markdown", status, &html));
+        }
+        Ok(html)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Op {
+    Read,
+    Write,
+}
+
+/// The error for a GraphQL response's `errors`. GitHub refusing a write (`UNPROCESSABLE`:
+/// the comment's line isn't in the diff, approving your own PR, ...; `FORBIDDEN`: no
+/// permission) is `rejected`; the same on a read is a `github_error` like any other.
+/// What a mutation returned. A mutation whose payload came back happened, even when GitHub
+/// also reports errors (about some field of the answer): those are logged, not returned, so
+/// the client doesn't take a write that landed for one that failed. An answer that can't be
+/// read is still an error (502): the client looks before trying again.
+fn write_result<T: DeserializeOwned>(text: &str) -> Result<T, AppError> {
+    let parsed: GqlResponse<serde_json::Value> = serde_json::from_str(text)
+        .map_err(|e| AppError::github(format!("unexpected GraphQL response: {e}")))?;
+    let landed = payload_returned(parsed.data.as_ref());
+    if let Some(errors) = parsed.errors.filter(|e| !e.is_empty()) {
+        if !landed {
+            return Err(classify_gql_errors(&errors, Op::Write));
+        }
+        let messages: Vec<&str> = errors.iter().map(|e| e.message.as_str()).collect();
+        eprintln!(
+            "gh-tideline: GitHub made a change but reported: {}",
+            messages.join("; ")
+        );
+    }
+    let data = parsed
+        .data
+        .ok_or_else(|| AppError::github("GraphQL response has no data"))?;
+    serde_json::from_value(data).map_err(|e| {
+        let made = if landed {
+            "GitHub made the change, but "
+        } else {
+            ""
+        };
+        AppError::github(format!("{made}its answer was unexpected: {e}"))
+    })
+}
+
+/// Whether some mutation in `data` returned a payload with a value in it.
+fn payload_returned(data: Option<&serde_json::Value>) -> bool {
+    let Some(data) = data.and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+    data.values().any(|payload| {
+        payload
+            .as_object()
+            .is_some_and(|p| p.values().any(|v| !v.is_null()))
+    })
+}
+
+fn classify_gql_errors(errors: &[GqlError], op: Op) -> AppError {
+    let mut message = errors
+        .iter()
+        .map(|e| e.message.trim())
+        .filter(|m| !m.is_empty())
+        .collect::<Vec<_>>()
+        .join("; ");
+    // As for a new review with neither comments nor a summary.
+    if message.is_empty() {
+        message = "GitHub gave no reason".into();
+    }
+    let has = |kind: &str| errors.iter().any(|e| e.kind.as_deref() == Some(kind));
+    if has("NOT_FOUND") {
+        AppError::not_found(message)
+    } else if op == Op::Write && (has("UNPROCESSABLE") || has("FORBIDDEN")) {
+        AppError::rejected(message)
+    } else {
+        AppError::github(message)
+    }
 }
 
 /// Commit ids from GitHub end up in git arguments and refspecs; reject anything else.
@@ -500,6 +627,100 @@ mod tests {
                 "{bad:?}"
             );
         }
+    }
+
+    fn errors(json: &str) -> Vec<GqlError> {
+        serde_json::from_str::<GqlResponse<serde_json::Value>>(json)
+            .unwrap()
+            .errors
+            .unwrap()
+    }
+
+    #[test]
+    fn graphql_errors_are_classified_by_type_and_operation() {
+        // As GitHub sends it for a comment on a line outside the diff (spike S12).
+        let unprocessable = errors(
+            r#"{"data": {"addPullRequestReviewThread": null}, "errors": [{"type": "UNPROCESSABLE",
+                "path": ["addPullRequestReviewThread"], "locations": [{"line": 2, "column": 3}],
+                "message": "Line could not be resolved"}]}"#,
+        );
+        let forbidden = errors(
+            r#"{"errors": [{"type": "FORBIDDEN", "message": "Resource not accessible by integration"}]}"#,
+        );
+        let not_found = errors(
+            r#"{"errors": [{"type": "NOT_FOUND", "message": "Could not resolve to a node"},
+                {"type": "UNPROCESSABLE", "message": "x"}]}"#,
+        );
+        let untyped =
+            errors(r#"{"errors": [{"message": "Something went wrong"}, {"message": "again"}]}"#);
+        let silent = errors(r#"{"errors": [{"type": "UNPROCESSABLE", "message": ""}]}"#);
+
+        let classify = |e: &[GqlError], op| {
+            let err = classify_gql_errors(e, op);
+            (err.code, err.message)
+        };
+        assert_eq!(
+            classify(&unprocessable, Op::Write),
+            (ErrorCode::Rejected, "Line could not be resolved".into())
+        );
+        assert_eq!(classify(&forbidden, Op::Write).0, ErrorCode::Rejected);
+        assert_eq!(
+            classify(&silent, Op::Write),
+            (ErrorCode::Rejected, "GitHub gave no reason".into())
+        );
+        assert_eq!(classify(&unprocessable, Op::Read).0, ErrorCode::GithubError);
+        assert_eq!(classify(&forbidden, Op::Read).0, ErrorCode::GithubError);
+        for op in [Op::Read, Op::Write] {
+            assert_eq!(classify(&not_found, op).0, ErrorCode::NotFound);
+            assert_eq!(
+                classify(&untyped, op),
+                (ErrorCode::GithubError, "Something went wrong; again".into())
+            );
+        }
+    }
+
+    #[test]
+    fn writes_that_returned_a_payload_landed() {
+        #[derive(Deserialize, Debug)]
+        #[serde(rename_all = "camelCase")]
+        struct Data {
+            delete_pull_request_review: Option<serde_json::Value>,
+        }
+        let refused = write_result::<Data>(
+            r#"{"data": {"deletePullRequestReview": null}, "errors": [{"type": "UNPROCESSABLE",
+                "message": "Can not delete"}]}"#,
+        )
+        .unwrap_err();
+        assert_eq!(refused.code, ErrorCode::Rejected);
+        // Done, with an error about some field of the answer: a success.
+        let landed = write_result::<Data>(
+            r#"{"data": {"deletePullRequestReview": {"pullRequestReview": {"id": "PRR_1"}}},
+                "errors": [{"message": "Something went wrong reading a field"}]}"#,
+        )
+        .unwrap();
+        assert!(landed.delete_pull_request_review.is_some());
+        // An answer with nothing in it says nothing about the write.
+        let empty = write_result::<Data>(
+            r#"{"data": {"deletePullRequestReview": {"clientMutationId": null}},
+                "errors": [{"type": "FORBIDDEN", "message": "no"}]}"#,
+        )
+        .unwrap_err();
+        assert_eq!(empty.code, ErrorCode::Rejected);
+        // Done, but the answer can't be read: an error that says the change was made.
+        let odd = write_result::<u32>(
+            r#"{"data": {"deletePullRequestReview": {"pullRequestReview": {"id": "PRR_1"}}}}"#,
+        )
+        .unwrap_err();
+        assert_eq!(odd.code, ErrorCode::GithubError);
+        assert!(
+            odd.message.starts_with("GitHub made the change"),
+            "{}",
+            odd.message
+        );
+        assert_eq!(
+            write_result::<u32>("not json").unwrap_err().code,
+            ErrorCode::GithubError
+        );
     }
 
     #[test]

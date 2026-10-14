@@ -55,6 +55,148 @@ export interface PrTree {
   entries: TreeEntry[]
 }
 
+/** LEFT is the old (base) file, RIGHT the new (head) file. */
+export type DiffSide = 'LEFT' | 'RIGHT'
+
+export interface ReviewAuthor {
+  login: string
+  avatarUrl: string | null
+}
+
+export interface ReviewComment {
+  id: string
+  /** null for a deleted account ("ghost"). */
+  author: ReviewAuthor | null
+  /** Markdown source. */
+  body: string
+  /** GitHub-rendered HTML; only ever displayed through `sanitize.ts`. */
+  bodyHtml: string
+  createdAt: string
+  lastEditedAt: string | null
+  url: string
+  /** PENDING: part of the viewer's unsubmitted review. */
+  state: 'PENDING' | 'SUBMITTED'
+  reviewId: string | null
+  replyTo: string | null
+  isMinimized: boolean
+  minimizedReason: string | null
+  viewerCanUpdate: boolean
+  viewerCanDelete: boolean
+  viewerDidAuthor: boolean
+}
+
+export interface ReviewThread {
+  id: string
+  /** GitHub's path; a LEFT thread of a renamed file may carry the old path. */
+  path: string
+  subjectType: 'LINE' | 'FILE'
+  /** null for file-level threads. */
+  side: DiffSide | null
+  /** Only for multi-line threads (it may differ from `side`). */
+  startSide: DiffSide | null
+  /** Line in the whole file on `side` at the threads' head; null when outdated or file-level. */
+  line: number | null
+  startLine: number | null
+  originalLine: number | null
+  originalStartLine: number | null
+  /** The diff hunk GitHub showed when the thread was started (plain text). */
+  diffHunk: string
+  isResolved: boolean
+  isOutdated: boolean
+  isCollapsed: boolean
+  resolvedBy: string | null
+  viewerCanReply: boolean
+  viewerCanResolve: boolean
+  viewerCanUnresolve: boolean
+  comments: ReviewComment[]
+}
+
+/** The viewer's own unsubmitted review. */
+export interface PendingReview {
+  id: string
+  body: string
+  /** The commit the review was started on; it stays there when the PR moves on. */
+  commit: string | null
+  createdAt: string
+  url: string
+}
+
+/** A review as GitHub submitted it. */
+export interface SubmittedReview {
+  id: string
+  /** `COMMENTED`, `APPROVED` or `CHANGES_REQUESTED`. */
+  state: string
+  url: string
+  /** The summary (Markdown); empty for the review a single comment makes. */
+  body: string
+}
+
+export interface ReviewThreads {
+  /** The head the line numbers refer to (compare it with the head the page shows). */
+  head: string
+  locked: boolean
+  pendingReview: PendingReview | null
+  /** The viewer's latest submitted review: where a submit whose answer was lost shows. */
+  latestReview: SubmittedReview | null
+  threads: ReviewThread[]
+}
+
+/** `single`: post now ("Add single comment"); `review`: add to the viewer's pending review. */
+export type CommentMode = 'single' | 'review'
+
+/** What a new thread is on: the file, or a line or range of lines on one side. */
+export type NewThreadTarget =
+  | { subjectType: 'FILE' }
+  | { subjectType: 'LINE'; side: DiffSide; line: number; startLine?: number; startSide?: DiffSide }
+
+export type NewThreadRequest = NewThreadTarget & {
+  /** The head the lines refer to. */
+  head: string
+  path: string
+  body: string
+  mode: CommentMode
+}
+
+export interface CreatedThread {
+  /** null when the comment was posted but its thread couldn't be read back: read again. */
+  thread: ReviewThread | null
+  pendingReview: PendingReview | null
+  /** A single comment on a file that was added but not submitted (it stays pending): why. */
+  submitError?: string
+}
+
+export interface ReplyRequest {
+  /** The head the page shows: a reply that starts a review starts it there. */
+  head: string
+  body: string
+  mode: CommentMode
+}
+
+export interface Replied {
+  /** null when the reply was posted but GitHub didn't return it: read again. */
+  comment: ReviewComment | null
+  pendingReview: PendingReview | null
+}
+
+export interface DeletedComment {
+  /** null once the thread has no comments left (GitHub drops it). */
+  thread: ReviewThread | null
+  /** GitHub drops a pending review with its last comment. */
+  pendingReview: PendingReview | null
+}
+
+export type ReviewEvent = 'COMMENT' | 'APPROVE' | 'REQUEST_CHANGES'
+
+export interface SubmitRequest {
+  /** The head the page shows: the review is of what the viewer has seen. */
+  head: string
+  /** The pending review shown (it goes out with its comments), or null for a review of just the summary. */
+  reviewId: string | null
+  event: ReviewEvent
+  /** The summary; may be blank when the review has comments, or approves. */
+  body: string
+}
+
 export interface ApiErrorBody {
   error: { code: string; message: string }
 }
@@ -77,8 +219,15 @@ const CODE_MESSAGES: Record<string, string> = {
   git_error: 'Git operation failed',
   bad_request: 'Invalid request',
   stale_head: STALE_HEAD_MESSAGE,
+  rejected: 'GitHub refused the change',
+  pending_review_exists: 'You have a pending review: add the comment to it, or submit or discard the review first',
+  review_changed: 'Your pending review changed on GitHub; refresh to see it',
+  http_413: 'The comment is too long',
   network: "Can't reach the Tideline server",
 }
+
+/** Codes whose fixed text says it all (the server's detail would repeat it). */
+const FIXED_MESSAGES = new Set(['unauthorized', 'stale_head', 'pending_review_exists', 'review_changed', 'http_413'])
 
 export class ApiError extends Error {
   readonly status: number
@@ -87,9 +236,7 @@ export class ApiError extends Error {
 
   constructor(status: number, code: string, detail: string) {
     const base = CODE_MESSAGES[code] ?? `Request failed (HTTP ${status})`
-    // These always show the fixed text; other codes append the server detail.
-    const fixed = code === 'unauthorized' || code === 'stale_head'
-    super(fixed || !detail || detail === base ? base : `${base}: ${detail}`)
+    super(FIXED_MESSAGES.has(code) || !detail || detail === base ? base : `${base}: ${detail}`)
     this.name = 'ApiError'
     this.status = status
     this.code = code
@@ -160,6 +307,104 @@ export async function setViewed(r: RepoRef, n: number, path: string, viewed: boo
     body: JSON.stringify({ path, viewed, head }),
   })
   return ((await res.json()) as { viewed: ViewedState }).viewed
+}
+
+/** Review threads and the viewer's pending review, read fresh from GitHub. */
+export async function getThreads(r: RepoRef, n: number, signal?: AbortSignal): Promise<ReviewThreads> {
+  const res = await request(`${repoBase(r)}/pulls/${n}/threads`, { signal })
+  return (await res.json()) as ReviewThreads
+}
+
+/** Resolves (`resolved`) or unresolves a thread; returns it as GitHub has it afterwards. */
+export async function setThreadResolved(r: RepoRef, n: number, threadId: string, resolved: boolean): Promise<ReviewThread> {
+  const res = await request(`${repoBase(r)}/pulls/${n}/threads/${seg(threadId)}/resolved`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ resolved }),
+  })
+  return (await written<{ thread: ReviewThread }>(res)).thread
+}
+
+/** The answer to a write; one cut short (after the server did the write) is like a lost connection. */
+async function written<T>(res: Response): Promise<T> {
+  try {
+    return (await res.json()) as T
+  } catch (e) {
+    throw new ApiError(0, 'network', errorMessage(e))
+  }
+}
+
+/** Starts a review thread (see `CommentMode`). Never retried: see `findCreated`. */
+export async function createThread(r: RepoRef, n: number, req: NewThreadRequest): Promise<CreatedThread> {
+  const res = await request(`${repoBase(r)}/pulls/${n}/threads`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(req),
+  })
+  return written<CreatedThread>(res)
+}
+
+/** Replies to a thread (see `CommentMode`). Never retried, like `createThread`. */
+export async function replyToThread(r: RepoRef, n: number, threadId: string, req: ReplyRequest): Promise<Replied> {
+  const res = await request(`${repoBase(r)}/pulls/${n}/threads/${seg(threadId)}/replies`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(req),
+  })
+  return written<Replied>(res)
+}
+
+/** Replaces the text of one of the viewer's comments; returns the comment as GitHub has it now. */
+export async function editComment(r: RepoRef, n: number, threadId: string, commentId: string, body: string): Promise<ReviewComment> {
+  const res = await request(`${repoBase(r)}/pulls/${n}/threads/${seg(threadId)}/comments/${seg(commentId)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ body }),
+  })
+  return (await written<{ comment: ReviewComment }>(res)).comment
+}
+
+/** Deletes one of the viewer's comments (one already gone counts as deleted). */
+export async function deleteComment(r: RepoRef, n: number, threadId: string, commentId: string): Promise<DeletedComment> {
+  const res = await request(`${repoBase(r)}/pulls/${n}/threads/${seg(threadId)}/comments/${seg(commentId)}`, { method: 'DELETE' })
+  return written<DeletedComment>(res)
+}
+
+/** Deletes the pending review `reviewId` (the one shown) with all its comments. */
+export async function discardReview(r: RepoRef, n: number, reviewId: string): Promise<void> {
+  await request(`${repoBase(r)}/pulls/${n}/review`, {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ reviewId }),
+  })
+}
+
+/** Submits the pending review shown, or a review of just the summary. Never retried: see `postSubmit`. */
+export async function submitReview(r: RepoRef, n: number, req: SubmitRequest): Promise<SubmittedReview | null> {
+  const res = await request(`${repoBase(r)}/pulls/${n}/review`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(req),
+  })
+  return (await written<{ review: SubmittedReview | null }>(res)).review
+}
+
+/**
+ * Whether a failed write may still have landed on GitHub: the server couldn't be reached, or
+ * GitHub failed or timed out (it may have done the write first). Look before trying again.
+ */
+export function mayHaveLanded(e: unknown): boolean {
+  return e instanceof ApiError && (e.code === 'network' || e.status === 502 || e.status === 504)
+}
+
+/** `text` as GitHub would render it in a comment in the repository (HTML to sanitize). */
+export async function renderMarkdown(r: RepoRef, text: string): Promise<string> {
+  const res = await request(`${repoBase(r)}/markdown`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text }),
+  })
+  return ((await res.json()) as { html: string }).html
 }
 
 /** Raw blob response; the caller decides whether to read the body (see Content-Length checks). */

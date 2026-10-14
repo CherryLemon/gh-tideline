@@ -1,7 +1,7 @@
 # Tideline Design Document
 
 - Status: draft
-- Date: 2026-10-12
+- Date: 2026-10-13
 
 ## 1. Background and goals
 
@@ -26,12 +26,16 @@ The server handles git operations, GitHub API calls and building the symbol inde
 | Milestone | Content |
 |---|---|
 | **M0 read diffs** | After you enter a PR link: changed-files tree; full-file diff (side-by-side / unified); collapsed unchanged regions; syntax highlighting; word-level highlighting; ignore leading/trailing whitespace; F7 jumps to the next change, across files; generated files collapsed by default; side-by-side image comparison |
-| **M1 review context** | Viewed state synced both ways with GitHub; read-only display of existing review threads; view a single commit or a commit range; "what changed since the last review" (handles rebases) |
-| **M2 code navigation** | tree-sitter symbol index; go to definition (Ctrl+B / Ctrl+click); find usages by symbol name (Alt+F7); sticky header showing the current function or class; file outline |
+| **M1 review context** | Viewed state synced both ways with GitHub; the full project tree |
+| **M2 review threads and writing** | Existing review threads in the diff (moved here from M1); comments on lines, line ranges and whole files, as a pending review or a single comment; replies, resolve / unresolve, editing and deleting your own comments; submitting a review (Comment / Approve / Request changes) with a summary; Markdown preview |
+| **M3 code navigation** | tree-sitter symbol index; go to definition (Ctrl+B / Ctrl+click); find usages by symbol name (Alt+F7); sticky header showing the current function or class; file outline; back / forward through visited locations (Ctrl+Alt+← / Ctrl+Alt+→), as in JetBrains |
+| **Later** | View a single commit or a commit range; "what changed since the last review" (handles rebases). Both were planned for M1 |
 
-### Out of scope (during M0–M2)
+Each milestone ships as a minor release: M0 is v0.1.0, M1 v0.2.0, M2 v0.3.0, and M3 is planned as v0.4.0.
 
-- No write operations: inline comments, suggested changes, submitting reviews, approving. Do all of these on the GitHub website.
+### Out of scope (through M3)
+
+- No writes beyond reviews: suggested changes (suggestion blocks), requesting reviewers, conversation comments outside a review, reactions, merging. Do these on the GitHub website.
 - No JetBrains-style curved connector bands. Monaco aligns the two sides by inserting blank lines. We accept that for this phase.
 - No LSP, and no three-way merge view.
 - Only GitHub and GitHub Enterprise; no other platforms. But all GitHub calls live in one module, so adding platforms later won't be too hard.
@@ -63,7 +67,7 @@ gh tideline                                          # opens the home page: rece
 
 ```
 +------------------------------------------------------------------------------+
-| o/r #123  Add foo support   main <- feat/foo  [All commits v] [Split|Unified] |
+| o/r #123  Add foo support   main <- feat/foo   [Split|Unified]  [Review (2)] |
 +----------------------+-------------------------------------------------------+
 | v src/               | src/foo/bar.rs                   change 2/5 [x Viewed]|
 |   v foo/             |  +------------ base ------------+------- head -------+|
@@ -100,13 +104,20 @@ The defaults stay as close to JetBrains as possible, and they are configurable.
 | Shift twice, Ctrl+P | Find a file by name and jump to it |
 | v | Toggle the viewed state of the current file. Marking it as viewed also jumps to the next unviewed file |
 | Ctrl+F | Search in the current file (built into Monaco) |
-| Ctrl+B / Ctrl+click (M2) | Go to definition |
-| Alt+F7 (M2) | Find usages. On Linux, GNOME and KDE grab this key (to move windows), so Ctrl+Alt+F7 is also provided |
+| c (M2) | Comment on the current line, or on the selected lines. A selection that ends at column 1 leaves out its last line |
+| Ctrl+Enter (M2) | In a comment box: its main button (Start a review, Add review comment, Update comment). In the review dialog: Submit review |
+| Esc (M2) | In a comment box: close it, asking first if it holds unsent changes. In the review dialog: close it; the summary is kept |
+| Ctrl+B / Ctrl+click (M3) | Go to definition |
+| Alt+F7 (M3) | Find usages. On Linux, GNOME and KDE grab this key (to move windows), so Ctrl+Alt+F7 is also provided |
+| Ctrl+Alt+← / Ctrl+Alt+→ (M3) | Back / forward through visited locations, like JetBrains' Navigate Back / Forward |
 
 **Notes:**
 - Shortcuts that the browser itself reserves can't be intercepted, such as Ctrl+T, Ctrl+W, Ctrl+N and Ctrl+Shift+N.
   So JetBrains' Ctrl+Shift+N (find file by name) becomes double Shift or Ctrl+P.
-- "Back to the previous location" uses the browser history directly: every jump calls `pushState`, so the browser's back / forward work.
+- **Back and forward (M3):** Ctrl+Alt+← / Ctrl+Alt+→ go back and forward through the locations visited (file and line: files opened, F7 jumps, jumps to a definition).
+  File switches already call `pushState`, so the browser's own Alt+← / Alt+→ go back to the previous file today; M3 adds positions within a file.
+  Some Linux desktops take Ctrl+Alt+← / → to switch workspaces (GNOME does by default), so the browser's keys remain the fallback there.
+- **In comment boxes, keys are text:** the other shortcuts (`v`, `c`, double Shift, F7, Alt+↓) are off there, on the box's buttons and tabs too. Ctrl+P still opens the file finder, and the box keeps its draft. While a dialog is open (the file finder, the review dialog), none of them work.
 
 ## 4. Architecture
 
@@ -116,7 +127,7 @@ The defaults stay as close to JetBrains as possible, and they are configurable.
  gh tideline <pr>  ──start / reuse──▶  local server (Rust, 127.0.0.1:PORT)
                                 ├─ git layer ──── runs git commands ──▶ cache repo (bare + partial + shallow)
                                 ├─ GitHub layer ─ GraphQL / REST ──▶ api.github.com / GHE
-                                ├─ index layer (M2) ─ tree-sitter-tags ──▶ SQLite
+                                ├─ index layer (M3) ─ tree-sitter-tags ──▶ SQLite
                                 └─ HTTP: /api/*, /api/events (SSE), static assets (embedded in the binary)
                                           ▲
  browser single-page app (TS + React) ────┘
@@ -134,7 +145,7 @@ The defaults stay as close to JetBrains as possible, and they are configurable.
 | Embedded frontend | rust-embed | The result is a single binary |
 | Cache directory | directories | Follows the XDG spec |
 | Opening the browser | webbrowser | |
-| Index (M2) | tree-sitter + tree-sitter-tags + per-language grammar crates; stored with rusqlite | tags.scm is exactly what GitHub's "search-based code navigation" uses |
+| Index (M3) | tree-sitter + tree-sitter-tags + per-language grammar crates; stored with rusqlite | tags.scm is exactly what GitHub's "search-based code navigation" uses |
 | Frontend | Vite + React + TS | |
 | Editor | monaco-editor (bundled into the frontend, not loaded from a CDN) + @monaco-editor/react | Built-in side-by-side / unified views, collapsing of unchanged regions, word-level highlighting and view zones. It also lets us register a definition provider |
 | Highlighting | shiki + @shikijs/monaco | Uses TextMate grammars, so highlighting quality matches VS Code and beats Monaco's built-in Monarch |
@@ -154,8 +165,8 @@ src/
   server/        axum routes, security middleware, static assets, SSE
   git/           cache repo management, fetch, diff, cat-file process pool, one lock per repo
   github/        token lookup, GraphQL / REST client, ETag cache
-  pr/            ties git and GitHub together: open a PR, file list, commits, changes since the last review
-  index/  (M2)   symbol extraction with tree-sitter-tags, SQLite, definition and usage lookup
+  pr/            ties git and GitHub together: open a PR, file list, review threads and review writing
+  index/  (M3)   symbol extraction with tree-sitter-tags, SQLite, definition and usage lookup
   config.rs      config file ~/.config/tideline/config.toml
 web/             frontend project; rust-embed embeds its build output
 ```
@@ -167,7 +178,7 @@ $XDG_CACHE_HOME/tideline/
   server.json                          running server: pid, port, version
   repos/<host>/<owner>/<repo>.git      bare repo, partial clone + shallow
   state.sqlite                         local state: recently opened PRs, the head last viewed in this tool for each PR
-  index.sqlite             (M2)        symbol index, keyed by blob OID
+  index.sqlite             (M3)        symbol index, keyed by blob OID
 ```
 
 **Maintaining the cache repos:**
@@ -266,23 +277,68 @@ When the diff computation times out, the result looks bad, so files above the th
 - **Read:** `pullRequest.files(first:100, after:$cursor) { nodes { path viewerViewedState } }`. There are three states: VIEWED, UNVIEWED and DISMISSED.
 - **Write:** `markFileAsViewed(input:{pullRequestId, path})`; to undo, use `unmarkFileAsViewed`. Renamed files use the new path.
 - **The frontend updates the UI first, then sends the request.** If the request fails, it rolls back and shows a toast.
-- **Record the local head:** after the user marks every checkable file (generated files excluded) as viewed in this tool, store the current head SHA in `state.sqlite`. 5.6 uses it as the fallback baseline. Recording the head after marking just one file would be wrong.
+- **Record the local head:** after the user marks every checkable file (generated files excluded) as viewed in this tool, store the current head SHA in `state.sqlite`. 5.7 uses it as the fallback baseline. Recording the head after marking just one file would be wrong.
 
-### 5.4 Review thread display (M1, read-only)
+### 5.4 Review threads (M2)
 
-- **Query:**
-  `reviewThreads(first:100) { nodes { id isResolved isOutdated path subjectType line startLine diffSide comments(first:50) { nodes { author{login} bodyHTML createdAt url } } } }`
-  Both levels, threads and comments, need pagination.
-- **When to show them:** only when viewing the full PR range (merge-base → head).
-  - Threads that are not outdated: insert them as a view zone below the matching line, based on `diffSide` (LEFT is the old file, RIGHT is the new file) and `line`.
-  - Outdated threads and resolved threads: list them in the sidebar, collapsed by default.
-  - File-level comments (`subjectType: FILE`) have no line number. Their `line` is null even when they are not outdated. Show them at the top of the file.
-  - If a commented line falls in a region that `hideUnchangedRegions` has collapsed, its view zone is invisible. These lines must be force-expanded.
-  - The implementation details (where LEFT threads go in unified mode, keeping cards from scrolling horizontally with the code, the order of forced expansion) were settled by the S8 spike results.
+- **Query:** `reviewThreads(first:100)`: each thread's `path subjectType diffSide startDiffSide line startLine originalLine originalStartLine isResolved isOutdated isCollapsed` and the viewer's permissions,
+  with `comments(first:100) { author bodyHTML state pullRequestReview{id} replyTo ... }`. Both levels are paged; a thread with more comments gets a follow-up `node(id)` query.
+  The same read returns the viewer's pending review (`reviews(states:[PENDING], first:5)`, keeping the one with `viewerDidAuthor`) and their latest submitted review (`viewerLatestReview`).
+- **Normalizing (S14):** single-line threads come back with `startLine == line` and `startDiffSide: null` (no range). FILE threads come back with `line: 1, diffSide: RIGHT` (ignored).
+  Right after a pending review is deleted, a thread can still be listed with zero comments: those are dropped.
+- **Where they show:**
+  - Threads that are not outdated: a card in a view zone below their line, on their side (LEFT is the old file, RIGHT is the new file).
+    In unified mode the original side takes no zones (S8), so a LEFT thread goes below its line's counterpart in the new file; on a removed line, after the lines that change adds (or above the removed lines when it adds none).
+  - Lines inside regions that `hideUnchangedRegions` collapsed are expanded first, so their cards show.
+  - File-level threads (`subjectType: FILE`, `line` null), outdated threads (with their `diffHunk`) and threads that can't be placed (with the reason) go in a panel above the editor.
+  - Resolved threads stay in place, collapsed. The viewer's pending comments carry a "Pending" chip.
+  - When the threads were read at another head than the one shown, line threads go to the panel too, with a Refresh button.
+  - The file tree shows each file's number of unresolved threads in the accent color, or its thread count in grey once all are resolved.
 - **Line numbers can be used directly.** GitHub's `line` is the line number in the whole file. It matches our full-file models, so no conversion is needed.
-- **Security:** `bodyHTML` is already rendered by GitHub, but we still sanitize it with DOMPurify.
+- **Security:** `bodyHTML` is already rendered by GitHub, but we still sanitize it (see section 8).
 
-### 5.5 Viewing by commit or range (M1)
+### 5.5 Writing reviews (M2)
+
+**The model is github.com's.** Comments wait in the viewer's pending review ("Start a review", then "Add review comment") until the review is submitted. "Add single comment" posts one at once.
+GitHub allows one pending review per user and PR, and no single comment while it exists (S13), so a box only offers what GitHub takes.
+Drafts live on GitHub, not in Tideline: a review started here can be finished on github.com, and the other way round.
+
+**Comment boxes:**
+- On lines: the "+" in the gutter (drag it for a range), or `c` on the current line or selection. Ranges stay on one side. Old lines take comments in split view only.
+  GitHub takes lines within 3 lines of a change (S12). Monaco's diff can differ from git's, so GitHub has the final word, and its refusal is shown.
+- On a whole file: "Comment on file" in the file header, for every changed file whatever its kind (binary, renamed, deleted).
+- In the thread cards: reply, resolve / unresolve, and edit or delete your own comments (delete asks first).
+- Write / Preview tabs. GitHub renders the preview (REST `POST /markdown`, `gfm` with the repo as context, so `#123` and `@user` link as they will), and it is sanitized like a comment body.
+  Renders are cached per text; a failed one isn't, so asking again retries.
+- The text of open boxes is kept in `sessionStorage` until it is sent, so it survives a reload or a file switch.
+  Each box remembers the head it was started on; a line box from an older head asks to confirm its lines before sending.
+- Cards and boxes live in view zones, each in an overlay widget that keeps its React state and focus across diff recomputes.
+  Key, input, composition and clipboard events stop at the card (S16), so typing never reaches Monaco.
+
+**Writes, on the server:**
+- Creating a thread or a reply, submitting and discarding start with a fresh read of the review state: the PR id, its head, the viewer's pending review. Nothing is cached.
+  Deleting reads it after the call, to return what is left; resolving and editing are single calls.
+- **Head checks (409 `stale_head`):** the comment, reply or review must name the head the page shows
+  - always for a comment on lines: GitHub anchors new threads to its current head (S13), so line numbers from an older head would land on the wrong lines;
+  - for any other comment or reply, unless it goes into an existing pending review (a single comment is a review of its own);
+  - for submitting, so a review never approves commits the reviewer hasn't seen.
+
+  Resolving, editing, deleting and discarding don't check the head.
+- 409 `pending_review_exists`: a single comment or reply while a pending review exists. 409 `review_changed`: the pending review on GitHub isn't the one the page shows.
+- 422 `rejected`: GitHub refused the write (`UNPROCESSABLE` or `FORBIDDEN`, or a `null` thread for a line outside the diff, S12). Its message is shown as text.
+- Review writes to one PR (creating, replying, submitting, discarding, deleting) run one at a time, from reading the state to the last call,
+  so two writes can't both start a review, or add to one the other is submitting.
+- Those writes also run to their end even if the browser goes away midway (a reload while sending).
+- **Creates are never retried automatically.** After an answer that may hide a landed write (network error, 502, 504), the client reads the threads again
+  and looks for its comment (written by the viewer, same text) or its review before it offers to send again.
+
+**Submitting (the topbar's "Review (N)" opens a dialog):**
+- A summary (kept with the drafts) and Comment, Approve or Request changes. GitHub refuses the last two on your own PR, so there the dialog offers only Comment.
+- A review with neither comments nor a summary needs a summary, unless it approves.
+- The dialog warns when the pending review was started on an older commit (its comments stay on that version's lines), and discards the pending review after asking.
+- A submit refused for new commits (409 `stale_head`) says so; refreshing loads them and closes the dialog, which says why: look at them before submitting. The summary is kept.
+
+### 5.6 Viewing by commit or range (later)
 
 - **Getting the commit list:** GraphQL `commits(first:100) { nodes { commit { oid messageHeadline authoredDate author{name} parents(first:2){nodes{oid}} } } }`.
   GitHub's REST list of PR commits returns at most 250 entries. Whether GraphQL `commits` has the same limit must be tested (see S7).
@@ -293,7 +349,7 @@ When the diff computation times out, the result looks bad, so files above the th
   - Range [A..B]: A's parent → B.
   - The state lives in the URL: `?from=<sha>&to=<sha>`.
 
-### 5.6 What changed since the last review (M1)
+### 5.7 What changed since the last review (later)
 
 **This is the key feature that sets us apart from the GitHub website.**
 
@@ -322,7 +378,7 @@ When the diff computation times out, the result looks bad, so files above the th
 
 **4. UI:** add an entry "Since your last review (abc1234)" to the commit selector.
 
-### 5.7 Symbol index and code navigation (M2)
+### 5.8 Symbol index and code navigation (M3)
 
 **When to build the index:** when the user first requests go to definition, or after the user turns on "Build index automatically" in settings. The index builds in the background, and the server pushes progress to the frontend over SSE.
 
@@ -363,17 +419,28 @@ All endpoints start with `/api/{host}/{owner}/{repo}`. The table below omits thi
 | Method | Path | Description | Milestone |
 |---|---|---|---|
 | GET | `/pulls/{n}` | PR info: title, author, state, base and head, merge-base, node id | M0 |
-| GET | `/pulls/{n}/files?from=&to=` | File list, with the `ChangedFile` shape below. Without parameters, it covers the full PR range | M0 |
+| GET | `/pulls/{n}/files` | File list, with the `ChangedFile` shape below, over the full PR range. `from` / `to` for a commit or a range come later | M0 |
 | GET | `/blobs/{oid}` | Raw file bytes, with `Cache-Control: immutable` | M0 |
-| GET | `/pulls/{n}/commits` | Commit list | M1 |
-| GET | `/pulls/{n}/threads` | Review threads | M1 |
+| GET | `/pulls/{n}/commits` | Commit list | later |
 | PUT | `/pulls/{n}/viewed` | Request body `{path, viewed, head}`. Returns 409 `stale_head` when `head` is not the current head | M1 |
-| GET | `/pulls/{n}/since-review` | Returns `{from, to, mode: direct \| rebased \| fallback, baseline}` | M1 |
+| GET | `/pulls/{n}/since-review` | Returns `{from, to, mode: direct \| rebased \| fallback, baseline}` | later |
 | GET | `/pulls/{n}/tree?head=` | Every file at the head, `{head, entries: [{path, mode, oid}]}`, for the full project tree. Listed locally with `git ls-tree` (trees are in the blob:none clone) and cached per snapshot; its OIDs become fetchable through `/blobs`. With `head`, a cached snapshot of that head is used however old; if the server has moved on, the response carries the newer `head` and no entries | M1 |
-| GET | `/revs/{sha}/symbols?path=` | Symbols of one file | M2 |
-| GET | `/revs/{sha}/definitions?name=&lang=` | Find definitions | M2 |
-| GET | `/revs/{sha}/references?name=&lang=` | Find usages | M2 |
+| GET | `/pulls/{n}/threads` | `{head, locked, pendingReview, latestReview, threads}`: review threads, the viewer's pending review and latest submitted review, read fresh from GitHub | M2 |
+| POST | `/pulls/{n}/threads` | `{head, path, body, mode: single \| review, subjectType: LINE \| FILE, side?, line?, startSide?, startLine?}`: a new thread, posted at once or added to the pending review (started if needed) | M2 |
+| POST | `/pulls/{n}/threads/{t}/replies` | `{head, body, mode}`: a reply | M2 |
+| PUT | `/pulls/{n}/threads/{t}/resolved` | `{resolved}`: resolve or unresolve | M2 |
+| PATCH / DELETE | `/pulls/{n}/threads/{t}/comments/{c}` | Edit (`{body}`) or delete one of your comments | M2 |
+| POST | `/pulls/{n}/review` | `{head, reviewId, event: COMMENT \| APPROVE \| REQUEST_CHANGES, body}`: submit the pending review `reviewId`, or (null) a review of just the summary | M2 |
+| DELETE | `/pulls/{n}/review` | `{reviewId}`: discard the pending review | M2 |
+| POST | `/markdown` | `{text}` → `{html}`: the text as GitHub renders a comment in the repo, for previews | M2 |
+| GET | `/revs/{sha}/symbols?path=` | Symbols of one file | M3 |
+| GET | `/revs/{sha}/definitions?name=&lang=` | Find definitions | M3 |
+| GET | `/revs/{sha}/references?name=&lang=` | Find usages | M3 |
 | GET | `/api/events` | SSE push: fetch progress, index progress, file list completion | M0 |
+
+Errors are `{"error": {"code", "message"}}`. For writes: 400 `bad_request`; 404 `not_found` (the thread or comment is gone); 409 `stale_head`, `pending_review_exists` or `review_changed`;
+422 `rejected` (GitHub refused, with its message); 502 `github_error` (the write may or may not have landed: the client looks before sending again).
+A request body over 512 KiB gets a plain-text 413.
 
 ```ts
 interface ChangedFile {
@@ -396,7 +463,7 @@ interface ChangedFile {
 
 **Routes:**
 - `/`: recently viewed PRs, plus an input box.
-- `/{host}/{owner}/{repo}/pull/{n}?file=&from=&to=`: view a PR.
+- `/{host}/{owner}/{repo}/pull/{n}?file=`: view a PR (`&from=&to=` later, with the commit and range views).
 
 **DiffEditor options:**
 
@@ -427,7 +494,7 @@ interface ChangedFile {
 
 ## 8. Security
 
-The local server holds a GitHub token and has a write endpoint (marking files as viewed). So it must stop other web pages from reaching it through the user's browser.
+The local server holds a GitHub token and has write endpoints: viewed marks and, from M2 on, review comments and reviews. So it must stop other web pages from reaching it through the user's browser.
 
 - **Listen only on 127.0.0.1.**
 - **The host in the path must be on the allowlist (the most important rule):**
@@ -457,7 +524,22 @@ The local server holds a GitHub token and has a write endpoint (marking files as
   - `Content-Security-Policy: sandbox`
 
   Otherwise, when someone opens a malicious SVG from a PR directly, it runs script on this server's origin and then calls the write endpoint as a same-origin caller.
-- **Sanitize comment `bodyHTML` with DOMPurify before displaying it.**
+- **GitHub-rendered HTML (comment bodies and previews) goes through a dedicated DOMPurify instance** before it reaches the page:
+  - no `style` (tag or attribute), forms, iframes or form controls; `id` and `name` are dropped (DOM clobbering);
+  - only absolute `https:` URLs; links open in a new tab with `rel="noopener noreferrer"`; task-list checkboxes are disabled.
+
+  This is the only place the app sets `innerHTML`.
+- **The app page has a Content-Security-Policy and `Referrer-Policy: no-referrer`**, so a sanitizer miss still can't run script, post a form or load code from elsewhere, and links and images don't leak the local URL:
+
+  `default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; font-src 'self' data:; worker-src 'self' blob:; connect-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'`
+
+  Monaco needs inline styles and same-origin (or `blob:`) workers; comment images come from GitHub's https hosts.
+- **Review writes:**
+  - node ids must match `[A-Za-z0-9_=+/-]{1,128}` and only ever reach GitHub as GraphQL variables;
+  - a comment's path must be in the PR's file list;
+  - bodies are capped at 65536 characters, request bodies at 512 KiB.
+
+  Ids aren't checked for ownership: the token is the user's own, so a write can do no more than the user can on github.com, and the checks above already keep other pages out.
 - **When no token is available:** fail with an error and tell the user to run `gh auth login`.
 
 ## 9. Performance targets
@@ -489,10 +571,15 @@ During review, the following points were already tested on the cli/cli repo:
 | S3 | With a single Monaco instance and a model LRU, how much memory does a 1000-file PR take and how long does switching files take; how well does `hideUnchangedRegions` work | Build a prototype page and measure | Tune the LRU size, or switch to the CodeMirror 6 merge view |
 | S4 | Confirmed: it works, with a single batched prefetch. No further checks needed | — | — |
 | S5 | For a 3000-file PR, how much rate limit does GraphQL pagination (30 pages) consume | Read the rateLimit field in the responses | Use conditional requests with ETags, and cache the results |
-| S6 (M2) | Does sticky scroll in DiffEditor use our custom DocumentSymbolProvider | Build a prototype and test | Draw our own bar at the top that shows the function or class name |
+| S6 (M3) | Does sticky scroll in DiffEditor use our custom DocumentSymbolProvider | Build a prototype and test | Draw our own bar at the top that shows the function or class name |
 | S7 | Confirmed (M1 phase 0): GraphQL, like REST, returns at most 250 commits, namely the latest 250 that end at head. `totalCount` is the real total | — | Show a notice in the UI when the limit is exceeded |
 | S8 | Confirmed (M1 phase 0, Monaco 0.57): view zones align on both sides automatically; only `setSelections` on the new-file editor reliably expands collapsed regions; in unified mode, zones can't be placed on the original-file side; cards stay put when the code scrolls horizontally only if they use a view zone plus an overlay widget; the production build works under the CSP response header | — | Approaches already in place |
-| S10 | Confirmed (M1 phase 0): gh's OAuth token (`repo` scope) can call `markFileAsViewed` / `unmarkFileAsViewed`. A path that is not in the PR returns `UNPROCESSABLE`. After a push, viewed files that the push changed become DISMISSED. Fine-grained PATs are untested | — | Map permission errors to `github_error`; the UI rolls back and shows a toast |
+| S10 | Confirmed (M1 phase 0): gh's OAuth token (`repo` scope) can call `markFileAsViewed` / `unmarkFileAsViewed`. A path that is not in the PR returns `UNPROCESSABLE`. After a push, viewed files that the push changed become DISMISSED. Fine-grained PATs are untested | — | Writes GitHub refuses (`UNPROCESSABLE`, `FORBIDDEN`) become 422 `rejected` with GitHub's message (M2); the UI rolls back and shows it |
+| S12 | Confirmed (M2 phase 0): `addPullRequestReviewThread` takes lines within 3 lines of a change on their side (git's default context; every line of an added file, the old lines of a deleted one), and ranges across hunks. A file-level comment works on any file, pure renames included. Anything else returns `thread: null` without an error | — | A null thread is a 422 `rejected` |
+| S13 | Confirmed (M2 phase 0): one pending review per user and PR. While it exists, no single comment can be posted, and new threads and replies go into it. Without one, a reply posts at once. New threads anchor to the current head, even when the pending review sits on an older commit | — | Head checks on line comments; the dialog warns about an older pending review |
+| S14 | Confirmed (M2 phase 0): the viewer's pending comments are in `reviewThreads` with `state: PENDING`; `reviews(states:[PENDING], first:1)` returns the viewer's pending review | — | The app reads 5 and keeps the one with `viewerDidAuthor` |
+| S15 | Confirmed (M2 phase 0): approving or requesting changes on your own PR fails with `UNPROCESSABLE` and keeps the pending review. Closed PRs still take reviews and replies | — | — |
+| S16 | Confirmed (M2): a textarea in an overlay widget over a view zone takes typing, IME and paste, as long as key, input, composition and clipboard events stop at the card | — | — |
 
 ## 11. Open questions
 
@@ -500,4 +587,4 @@ During review, the following points were already tested on the cli/cli repo:
 - **Default port:** browser extensions and bookmarks need a fixed port. Tentatively a fixed, configurable port, such as 7457.
 - **How the server runs:** exit automatically after N idle minutes, or run all the time as a systemd user service? The former costs less. The latter keeps the browser extension usable at any time.
 - **Cache eviction:** provide a `gh tideline gc` command that evicts the least recently used entries based on cache size. But "the head at the last review" must be kept.
-- **Curved connector bands:** after M2, should we draw our own layer on top of Monaco to get JetBrains-style curved connector bands?
+- **Curved connector bands:** after M3, should we draw our own layer on top of Monaco to get JetBrains-style curved connector bands?

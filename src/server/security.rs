@@ -498,7 +498,11 @@ mod tests {
             ("origin", "http://localhost:7457"),
             ("x-dr", "1"),
         ]);
-        assert_eq!(decide(&Method::PUT, API, &ok, &p), Decision::Allow);
+        // Every write method of the API (viewed marks, threads, comments, the review).
+        let writes = [Method::PUT, Method::POST, Method::PATCH, Method::DELETE];
+        for m in &writes {
+            assert_eq!(decide(m, API, &ok, &p), Decision::Allow, "{m}");
+        }
         for origin in [
             "http://evil.com",
             "https://localhost:7457",
@@ -523,15 +527,19 @@ mod tests {
             ("origin", "http://localhost:7457"),
             ("sec-fetch-site", "same-origin"),
         ]);
-        assert_eq!(
-            code(decide(&Method::PUT, API, &no_xdr, &p)),
-            Some(ErrorCode::Unauthorized)
-        );
         let no_origin = headers(&[("host", "localhost:7457"), ("cookie", &c), ("x-dr", "1")]);
-        assert_eq!(
-            code(decide(&Method::POST, API, &no_origin, &p)),
-            Some(ErrorCode::Unauthorized)
-        );
+        for m in &writes {
+            assert_eq!(
+                code(decide(m, API, &no_xdr, &p)),
+                Some(ErrorCode::Unauthorized),
+                "{m} without X-DR"
+            );
+            assert_eq!(
+                code(decide(m, API, &no_origin, &p)),
+                Some(ErrorCode::Unauthorized),
+                "{m} without Origin"
+            );
+        }
         // CORS preflights from other origins are rejected as well.
         let preflight = headers(&[("host", "localhost:7457"), ("origin", "http://evil.com")]);
         assert_eq!(

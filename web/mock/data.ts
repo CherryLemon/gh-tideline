@@ -490,6 +490,15 @@ function buildFiles(): MockChangedFile[] {
 
 export const files: MockChangedFile[] = buildFiles()
 
+/** Lines of a changed file on one side (LEFT = old, RIGHT = new), for review-thread fixtures. */
+export function fileLines(path: string, side: 'LEFT' | 'RIGHT'): string[] {
+  const f = files.find((f) => f.path === path)
+  const oid = f && (side === 'LEFT' ? f.oldOid : f.newOid)
+  const blob = oid ? blobs.get(oid) : undefined
+  if (!blob) throw new Error(`mock: no ${side} text for ${path}`)
+  return blob.toString('utf8').split('\n')
+}
+
 export interface MockTreeEntry {
   path: string
   mode: string
@@ -564,6 +573,14 @@ export function filesWithViewed(): MockChangedFile[] {
   })
 }
 
+const HEAD = 'b'.repeat(40)
+let head = HEAD
+
+/** Test hook: new commits on the pull request (`null`: back to the fixtures' head). */
+export function setHead(sha: string | null): void {
+  head = sha ?? HEAD
+}
+
 export function prSummary(host: string, owner: string, repo: string, n: number): MockPr {
   return {
     host,
@@ -571,11 +588,12 @@ export function prSummary(host: string, owner: string, repo: string, n: number):
     repo,
     number: n,
     title: 'Add slug redirects, idle timeout and renamed Button component',
-    author: 'octocat',
+    // PR 43 is the viewer's own: GitHub refuses approving it or requesting changes on it.
+    author: n === 43 ? 'mock-reviewer' : 'octocat',
     state: 'OPEN',
     url: `https://${host}/${owner}/${repo}/pull/${n}`,
     base: { ref: 'main', sha: 'a'.repeat(40) },
-    head: { ref: 'feat/slug-redirects', sha: 'b'.repeat(40) },
+    head: { ref: 'feat/slug-redirects', sha: head },
     mergeBase: 'c'.repeat(40),
     nodeId: 'PR_kwDOMOCK',
     viewer: 'mock-reviewer',

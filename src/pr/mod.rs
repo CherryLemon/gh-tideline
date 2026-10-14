@@ -1,5 +1,6 @@
 //! Opening a PR: GitHub metadata + cache-repo fetch + diff, with a short in-memory cache.
 
+pub mod review;
 pub mod target;
 
 use std::collections::HashMap;
@@ -113,6 +114,14 @@ fn check_viewed_request(
             "the pull request has new commits; refresh before marking files as viewed",
         ));
     }
+    check_github_path(data, path)
+}
+
+/// Rejects a path GitHub does not list for the PR (400): ours only (our rename detection may
+/// differ), made up, or the old path of a renamed file (GitHub lists the new one; it takes
+/// comments on the old one too, but files them there with lines that make no sense, spike
+/// S12).
+fn check_github_path(data: &PrData, path: &str) -> Result<(), AppError> {
     if !data
         .viewed
         .lock()
@@ -144,6 +153,8 @@ pub struct PrService {
     cache: Mutex<HashMap<PrKey, CacheSlot>>,
     /// Detached work after a response (see [`PrService::set_viewed`]), awaited on shutdown.
     bookkeeping: Mutex<tokio::task::JoinSet<()>>,
+    /// One review write at a time per PR (see `PrService::review_write`).
+    review_writes: Mutex<HashMap<PrKey, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 fn git_err(e: GitFailure) -> AppError {
@@ -159,6 +170,7 @@ impl PrService {
             state,
             cache: Default::default(),
             bookkeeping: Default::default(),
+            review_writes: Default::default(),
         }
     }
 
@@ -339,16 +351,7 @@ impl PrService {
                 "the pull request has new commits; refresh before marking files as viewed",
             ));
         }
-        // Any snapshot of this head will do, past its TTL too: only its file list and node id
-        // are needed, and GitHub itself rejects a path that is no longer part of the PR.
-        // Without one, load this head (a merely recent snapshot may still have another).
-        let data = match self.cached(key).await {
-            Some(data) if data.summary.head.sha == current => data,
-            _ => {
-                self.open(&key.host, &key.owner, &key.repo, key.number, true)
-                    .await?
-            }
-        };
+        let data = self.snapshot_for_write(key, &current).await?;
         check_viewed_request(&data, path, head, &current)?;
         self.github
             .set_viewed(&key.host, &token, &data.summary.node_id, path, viewed)
@@ -434,6 +437,24 @@ impl PrService {
             .map_err(|e| e.to_string())?;
         drop(guard);
         db.set_seen_head(key, head, crate::clock::unix_now()).await
+    }
+
+    /// A snapshot of `head` (GitHub's current one) to check a write against. Any snapshot of
+    /// it will do, past its TTL too: only its file list and node id are needed, and GitHub
+    /// itself rejects a path that is no longer part of the PR. Without one, load the PR afresh
+    /// (a merely recent snapshot may still have another head); that may return a newer head.
+    async fn snapshot_for_write(
+        self: &Arc<Self>,
+        key: &PrKey,
+        head: &str,
+    ) -> Result<Arc<PrData>, AppError> {
+        match self.cached(key).await {
+            Some(data) if data.summary.head.sha == head => Ok(data),
+            _ => {
+                self.open(&key.host, &key.owner, &key.repo, key.number, true)
+                    .await
+            }
+        }
     }
 
     /// The snapshot of `head`: a cached one however old (the listing of a head never

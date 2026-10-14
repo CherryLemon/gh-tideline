@@ -142,11 +142,14 @@ const NON_TEXT_INPUTS = new Set(['checkbox', 'radio', 'button', 'submit', 'reset
 /**
  * Whether a key event target is a text field, so single-key shortcuts must not fire. The
  * Monaco editor's own input (a textarea or an EditContext element) does not count, but its
- * find/replace boxes (inside `.monaco-inputbox`) do.
+ * find/replace boxes (inside `.monaco-inputbox`) and the fields of review cards in it
+ * (`.tl-zone`) do. So does all of a comment box (`.composer`): its Write and Preview tabs,
+ * its preview, its buttons.
  */
 export function isTypingTarget(target: EventTarget | null): boolean {
   if (!(target instanceof Element)) return false
-  if (target.closest('.monaco-editor') && !target.closest('.monaco-inputbox')) return false
+  if (target.closest('.composer')) return true
+  if (target.closest('.monaco-editor') && !target.closest('.monaco-inputbox, .tl-zone')) return false
   if (target instanceof HTMLElement && target.isContentEditable) return true
   if (target instanceof HTMLInputElement) return !NON_TEXT_INPUTS.has(target.type)
   return target.matches('textarea, select')

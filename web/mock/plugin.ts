@@ -32,6 +32,7 @@ export function mockApi(): Plugin {
     apply: 'serve',
     async configureServer(server) {
       const data = await import('./data.ts')
+      const review = await import('./review.ts')
       server.config.logger.info(`  [mock] serving fake PR with ${data.files.length} files at /github.com/acme/demo-app/pull/42`)
 
       server.middlewares.use((req: IncomingMessage, res: ServerResponse, next: () => void) => {
@@ -46,6 +47,33 @@ export function mockApi(): Plugin {
         if (!url.pathname.startsWith('/api/')) return next()
 
         if (url.pathname === '/api/health') return json(res, 200, { app: 'tideline', version: '0.1.0-mock' })
+        // Test hook: the review state (and the head) back to the fixtures (`{"pending": false}`: no
+        // pending review; `{"staleReview": true}`: the pending review on a commit before the head).
+        if (url.pathname === '/api/__mock/reset' && req.method === 'POST') {
+          void readJson(req).then((body) => {
+            const o = body as { pending?: unknown; staleReview?: unknown } | null
+            data.setHead(null)
+            review.resetReview({ pending: o?.pending !== false, staleReview: o?.staleReview === true })
+            json(res, 200, { ok: true })
+          })
+          return
+        }
+        // Test hook: new commits (the same files) on the pull request.
+        if (url.pathname === '/api/__mock/push' && req.method === 'POST') {
+          data.setHead('e'.repeat(40))
+          return json(res, 200, { ok: true })
+        }
+        if (url.pathname === '/api/__mock/fail-next' && req.method === 'POST') {
+          void readJson(req).then((body) => {
+            const { status = 502, after = false } = (body ?? {}) as { status?: unknown; after?: unknown }
+            if (typeof status !== 'number' || !Number.isInteger(status) || typeof after !== 'boolean') {
+              return error(res, 400, 'bad_request', 'expected {status, after?}')
+            }
+            review.failNextWrite(status, after)
+            json(res, 200, { ok: true })
+          })
+          return
+        }
         if (req.headers['x-dr'] !== '1' && req.headers['sec-fetch-site'] !== 'same-origin') {
           return error(res, 401, 'unauthorized', 'missing X-DR header')
         }
@@ -71,6 +99,51 @@ export function mockApi(): Plugin {
               const asked = url.searchParams.get('head')
               return json(res, 200, { head: pr.head.sha, entries: asked && asked !== pr.head.sha ? [] : data.tree })
             }
+            if (sub === 'threads' && parts.length === 6 && req.method === 'GET') {
+              await delay(250)
+              return json(res, 200, review.threadsResponse(pr.head.sha))
+            }
+            if (sub === 'threads' && parts.length === 6 && req.method === 'POST') {
+              const body = await readJson(req)
+              await delay(500)
+              const r = review.createThread(pr.head.sha, (p) => data.viewed.has(p), body)
+              return json(res, r.status, r.body)
+            }
+            if (sub === 'threads' && parts.length >= 7) {
+              const [threadId, part, commentId] = parts.slice(6)
+              const ok = (v: string | undefined) => v !== undefined && /^[A-Za-z0-9_=+/-]{1,128}$/.test(v)
+              if (!ok(threadId) || (part === 'comments' && !ok(commentId))) return error(res, 400, 'bad_request', 'invalid id')
+              let r: { status: number; body: unknown } | null = null
+              if (part === 'replies' && parts.length === 8 && req.method === 'POST') {
+                const body = await readJson(req)
+                await delay(500)
+                r = review.reply(pr.head.sha, threadId, body)
+              } else if (part === 'resolved' && parts.length === 8 && req.method === 'PUT') {
+                const body = await readJson(req)
+                await delay(400)
+                r = review.setResolved(pr.head.sha, threadId, body)
+              } else if (part === 'comments' && parts.length === 9 && req.method === 'PATCH') {
+                const body = await readJson(req)
+                await delay(400)
+                r = review.editComment(pr.head.sha, commentId, body)
+              } else if (part === 'comments' && parts.length === 9 && req.method === 'DELETE') {
+                await delay(400)
+                r = review.deleteComment(pr.head.sha, threadId, commentId)
+              }
+              if (r) return json(res, r.status, r.body)
+            }
+            if (sub === 'review' && parts.length === 6 && req.method === 'POST') {
+              const body = await readJson(req)
+              await delay(600)
+              const r = review.submitReview(pr.head.sha, pr.author === pr.viewer, body)
+              return json(res, r.status, r.body)
+            }
+            if (sub === 'review' && parts.length === 6 && req.method === 'DELETE') {
+              const body = await readJson(req)
+              await delay(400)
+              const r = review.discardReview(pr.head.sha, body)
+              return json(res, r.status, r.body)
+            }
             if (sub === 'viewed' && req.method === 'PUT') {
               const body = (await readJson(req)) as { path?: unknown; viewed?: unknown; head?: unknown } | null
               if (!body || typeof body.path !== 'string' || typeof body.viewed !== 'boolean' || typeof body.head !== 'string') {
@@ -86,6 +159,12 @@ export function mockApi(): Plugin {
               data.viewed.set(body.path, state)
               return json(res, 200, { path: body.path, viewed: state })
             }
+          }
+          if (kind === 'markdown' && parts.length === 4 && req.method === 'POST') {
+            const body = await readJson(req)
+            await delay(300)
+            const r = review.renderPreview(body)
+            return json(res, r.status, r.body)
           }
           if (kind === 'blobs' && id && sub === undefined) {
             if (!/^[0-9a-f]{40}$/.test(id)) return error(res, 400, 'bad_request', 'invalid oid')
