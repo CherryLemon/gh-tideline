@@ -232,12 +232,31 @@ mod tests {
             path: &str,
             body: Option<&str>,
         ) -> (u16, HeaderMap, Value) {
+            let origin = format!("http://127.0.0.1:{}", self.port);
+            self.send_with(
+                method,
+                path,
+                body,
+                &[("origin", origin.as_str()), ("x-dr", "1")],
+            )
+            .await
+        }
+
+        /// Sends a request with the cookie of the browser that is logged in, and just the headers given besides.
+        async fn send_with(
+            &self,
+            method: Method,
+            path: &str,
+            body: Option<&str>,
+            headers: &[(&str, &str)],
+        ) -> (u16, HeaderMap, Value) {
             let mut request = self
                 .client
                 .request(method, format!("http://127.0.0.1:{}{path}", self.port))
-                .header("cookie", &self.cookie)
-                .header("origin", format!("http://127.0.0.1:{}", self.port))
-                .header("x-dr", "1");
+                .header("cookie", &self.cookie);
+            for (name, value) in headers {
+                request = request.header(*name, *value);
+            }
             if let Some(body) = body {
                 request = request.body(body.to_string());
             }
@@ -572,6 +591,48 @@ mod tests {
         // None of it started anything.
         let (_, _, body) = server.get(&format!("{INDEX}{query}")).await;
         assert_eq!(body, idle(&head, "missing"));
+    }
+
+    #[tokio::test]
+    async fn starting_and_cancelling_a_build_need_the_origin_and_x_dr_of_the_page() {
+        let p = Pull::new("srv-index-origin").await;
+        let server = TestServer::start(p.service.clone()).await;
+        let head = p.clone.head.clone();
+        let query = format!("{INDEX}?head={head}&side=head");
+        let start = json!({ "head": head, "side": "head" }).to_string();
+        let origin = format!("http://127.0.0.1:{}", server.port);
+
+        // The cookie is there, but these requests lack the origin of the page or its `X-DR`, or have others.
+        let not_the_page: [&[(&str, &str)]; 5] = [
+            &[],
+            &[("origin", origin.as_str())],
+            &[("x-dr", "1")],
+            &[("origin", "http://evil.example"), ("x-dr", "1")],
+            &[("origin", origin.as_str()), ("x-dr", "0")],
+        ];
+        for headers in not_the_page {
+            let answers = [
+                server
+                    .send_with(Method::POST, INDEX, Some(&start), headers)
+                    .await,
+                server
+                    .send_with(Method::DELETE, &query, None, headers)
+                    .await,
+            ];
+            for (status, _, answer) in answers {
+                assert_eq!(
+                    (status, error_code(&answer)),
+                    (401, "unauthorized"),
+                    "{headers:?}"
+                );
+            }
+        }
+        // None of it started a build, and the page's own request, which differs only in those headers, does.
+        let (_, _, body) = server.get(&query).await;
+        assert_eq!(body, idle(&head, "missing"));
+        let (status, _, body) = server.post(INDEX, &start).await;
+        assert_eq!((status, &body), (200, &idle(&head, "queued")));
+        server.until(&query, ended).await;
     }
 
     #[tokio::test]

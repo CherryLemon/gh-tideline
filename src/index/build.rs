@@ -81,6 +81,9 @@ fn join_failed(e: JoinError) -> Stop {
 /// The path, blob and grammar of every file a commit lists.
 type Listing = Vec<(String, String, Grammar)>;
 
+/// The grammars the index stores each blob under, with how it went with each (see `IndexDb::stored_blobs`).
+type Stored = HashMap<String, Vec<(Grammar, BlobStatus)>>;
+
 /// A blob the index lacks, with the source paths that hold it.
 #[derive(Debug, PartialEq, Eq)]
 struct Pending {
@@ -91,14 +94,15 @@ struct Pending {
 }
 
 /// The files of the tree that the index covers: regular files of a language it knows, outside the paths it leaves out.
-fn select_files(entries: Vec<TreeEntry>, max_files: usize) -> Result<Vec<TreeEntry>, Stop> {
+fn select_files(entries: &[TreeEntry], max_files: usize) -> Result<Vec<TreeEntry>, Stop> {
     let files: Vec<TreeEntry> = entries
-        .into_iter()
+        .iter()
         .filter(|entry| {
             FILE_MODES.contains(&entry.mode.as_str())
                 && Family::for_path(&entry.path).is_some()
                 && !skipped_path(&entry.path)
         })
+        .cloned()
         .collect();
     if files.len() > max_files {
         return Err(Stop::Failed(format!(
@@ -148,6 +152,46 @@ fn settle(files: &[TreeEntry], stored: &HashMap<String, Vec<Grammar>>) -> (Listi
         pending[i].paths.push(file.path.clone());
     }
     (listing, pending)
+}
+
+/// The grammars each blob is stored under in a row whose status `keep` accepts.
+fn grammars_with(
+    stored: &Stored,
+    keep: impl Fn(BlobStatus) -> bool,
+) -> HashMap<String, Vec<Grammar>> {
+    stored
+        .iter()
+        .map(|(oid, rows)| {
+            let grammars = rows
+                .iter()
+                .filter(|&&(_, status)| keep(status))
+                .map(|&(grammar, _)| grammar)
+                .collect();
+            (oid.clone(), grammars)
+        })
+        .collect()
+}
+
+/// The blobs among `oids` to fetch: those the repo lacks (`missing`) that the build has to parse (`pending`), and those
+/// the index holds with their tags. A repo needs those for the lines of the references it finds in them, and a second
+/// clone of a repository, or one made anew, lacks what the index holds from the first. A blob too large to be parsed
+/// has no tags, so no references to read lines for.
+fn to_fetch(
+    oids: &[String],
+    pending: &[Pending],
+    stored: &Stored,
+    missing: &HashSet<String>,
+) -> Vec<String> {
+    let pending: HashSet<&str> = pending.iter().map(|blob| blob.oid.as_str()).collect();
+    let parsed = |oid: &String| {
+        stored
+            .get(oid)
+            .is_some_and(|rows| rows.iter().any(|&(_, status)| status == BlobStatus::Parsed))
+    };
+    oids.iter()
+        .filter(|oid| missing.contains(*oid) && (pending.contains(oid.as_str()) || parsed(oid)))
+        .cloned()
+        .collect()
 }
 
 /// The grammars a blob is stored under: one for each its paths name. Without the content (`&[]`) a `.h` file counts as C.
@@ -210,35 +254,38 @@ fn classify(
     (readable, rows)
 }
 
-/// Groups of blobs, in order, whose sizes add up to at most `limit` bytes. A blob over it makes a group of its own.
-fn groups(blobs: Vec<Pending>, limit: u64) -> Vec<Vec<Pending>> {
-    let mut groups: Vec<Vec<Pending>> = Vec::new();
+/// Groups of items, in order, whose sizes (`size` gives them) add up to at most `limit` bytes. An item over it makes a
+/// group of its own.
+pub(crate) fn groups<T>(items: Vec<T>, size: impl Fn(&T) -> u64, limit: u64) -> Vec<Vec<T>> {
+    let mut groups: Vec<Vec<T>> = Vec::new();
     let mut bytes = 0;
-    for blob in blobs {
+    for item in items {
+        let item_bytes = size(&item);
         match groups.last_mut() {
-            Some(group) if bytes + blob.size <= limit => {
-                bytes += blob.size;
-                group.push(blob);
+            Some(group) if bytes + item_bytes <= limit => {
+                bytes += item_bytes;
+                group.push(item);
             }
             _ => {
-                bytes = blob.size;
-                groups.push(vec![blob]);
+                bytes = item_bytes;
+                groups.push(vec![item]);
             }
         }
     }
     groups
 }
 
-/// The rows of one blob, one for each grammar its paths name; None when `cancel` was raised.
+/// The rows of one blob, one for each grammar its paths name; None when `cancel` was raised. A blob that cannot be
+/// parsed, or not in time, gets `unreadable` rows: the next build that lists it tries again.
 fn parse_blob(blob: &Pending, content: &[u8], cancel: &AtomicUsize) -> Option<Vec<NewBlob>> {
     let mut rows = Vec::new();
     for grammar in grammars_of(&blob.paths, content) {
         let (status, tags) = match tags::parse(grammar, content, Some(cancel)) {
             Ok(tags) => (BlobStatus::Parsed, tags),
             Err(ParseError::Cancelled) => return None,
-            Err(ParseError::Failed(message)) => {
+            Err(e @ (ParseError::TimedOut | ParseError::Failed(_))) => {
                 eprintln!(
-                    "gh-tideline: parsing {} as {} failed: {message}",
+                    "gh-tideline: parsing {} as {} failed: {e}",
                     blob.paths[0],
                     grammar.id()
                 );
@@ -335,11 +382,14 @@ impl Build {
         self.job.finish(outcome);
     }
 
+    /// A job that was cancelled before its turn has come ends cancelled, even if the indexer is shutting down too
+    /// (`Indexer::shut_down` closes the turn and cancels the jobs).
     async fn wait_for(&self, turn: Arc<Semaphore>) -> Result<OwnedSemaphorePermit, Stop> {
         tokio::select! {
+            biased;
+            _ = self.job.wake.notified() => Err(Stop::Cancelled),
             permit = turn.acquire_owned() => permit
                 .map_err(|_| Stop::Failed("indexing is shutting down".to_string())),
-            _ = self.job.wake.notified() => Err(Stop::Cancelled),
         }
     }
 
@@ -361,7 +411,7 @@ impl Build {
             .map_err(join_failed)??)
     }
 
-    async fn stored(&self, oids: Vec<String>) -> Result<HashMap<String, Vec<Grammar>>, Stop> {
+    async fn stored(&self, oids: Vec<String>) -> Result<Stored, Stop> {
         self.with_db(move |db| db.stored_blobs(&oids)).await
     }
 
@@ -369,30 +419,34 @@ impl Build {
         let commit = self.job.commit.as_str();
         self.alive()?;
         let entries = self.repo.ls_tree(commit).await?;
+        let files = select_files(&entries, self.limits.max_files)?;
         // From now on the blob endpoint may fetch any file of the commit, as it may those of a pull request.
         self.repo.remember_oids(
             entries
                 .iter()
                 .map(|entry| (entry.oid.as_str(), entry.mode != GITLINK_MODE)),
         );
-        let files = select_files(entries, self.limits.max_files)?;
         let mut oids: Vec<String> = files.iter().map(|file| file.oid.clone()).collect();
         oids.sort();
         oids.dedup();
 
-        let (_, pending) = settle(&files, &self.stored(oids.clone()).await?);
-        if !pending.is_empty() {
-            self.index_blobs(pending).await?;
-        }
+        // A blob that was left unreadable (it could not be fetched, or parsed in time) is tried again.
+        let stored = self.stored(oids.clone()).await?;
+        let usable = grammars_with(&stored, |status| status != BlobStatus::Unreadable);
+        let (_, pending) = settle(&files, &usable);
+        self.index_blobs(&oids, &stored, pending).await?;
 
         self.job.enter(Phase::Saving, 0);
-        let (listing, pending) = settle(&files, &self.stored(oids).await?);
+        let stored = self.stored(oids).await?;
+        // A blob that is unreadable still is no reason not to list the commit.
+        let (mut listing, pending) = settle(&files, &grammars_with(&stored, |_| true));
         if !pending.is_empty() {
             return Err(Stop::Failed(format!(
                 "{} blobs are still missing from the index after the build",
                 pending.len()
             )));
         }
+        self.headers_by_content(&mut listing, &stored).await?;
         self.alive()?;
         self.with_db({
             let commit = commit.to_string();
@@ -401,15 +455,59 @@ impl Build {
         .await
     }
 
-    /// Gets the blobs into the index: fetches those that are not local, then parses and stores them.
-    async fn index_blobs(&self, pending: Vec<Pending>) -> Result<(), Stop> {
+    /// A `.h` file is C or C++ by its content, but the index only knows which grammars its blob is stored under, and
+    /// `settle` takes the first of the C family. Where there is a choice (the same content is stored as C and as C++,
+    /// because it has other names) the content, which is local by now, decides, if the grammar it names is stored.
+    async fn headers_by_content(&self, listing: &mut Listing, stored: &Stored) -> Result<(), Stop> {
+        let has_choice = |path: &str, oid: &str| {
+            Grammar::for_path_only(path).is_none()
+                && stored.get(oid).is_some_and(|rows| {
+                    rows.iter()
+                        .filter(|(grammar, _)| grammar.family() == Family::C)
+                        .count()
+                        > 1
+                })
+        };
+        let mut oids: Vec<String> = listing
+            .iter()
+            .filter(|(path, oid, _)| has_choice(path, oid))
+            .map(|(_, oid, _)| oid.clone())
+            .collect();
+        oids.sort();
+        oids.dedup();
+        if oids.is_empty() {
+            return Ok(());
+        }
+        let contents: HashMap<String, Vec<u8>> =
+            self.repo.read_blobs(&oids).await?.into_iter().collect();
+        for (path, oid, grammar) in listing.iter_mut() {
+            let Some(content) = contents.get(oid.as_str()) else {
+                continue;
+            };
+            if !has_choice(path, oid) {
+                continue;
+            }
+            let by_content = Grammar::for_path(path, content);
+            let is_stored =
+                |wanted: Grammar| stored[oid.as_str()].iter().any(|&(held, _)| held == wanted);
+            if let Some(wanted) = by_content.filter(|&wanted| is_stored(wanted)) {
+                *grammar = wanted;
+            }
+        }
+        Ok(())
+    }
+
+    /// Gets the blobs into the index: fetches those the repo lacks, then parses and stores those the index lacks
+    /// (`pending`). A blob the index holds is fetched too when the repo lacks it (see `to_fetch`), though not parsed.
+    async fn index_blobs(
+        &self,
+        oids: &[String],
+        stored: &Stored,
+        pending: Vec<Pending>,
+    ) -> Result<(), Stop> {
         let commit = self.job.commit.as_str();
         let missing = self.repo.missing_objects(commit).await?;
-        let to_fetch: Vec<String> = pending
-            .iter()
-            .filter(|blob| missing.contains(&blob.oid))
-            .map(|blob| blob.oid.clone())
-            .collect();
+        let to_fetch = to_fetch(oids, &pending, stored, &missing);
         let missing = if to_fetch.is_empty() {
             missing
         } else {
@@ -417,6 +515,9 @@ impl Build {
             // What the remote did not give stays missing.
             self.repo.missing_objects(commit).await?
         };
+        if pending.is_empty() {
+            return Ok(());
+        }
         let (present, lost) = partition(pending, &missing);
         // Sizing a blob that is not local would cost git a scan of the promisor packs.
         let present_oids: Vec<String> = present.iter().map(|blob| blob.oid.clone()).collect();
@@ -429,7 +530,10 @@ impl Build {
         }
         let mut inserting = None;
         let parsed = self
-            .parse(groups(readable, self.limits.group_bytes), &mut inserting)
+            .parse(
+                groups(readable, |blob| blob.size, self.limits.group_bytes),
+                &mut inserting,
+            )
             .await;
         // The insert in the background is over before the build is.
         let inserted = wait_for_insert(inserting).await;
@@ -547,6 +651,12 @@ mod tests {
         }
     }
 
+    fn stored_as(rows: &[(u32, &[(Grammar, BlobStatus)])]) -> Stored {
+        rows.iter()
+            .map(|&(n, held)| (oid(n), held.to_vec()))
+            .collect()
+    }
+
     #[test]
     fn only_regular_files_of_a_known_language_outside_skipped_paths_are_indexed() {
         let entries = vec![
@@ -560,7 +670,7 @@ mod tests {
             file("include/api.h", 8),
             file("web/app.js", 9),
         ];
-        let got: Vec<String> = select_files(entries, 100)
+        let got: Vec<String> = select_files(&entries, 100)
             .unwrap()
             .into_iter()
             .map(|entry| entry.path)
@@ -574,9 +684,9 @@ mod tests {
     #[test]
     fn a_commit_with_more_files_than_the_limit_is_not_indexed() {
         let entries: Vec<TreeEntry> = (0..3).map(|n| file(&format!("f{n}.rs"), n)).collect();
-        assert_eq!(select_files(entries.clone(), 3).unwrap().len(), 3);
+        assert_eq!(select_files(&entries, 3).unwrap().len(), 3);
         assert_eq!(
-            select_files(entries, 2).unwrap_err(),
+            select_files(&entries, 2).unwrap_err(),
             Stop::Failed("the commit has 3 source files; the index covers at most 2".to_string())
         );
     }
@@ -685,6 +795,60 @@ mod tests {
     }
 
     #[test]
+    fn an_unreadable_blob_is_pending_before_the_build_and_listed_after_it() {
+        let files = vec![file("a.rs", 1), file("b.rs", 2), file("c.rs", 3)];
+        let stored = stored_as(&[
+            (1, &[(Grammar::Rust, BlobStatus::Parsed)]),
+            (2, &[(Grammar::Rust, BlobStatus::Unreadable)]),
+            (3, &[(Grammar::Rust, BlobStatus::TooLarge)]),
+        ]);
+        // A blob that could not be read is one to do again, ...
+        let usable = grammars_with(&stored, |status| status != BlobStatus::Unreadable);
+        let (listing, pending_blobs) = settle(&files, &usable);
+        assert_eq!(
+            listing,
+            [
+                ("a.rs".to_string(), oid(1), Grammar::Rust),
+                ("c.rs".to_string(), oid(3), Grammar::Rust),
+            ]
+        );
+        assert_eq!(pending_blobs, [pending(2, &["b.rs"])]);
+        // ... and when the build has done what it can, a blob it could not read is listed all the same.
+        let (listing, pending_blobs) = settle(&files, &grammars_with(&stored, |_| true));
+        assert_eq!(listing.len(), 3);
+        assert!(pending_blobs.is_empty());
+    }
+
+    #[test]
+    fn blobs_the_repo_lacks_are_fetched_if_they_are_to_be_parsed_or_have_tags() {
+        let oids: Vec<String> = (1..=6).map(oid).collect();
+        let stored = stored_as(&[
+            (2, &[(Grammar::Rust, BlobStatus::Parsed)]),
+            (3, &[(Grammar::Rust, BlobStatus::TooLarge)]),
+            (4, &[(Grammar::Rust, BlobStatus::Unreadable)]),
+            (
+                5,
+                &[
+                    (Grammar::C, BlobStatus::TooLarge),
+                    (Grammar::Cpp, BlobStatus::Parsed),
+                ],
+            ),
+            (6, &[(Grammar::Rust, BlobStatus::Parsed)]),
+        ]);
+        // The index lacks 1, and 4 is to be tried again.
+        let pending_blobs = vec![pending(1, &["a.rs"]), pending(4, &["d.rs"])];
+        // The repo lacks all but 6.
+        let missing: HashSet<String> = (1..=5).map(oid).collect();
+        // Not 3, which is too large to have tags.
+        assert_eq!(
+            to_fetch(&oids, &pending_blobs, &stored, &missing),
+            [oid(1), oid(2), oid(4), oid(5)]
+        );
+        assert!(to_fetch(&oids, &pending_blobs, &stored, &HashSet::new()).is_empty());
+        assert!(to_fetch(&[], &pending_blobs, &stored, &missing).is_empty());
+    }
+
+    #[test]
     fn blobs_are_grouped_in_order_up_to_a_size() {
         let sizes = |groups: Vec<Vec<Pending>>| -> Vec<Vec<u64>> {
             groups
@@ -700,15 +864,19 @@ mod tests {
             sized(5, 1),
         ];
         assert_eq!(
-            sizes(groups(blobs, 10)),
+            sizes(groups(blobs, |blob| blob.size, 10)),
             [vec![4, 4], vec![4], vec![10], vec![1]]
         );
         // A blob over the limit makes a group of its own.
         assert_eq!(
-            sizes(groups(vec![sized(1, 50), sized(2, 1)], 10)),
+            sizes(groups(
+                vec![sized(1, 50), sized(2, 1)],
+                |blob| blob.size,
+                10
+            )),
             [vec![50], vec![1]]
         );
-        assert!(groups(Vec::new(), 10).is_empty());
+        assert!(groups(Vec::<Pending>::new(), |blob| blob.size, 10).is_empty());
     }
 
     #[test]
@@ -747,6 +915,35 @@ mod tests {
                 .any(|tag| tag.name == "Two" && tag.is_def)
         );
         assert_eq!(job.status().done, 2);
+    }
+
+    #[test]
+    fn a_file_that_takes_too_long_to_parse_is_stored_unreadable_for_a_later_build_to_try_again() {
+        // A definition and then a long run of `+` after an `=`: matching it takes tree-sitter far longer than a file is
+        // given. That says nothing about the file, only about this run, so it must not be kept as a file with no tags.
+        let content = format!("function f() {{}}\nx = {}", "+".repeat(300_000));
+        let slow = Pending {
+            size: content.len() as u64,
+            ..pending(1, &["slow.js"])
+        };
+        let cancel = AtomicUsize::new(0);
+        let started = std::time::Instant::now();
+        let rows = parse_blob(&slow, content.as_bytes(), &cancel).unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(30));
+        assert_eq!(
+            rows,
+            [row(
+                1,
+                Grammar::JavaScript,
+                BlobStatus::Unreadable,
+                content.len() as u64
+            )]
+        );
+
+        // The next parse on the thread goes well.
+        let fine = parse_blob(&pending(2, &["fine.js"]), b"function g() {}\n", &cancel).unwrap();
+        assert_eq!(fine[0].status, BlobStatus::Parsed);
+        assert_eq!(fine[0].tags.len(), 1);
     }
 
     #[test]

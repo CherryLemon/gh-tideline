@@ -48,6 +48,8 @@ const TIME_LIMIT: Duration = Duration::from_millis(1500);
 /// 16 bits: from depth 65 536 on, matches are lost track of, pile up and make the work grow with the square of the
 /// depth. Code nested even a thousand levels deep is not code.
 const MAX_DEPTH: u32 = 60_000;
+/// How many tags `parse` turns into their final form between two looks at the cancellation flag and the deadline.
+const TAGS_PER_CHECK: usize = 4096;
 /// The longest snippet, in UTF-16 code units.
 const SNIPPET_UNITS: usize = 200;
 /// How many code units before the name a snippet starts when the name is too far into a long line to fit.
@@ -88,6 +90,9 @@ pub struct Tag {
 pub enum ParseError {
     /// The cancellation flag was raised.
     Cancelled,
+    /// The file took longer than `TIME_LIMIT`. It may parse on a machine that is less busy, so it is no reason to
+    /// remember that the file has no tags.
+    TimedOut,
     Failed(String),
 }
 
@@ -95,6 +100,7 @@ impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ParseError::Cancelled => f.write_str("cancelled"),
+            ParseError::TimedOut => f.write_str("took too long to parse"),
             ParseError::Failed(message) => f.write_str(message),
         }
     }
@@ -116,9 +122,10 @@ thread_local! {
 /// patterns that tag every type name also match the name of a type being defined. Source that is not valid code
 /// yields whatever tags the parser could recover, never an error.
 ///
-/// A file is given up on after `TIME_LIMIT`: the call returns `Ok` with no tags at all (it is no error, and not
-/// different from an empty file; the caller has nothing to retry). Tags nested deeper than `MAX_DEPTH` are left out.
-/// Neither happens to code, only to text that makes tree-sitter spend minutes on a megabyte.
+/// A file is given up on after `TIME_LIMIT`: the call returns `Err(TimedOut)`, and no tags. It is an error, not an
+/// empty result, because how long a file takes depends on the machine: a caller that keeps what it learns about a file
+/// must not keep that. Tags nested deeper than `MAX_DEPTH` are left out, which is no error: the depth is a property of
+/// the file. Neither happens to code, only to text that makes tree-sitter spend minutes on a megabyte.
 pub fn parse(
     grammar: Grammar,
     src: &[u8],
@@ -145,10 +152,7 @@ fn parse_within(
         deadline: Instant::now() + limit,
         timed_out: Cell::new(false),
     };
-    let Some(mut found) = ENGINE.with_borrow_mut(|engine| engine.find(config, src, &budget))?
-    else {
-        return Ok(Vec::new());
-    };
+    let mut found = ENGINE.with_borrow_mut(|engine| engine.find(config, src, &budget))?;
     if grammar == Grammar::Rust {
         // `r#type` is the name `type`.
         for tag in &mut found {
@@ -164,7 +168,12 @@ fn parse_within(
     // not, and counting from the start of a line of 100 000 bytes for each of 8000 tags on it would take forever.
     let mut previous = (usize::MAX, 0, 0);
     let mut tags = Vec::new();
-    for i in select(grammar, src, &found) {
+    for (n, i) in select(grammar, src, &found).into_iter().enumerate() {
+        // Tree-sitter looks at the budget while it works; this loop is out of its hands, and on a dense megabyte it
+        // takes a few hundred milliseconds.
+        if n % TAGS_PER_CHECK == 0 && budget.check().is_break() {
+            return budget.stopped();
+        }
         let found = &found[i];
         let name = String::from_utf8_lossy(&src[found.name.clone()]).into_owned();
         let kind = config.kind(found.capture);
@@ -233,11 +242,11 @@ impl Budget<'_> {
     }
 
     /// The result of work that stopped early.
-    fn stopped<T>(&self) -> Result<Option<T>, ParseError> {
+    fn stopped<T>(&self) -> Result<T, ParseError> {
         if cancelled(self.cancel) {
             Err(ParseError::Cancelled)
         } else if self.timed_out.get() {
-            Ok(None)
+            Err(ParseError::TimedOut)
         } else {
             Err(ParseError::Failed("the parser gave up".to_string()))
         }
@@ -264,13 +273,13 @@ struct Engine {
 impl Engine {
     /// The tags of `src` in the order the tags crate would hand them out: the matches of the query in the order
     /// tree-sitter finds them, with one tag per name node (the pattern written first wins), except that a tag is handed
-    /// out as soon as the matching has moved past its name. `Ok(None)` when the time ran out.
+    /// out as soon as the matching has moved past its name. `Err(TimedOut)` when the time ran out.
     fn find(
         &mut self,
         config: &Config,
         src: &[u8],
         budget: &Budget,
-    ) -> Result<Option<Vec<Found>>, ParseError> {
+    ) -> Result<Vec<Found>, ParseError> {
         self.parser
             .set_language(&config.language)
             .map_err(|e| ParseError::Failed(e.to_string()))?;
@@ -339,7 +348,7 @@ impl Engine {
             return budget.stopped();
         }
         found.extend(queue.into_iter().map(|(tag, _)| tag));
-        Ok(Some(found))
+        Ok(found)
     }
 }
 
@@ -389,6 +398,24 @@ pub fn line_snippet(src: &[u8], line: u32, column: u32) -> Option<(String, u32)>
     let text = &src[start..end];
     let name_byte = byte_offset_of(text, column.saturating_sub(1) as usize);
     Some(snippet_at(text, name_byte))
+}
+
+/// `line_snippet` for each of `places`, the (line, column) pairs of one file, in the order given. The lines are found
+/// once instead of once for each place, which would read a file of megabytes as often as it has places.
+pub fn line_snippets(src: &[u8], places: &[(u32, u32)]) -> Vec<Option<(String, u32)>> {
+    let starts = line_starts(src);
+    places
+        .iter()
+        .map(|&(line, column)| {
+            let start = *starts.get(line.checked_sub(1)? as usize)?;
+            match start.checked_sub(1) {
+                // From the line break before the line, so that a character at the start of the line that looks like a
+                // byte order mark is not dropped like the one at the start of the file.
+                Some(before) => line_snippet(&src[before..], 2, column),
+                None => line_snippet(src, 1, column),
+            }
+        })
+        .collect()
 }
 
 /// `line` (without its `\n`) trimmed and cut for display around the name starting at byte `name_byte`: the snippet
@@ -1569,6 +1596,7 @@ Foo::Foo() {}
             );
         }
         assert_eq!(ParseError::Cancelled.to_string(), "cancelled");
+        assert_eq!(ParseError::TimedOut.to_string(), "took too long to parse");
         assert_eq!(
             ParseError::Failed("bad query".into()).to_string(),
             "bad query"
@@ -1599,16 +1627,17 @@ Foo::Foo() {}
     }
 
     #[test]
-    fn work_that_takes_too_long_is_given_up_on_without_tags_or_an_error() {
+    fn work_that_takes_too_long_is_given_up_on_and_says_so() {
         let limit = Duration::from_millis(200);
         for (grammar, src) in [
             (Grammar::JavaScript, slow_to_match()),
             (Grammar::Cpp, slow_to_parse()),
         ] {
             let started = Instant::now();
+            // An error, not an empty file: the caller must not take it for what the file holds.
             assert_eq!(
                 parse_within(grammar, src.as_bytes(), None, limit),
-                Ok(Vec::new()),
+                Err(ParseError::TimedOut),
                 "{grammar:?}"
             );
             let took = started.elapsed();
@@ -1653,6 +1682,24 @@ Foo::Foo() {}
             defs(Grammar::JavaScript, "function g() {}"),
             ["function g 1:10 1-1"]
         );
+    }
+
+    #[test]
+    fn the_loop_that_makes_the_tags_looks_at_the_deadline_too() {
+        // A file this small is parsed and matched without tree-sitter looking at the clock even once, so only the
+        // loop that turns what was found into tags can notice that the time is up.
+        let src = b"pub fn one() {}\n";
+        assert_eq!(
+            parse_within(Grammar::Rust, src, None, Duration::ZERO),
+            Err(ParseError::TimedOut)
+        );
+        let kept = parse_within(Grammar::Rust, src, None, Duration::from_secs(60)).unwrap();
+        assert_eq!(kept.len(), 1);
+
+        // A dense file, a tag in every four bytes: the loop looks again every `TAGS_PER_CHECK` tags (five times here)
+        // and lets code through while there is time.
+        let dense = "a();".repeat(5 * TAGS_PER_CHECK);
+        assert_eq!(tags(Grammar::JavaScript, &dense).len(), 5 * TAGS_PER_CHECK);
     }
 
     #[test]
@@ -1725,6 +1772,12 @@ Foo::Foo() {}
 
     #[test]
     fn garbage_and_truncated_source_do_not_panic() {
+        // Running out of time is an answer too (a machine that is busy may not give a parse 1.5 seconds), not a panic.
+        let parsed = |grammar: Grammar, src: &[u8]| match parse(grammar, src, None) {
+            Ok(tags) => Some(tags),
+            Err(ParseError::TimedOut) => None,
+            Err(e) => panic!("{grammar:?}: {e}"),
+        };
         let mut state = 0x2545_F491_u32;
         let mut next = move || {
             state ^= state << 13;
@@ -1735,23 +1788,22 @@ Foo::Foo() {}
         for grammar in Grammar::ALL {
             for len in [0, 1, 7, 64, 500, 4000] {
                 let bytes: Vec<u8> = (0..len).map(|_| next() as u8).collect();
-                parse(grammar, &bytes, None).unwrap();
+                parsed(grammar, &bytes);
             }
-            parse(grammar, "{(([<".repeat(3000).as_bytes(), None).unwrap();
-            parse(grammar, "\u{FEFF}".as_bytes(), None).unwrap();
+            parsed(grammar, "{(([<".repeat(3000).as_bytes());
+            parsed(grammar, "\u{FEFF}".as_bytes());
         }
         for (grammar, src) in FIXTURES {
             for cut in (0..src.len()).step_by(11) {
-                parse(grammar, &src.as_bytes()[..cut], None).unwrap();
+                parsed(grammar, &src.as_bytes()[..cut]);
             }
         }
         // A name that is not UTF-8 is no name.
-        let found = parse(
+        let found = parsed(
             Grammar::C,
             b"int caf\xE9(void) { return 0; }\nint ok(void) { return 1; }\n",
-            None,
-        )
-        .unwrap();
+        );
+        let Some(found) = found else { return };
         assert!(found.iter().all(|t| t.name != "caf\u{FFFD}"));
         assert!(found.iter().any(|t| t.name == "ok" && t.is_def));
     }
@@ -1918,6 +1970,43 @@ Foo::Foo() {}
         assert_eq!(
             line_snippet(b"ab\xFFcd", 1, 4),
             Some(("ab\u{FFFD}cd".to_string(), 4))
+        );
+    }
+
+    #[test]
+    fn line_snippets_are_those_of_line_snippet_for_every_place() {
+        // A character that looks like a byte order mark starts the second line, and the first line has the real one.
+        let src =
+            "\u{FEFF}  fn a() {}\n\u{FEFF}fn b() {}\r\n\n\tfn c() {} // 😀 d\nlast".as_bytes();
+        let places = [
+            (1, 6),
+            (2, 2),
+            (2, 5),
+            (3, 1),
+            (4, 5),
+            (4, 22),
+            (5, 3),
+            (5, 99),
+            // Lines that do not exist.
+            (6, 1),
+            (0, 1),
+            (1_000_000, 1),
+        ];
+        let got = line_snippets(src, &places);
+        let expected: Vec<_> = places
+            .iter()
+            .map(|&(line, column)| line_snippet(src, line, column))
+            .collect();
+        assert_eq!(got, expected);
+        // The mark of the file is ignored, the look-alike of the second line is part of it.
+        assert_eq!(got[0], Some(("fn a() {}".to_string(), 4)));
+        assert_eq!(got[1], Some(("\u{FEFF}fn b() {}".to_string(), 2)));
+        assert_eq!(got[3], Some((String::new(), 1)));
+        assert_eq!(got[8], None);
+        assert!(line_snippets(src, &[]).is_empty());
+        assert_eq!(
+            line_snippets(b"", &[(1, 1), (2, 1)]),
+            [Some((String::new(), 1)), None]
         );
     }
 

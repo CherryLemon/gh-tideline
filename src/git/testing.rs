@@ -226,6 +226,20 @@ impl PartialClone {
         }
     }
 
+    /// A second cache repo over the same source repo, as a clone made anew has: both commits and their trees, no blobs.
+    pub(crate) async fn another_cache(&self) -> Arc<Repo> {
+        let repo = Arc::new(repo_at(
+            self.dir.join("repos/github.com/o/fork.git"),
+            format!("file://{}", self.origin.display()),
+        ));
+        let guard = repo.lock().await.unwrap();
+        repo.fetch_commits(&guard, &self.auth, 1, &self.base, &self.head)
+            .await
+            .unwrap();
+        drop(guard);
+        repo
+    }
+
     /// The OID of `path` in `commit`, from the source repo.
     pub(crate) async fn oid(&self, commit: &str, path: &str) -> String {
         git_in(&self.origin, &["rev-parse", &format!("{commit}:{path}")]).await

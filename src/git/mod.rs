@@ -618,7 +618,8 @@ impl Repo {
         })
     }
 
-    /// Step 5: batch-fetch blobs by OID, fed over stdin.
+    /// Step 5: batch-fetch blobs by OID, fed over stdin. A transfer that stays under 1 kB/s for a minute is given up
+    /// on (`http.lowSpeed*`): git is never killed, so a fetch that hangs would hold the repo lock for ever.
     pub async fn fetch_blobs(
         &self,
         _guard: &RepoGuard,
@@ -635,6 +636,10 @@ impl Repo {
             &[
                 "-c",
                 "fetch.negotiationAlgorithm=noop",
+                "-c",
+                "http.lowSpeedLimit=1000",
+                "-c",
+                "http.lowSpeedTime=60",
                 "fetch",
                 "origin",
                 "--no-tags",

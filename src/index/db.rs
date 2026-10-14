@@ -5,11 +5,11 @@
 //! at its paths. The listing is written in one transaction together with the mark that says it is complete, so a
 //! lookup never sees a commit that is half indexed. Nothing is evicted.
 //!
-//! Every server and job shares the file: WAL mode, a busy timeout and `INSERT OR IGNORE` make it harmless to write
-//! the same blob twice. A writer connection does the writes and a reader connection the lookups, each behind a
-//! mutex, so a lookup never waits for a long insert. A second reader answers a build's question which blobs are
-//! stored, a long read that would keep the lookups waiting. The methods are synchronous; async callers run them on
-//! the blocking pool.
+//! Every server and job shares the file: WAL mode, a busy timeout and an insert that leaves a stored blob alone make
+//! it harmless to write the same blob twice (only a blob that is `unreadable` is replaced, once, by one that is not).
+//! A writer connection does the writes and a reader connection the lookups, each behind a mutex, so a lookup never
+//! waits for a long insert. A second reader answers a build's question which blobs are stored, a long read that would
+//! keep the lookups waiting. The methods are synchronous; async callers run them on the blocking pool.
 
 use std::collections::HashMap;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -219,43 +219,77 @@ impl IndexDb {
         })
     }
 
-    /// Every grammar each of `oids` is stored with, whatever the status of the blob. A build skips what is stored
-    /// (a `.h` file has one grammar, but the same content may be stored under two names). OIDs that are not stored
-    /// are left out of the map. It does not use the reader of the lookups, so it never keeps a click waiting.
-    pub fn stored_blobs(&self, oids: &[String]) -> Result<HashMap<String, Vec<Grammar>>, String> {
+    /// Every grammar each of `oids` is stored with, and the status of each row. A build skips what it has no reason to
+    /// do again (a `.h` file has one grammar, but the same content may be stored under two names). OIDs that are not
+    /// stored are left out of the map. It does not use the reader of the lookups, so it never keeps a click waiting.
+    pub fn stored_blobs(
+        &self,
+        oids: &[String],
+    ) -> Result<HashMap<String, Vec<(Grammar, BlobStatus)>>, String> {
         let conn = lock(&self.bulk_reader);
         let mut query = conn
-            .prepare_cached("SELECT grammar FROM blobs WHERE oid = ?1")
+            .prepare_cached("SELECT grammar, status FROM blobs WHERE oid = ?1")
             .map_err(db_err)?;
         let mut stored = HashMap::new();
         for oid in oids {
-            let ids = query
-                .query_map([oid], |row| row.get::<_, String>(0))
+            let rows = query
+                .query_map([oid], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
                 .map_err(db_err)?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(db_err)?;
-            // A grammar this version does not know was stored by a newer one.
-            let mut grammars: Vec<Grammar> =
-                ids.iter().filter_map(|id| Grammar::from_id(id)).collect();
-            if !grammars.is_empty() {
-                grammars.sort();
-                stored.insert(oid.clone(), grammars);
+            let mut held = Vec::new();
+            for (id, status) in rows {
+                // A grammar this version does not know was stored by a newer one.
+                let Some(grammar) = Grammar::from_id(&id) else {
+                    continue;
+                };
+                let status = BlobStatus::from_stored(&status)
+                    .ok_or_else(|| format!("index database: unknown blob status {status:?}"))?;
+                held.push((grammar, status));
+            }
+            if !held.is_empty() {
+                held.sort_by_key(|&(grammar, _)| grammar);
+                stored.insert(oid.clone(), held);
             }
         }
         Ok(stored)
     }
 
+    /// The size of each of `oids` that is stored (under any grammar); the others are left out of the map.
+    pub fn blob_sizes(&self, oids: &[String]) -> Result<HashMap<String, u64>, String> {
+        let conn = lock(&self.reader);
+        let mut query = conn
+            .prepare_cached("SELECT max(size) FROM blobs WHERE oid = ?1")
+            .map_err(db_err)?;
+        let mut sizes = HashMap::new();
+        for oid in oids {
+            let size: Option<i64> = query.query_row([oid], |row| row.get(0)).map_err(db_err)?;
+            if let Some(size) = size {
+                sizes.insert(oid.clone(), size as u64);
+            }
+        }
+        Ok(sizes)
+    }
+
     /// Stores blobs and their tags in one transaction. A blob already stored as (OID, grammar) is left as it is, and
-    /// so are its tags, so two jobs, or two servers, may store the same blob.
+    /// so are its tags, so two jobs, or two servers, may store the same blob; except that a row that says `unreadable`
+    /// is replaced by one that does not, with the tags that go with it. `unreadable` is a failure that may not be
+    /// there next time (a blob that could not be fetched, a parse that took too long), so it does not stay for ever.
     pub fn insert_blobs(&self, blobs: Vec<NewBlob>) -> Result<(), String> {
         let mut conn = lock(&self.writer);
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(db_err)?;
         {
+            // Returns the id of the row if this stored the blob or replaced an `unreadable` row, else nothing.
             let mut insert_blob = tx
                 .prepare_cached(
-                    "INSERT OR IGNORE INTO blobs (oid, grammar, status, size) VALUES (?1, ?2, ?3, ?4)",
+                    "INSERT INTO blobs (oid, grammar, status, size) VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT (oid, grammar) DO UPDATE SET status = excluded.status, size = excluded.size
+                     WHERE blobs.status = 'unreadable' AND excluded.status <> 'unreadable'
+                     RETURNING id",
                 )
                 .map_err(db_err)?;
             let mut insert_tag = tx
@@ -268,18 +302,21 @@ impl IndexDb {
             // Names repeat a lot within a batch.
             let mut name_ids: HashMap<String, i64> = HashMap::new();
             for blob in blobs {
-                let inserted = insert_blob
-                    .execute(params![
-                        blob.oid,
-                        blob.grammar.id(),
-                        blob.status.as_str(),
-                        blob.size as i64
-                    ])
+                let blob_id: Option<i64> = insert_blob
+                    .query_row(
+                        params![
+                            blob.oid,
+                            blob.grammar.id(),
+                            blob.status.as_str(),
+                            blob.size as i64
+                        ],
+                        |row| row.get(0),
+                    )
+                    .optional()
                     .map_err(db_err)?;
-                if inserted == 0 {
+                let Some(blob_id) = blob_id else {
                     continue;
-                }
-                let blob_id = tx.last_insert_rowid();
+                };
                 for tag in blob.tags {
                     let name_id = match name_ids.get(&tag.name) {
                         Some(&id) => id,
@@ -907,9 +944,190 @@ mod tests {
 
         let stored = fx.stored_blobs(&[oid(1), oid(2), oid(3)]).unwrap();
         assert_eq!(stored.len(), 2);
-        assert_eq!(stored[&oid(1)], [Grammar::C, Grammar::Cpp]);
-        assert_eq!(stored[&oid(2)], [Grammar::C]);
+        assert_eq!(
+            stored[&oid(1)],
+            [
+                (Grammar::C, BlobStatus::Parsed),
+                (Grammar::Cpp, BlobStatus::Parsed)
+            ]
+        );
+        assert_eq!(stored[&oid(2)], [(Grammar::C, BlobStatus::Parsed)]);
         assert!(fx.stored_blobs(&[]).unwrap().is_empty());
+    }
+
+    fn unreadable(n: u32, grammar: Grammar) -> NewBlob {
+        NewBlob {
+            status: BlobStatus::Unreadable,
+            size: 0,
+            ..blob(n, grammar, Vec::new())
+        }
+    }
+
+    #[test]
+    fn an_unreadable_blob_is_replaced_by_one_that_was_read_and_nothing_else_is() {
+        let fx = TempDb::new("unreadable");
+        let status = |n: u32, grammar: Grammar| {
+            fx.blob_symbols(&oid(n), grammar)
+                .unwrap()
+                .map(|stored| (stored.status, stored.symbols))
+        };
+        let size_of =
+            |n: u32| fx.count(&format!("SELECT size FROM blobs WHERE oid = '{}'", oid(n)));
+
+        // A blob that could not be read, twice (nothing changes), and then read.
+        fx.insert_blobs(vec![unreadable(1, Grammar::Rust)]).unwrap();
+        fx.insert_blobs(vec![unreadable(1, Grammar::Rust)]).unwrap();
+        assert_eq!(
+            status(1, Grammar::Rust),
+            Some((BlobStatus::Unreadable, vec![]))
+        );
+        // A commit that lists it, as a build leaves it when the blob stays unreadable.
+        fx.save_commit(&commit(1), &[entry("a.rs", 1, Grammar::Rust)])
+            .unwrap();
+
+        fx.insert_blobs(vec![blob(1, Grammar::Rust, vec![def("f", 1, 4)])])
+            .unwrap();
+        assert_eq!(
+            status(1, Grammar::Rust),
+            Some((BlobStatus::Parsed, vec![def("f", 1, 4)]))
+        );
+        assert_eq!(
+            (size_of(1), fx.count("SELECT count(*) FROM blobs")),
+            (100, 1)
+        );
+        // The row is the same one: the commit that listed it finds the tags.
+        let hits = fx
+            .definitions(&commit(1), Family::Rust, "f", "a.rs")
+            .unwrap()
+            .unwrap();
+        assert_eq!(places(&hits), [("a.rs", 1)]);
+
+        // What was read stays as it was: not replaced by an unreadable row, nor by another reading.
+        fx.insert_blobs(vec![
+            unreadable(1, Grammar::Rust),
+            blob(1, Grammar::Rust, vec![def("g", 7, 7), call("f", 2, 2)]),
+        ])
+        .unwrap();
+        assert_eq!(
+            status(1, Grammar::Rust),
+            Some((BlobStatus::Parsed, vec![def("f", 1, 4)]))
+        );
+        assert_eq!(fx.count("SELECT count(*) FROM tags"), 1);
+
+        // Too large is an answer too. The size is the one that was found out.
+        fx.insert_blobs(vec![unreadable(2, Grammar::Go)]).unwrap();
+        fx.insert_blobs(vec![NewBlob {
+            status: BlobStatus::TooLarge,
+            size: 5 << 20,
+            ..blob(2, Grammar::Go, Vec::new())
+        }])
+        .unwrap();
+        assert_eq!(status(2, Grammar::Go), Some((BlobStatus::TooLarge, vec![])));
+        assert_eq!(size_of(2), 5 << 20);
+
+        // Both in one batch, whichever comes first.
+        fx.insert_blobs(vec![
+            unreadable(3, Grammar::C),
+            blob(3, Grammar::C, vec![def("h", 3, 3)]),
+            blob(4, Grammar::C, vec![def("i", 4, 4)]),
+            unreadable(4, Grammar::C),
+        ])
+        .unwrap();
+        assert_eq!(
+            status(3, Grammar::C),
+            Some((BlobStatus::Parsed, vec![def("h", 3, 3)]))
+        );
+        assert_eq!(
+            status(4, Grammar::C),
+            Some((BlobStatus::Parsed, vec![def("i", 4, 4)]))
+        );
+        // Each grammar of a blob is a row of its own.
+        fx.insert_blobs(vec![unreadable(3, Grammar::Cpp)]).unwrap();
+        assert_eq!(
+            status(3, Grammar::Cpp),
+            Some((BlobStatus::Unreadable, vec![]))
+        );
+        assert_eq!(
+            status(3, Grammar::C),
+            Some((BlobStatus::Parsed, vec![def("h", 3, 3)]))
+        );
+    }
+
+    #[test]
+    fn two_servers_replacing_the_same_unreadable_blob_store_its_tags_once() {
+        let fx = TempDb::new("unreadable-twice");
+        let other_server = IndexDb::open(&fx.path).unwrap();
+        fx.insert_blobs((0..40).map(|n| unreadable(n, Grammar::Rust)).collect())
+            .unwrap();
+
+        std::thread::scope(|scope| {
+            for db in [fx.db.clone(), other_server] {
+                scope.spawn(move || {
+                    for round in 0..10u32 {
+                        let blobs = (0..40)
+                            .map(|n| blob(n, Grammar::Rust, vec![def(&format!("f{n}"), n + 1, 4)]))
+                            .collect();
+                        db.insert_blobs(blobs).unwrap();
+                        // Still unreadable in the eyes of a slower build that read nothing.
+                        db.insert_blobs(vec![unreadable(round, Grammar::Rust)])
+                            .unwrap();
+                    }
+                });
+            }
+        });
+        assert_eq!(fx.count("SELECT count(*) FROM blobs"), 40);
+        assert_eq!(
+            fx.count("SELECT count(*) FROM blobs WHERE status = 'parsed'"),
+            40
+        );
+        assert_eq!(fx.count("SELECT count(*) FROM tags"), 40);
+    }
+
+    #[test]
+    fn what_is_stored_says_how_each_row_went_and_how_big_the_blob_is() {
+        let fx = TempDb::new("stored");
+        fx.insert_blobs(vec![
+            blob(1, Grammar::C, vec![]),
+            NewBlob {
+                size: 7,
+                ..unreadable(1, Grammar::Cpp)
+            },
+            NewBlob {
+                status: BlobStatus::TooLarge,
+                size: 5 << 20,
+                ..blob(2, Grammar::Go, vec![])
+            },
+        ])
+        .unwrap();
+        let stored = fx.stored_blobs(&[oid(1), oid(2), oid(3)]).unwrap();
+        assert_eq!(
+            stored,
+            HashMap::from([
+                (
+                    oid(1),
+                    vec![
+                        (Grammar::C, BlobStatus::Parsed),
+                        (Grammar::Cpp, BlobStatus::Unreadable)
+                    ]
+                ),
+                (oid(2), vec![(Grammar::Go, BlobStatus::TooLarge)]),
+            ])
+        );
+
+        // A size is the largest of the rows (an unreadable one may not know it), and a blob that is not stored has none.
+        let sizes = fx.blob_sizes(&[oid(1), oid(2), oid(3)]).unwrap();
+        assert_eq!(sizes, HashMap::from([(oid(1), 100), (oid(2), 5 << 20)]));
+        assert!(fx.blob_sizes(&[]).unwrap().is_empty());
+
+        // A status this version does not know is not guessed at.
+        fx.side()
+            .execute(
+                "INSERT INTO blobs (oid, grammar, status, size) VALUES (?1, 'rust', 'surprise', 1)",
+                [oid(9)],
+            )
+            .unwrap();
+        let error = fx.stored_blobs(&[oid(9)]).unwrap_err();
+        assert!(error.contains("unknown blob status"), "{error}");
     }
 
     #[test]
@@ -1787,7 +2005,7 @@ mod tests {
             .expect("the build waited for the lookup of a click")
             .unwrap();
         assert_eq!(stored.len(), 1);
-        assert_eq!(stored[&oid(1)], [Grammar::Rust]);
+        assert_eq!(stored[&oid(1)], [(Grammar::Rust, BlobStatus::Parsed)]);
         drop(click);
 
         // And the build is in the middle of a long read: the click goes through.

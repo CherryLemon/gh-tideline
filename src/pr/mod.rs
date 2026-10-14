@@ -558,11 +558,16 @@ impl PrService {
         }
     }
 
-    /// Waits for detached bookkeeping, then stops the index builds, then waits for in-flight git
-    /// work (see [`Repos::drain`]). Bookkeeping still running at the deadline is cancelled first,
-    /// so it cannot start git work that the repo drain no longer waits for.
+    /// Tells the index builds to stop, waits for detached bookkeeping, then for the builds, then for
+    /// in-flight git work (see [`Repos::drain`]). The builds are told first: one that waits for the
+    /// repo lock that bookkeeping holds should not start fetching when it gets it. Bookkeeping still
+    /// running at the deadline is cancelled, so it cannot start git work that the repo drain no
+    /// longer waits for.
     pub async fn drain(&self, timeout: Duration) {
         let deadline = tokio::time::Instant::now() + timeout;
+        if let Some(index) = &self.index {
+            index.shut_down();
+        }
         let mut tasks =
             std::mem::take(&mut *self.bookkeeping.lock().expect("bookkeeping poisoned"));
         let _ = tokio::time::timeout_at(deadline, async {

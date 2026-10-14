@@ -385,11 +385,14 @@ Drafts live on GitHub, not in Tideline: a review started here can be finished on
 **Steps to build the index:**
 1. `git ls-tree -r -z --long <head>` lists all files in the head version.
 2. Filter by extension to the supported languages, and keep only files of 1 MB or less.
-3. Batch-fetch these blobs in one go, with the method from step 6 of 5.1.
-4. Read them one by one through `cat-file --batch`, and extract symbols by running the tree-sitter tags queries. A file that takes more than 1.5 seconds to parse and match is given up on (it has no symbols), and a cancelled build stops within the file it is on.
+3. Batch-fetch the blobs the cache repo lacks, with the method from step 6 of 5.1, in chunks with the repo free for pull requests in between. A fetch that moves less than 1000 bytes a second for a minute is given up on (`http.lowSpeedLimit`, `http.lowSpeedTime`). The blobs to fetch are those to be parsed and also those the index holds with tags already: a second clone of the repository, or one made anew, lacks the blobs the first one gave the index, and the lines of a reference are read from the cache repo's copy.
+4. Read the blobs to be parsed through `cat-file --batch`, in groups of at most 16 MiB, and extract symbols by running the tree-sitter tags queries. A file that takes more than 1.5 seconds to parse and match is given up on: it is noted as `unreadable`, without symbols. A cancelled build stops within the file it is on.
 
 **The index is keyed by blob OID, not by commit.** Files with the same content have the same OID.
 So when the same repo moves to another head or another PR, only the new blobs need processing, and the increment is small.
+The one exception is a blob noted as `unreadable` (the remote did not give it, or it took too long to parse): every build tries it again, and a parse that succeeds replaces the note. The commit is listed meanwhile, with that file having no symbols.
+
+**Jobs.** One commit is built at a time, and the others wait in a queue. A request to build joins the job that builds the commit, unless that job failed, was cancelled or is being cancelled: a new job takes its place, and it waits for the turn the old one gives up. Jobs that are ready are forgotten (the database tells), and so are all that failed or were cancelled once there are more than 64. When the server exits, every job is cancelled first, a job in the queue leaves it, one that starts afterwards fails with "indexing is shutting down", and the fetch that has begun is waited for, never killed.
 
 **Schema:**
 ```sql
@@ -401,9 +404,9 @@ tree_entries(commit_oid, path, blob_oid)
 
 | Feature | Approach |
 |---|---|
-| File outline / sticky current function at the top | Convert the definition tags of the file into a Monaco `DocumentSymbolProvider` |
+| File outline / sticky current function at the top | Convert the definition tags of the file into a Monaco `DocumentSymbolProvider`. A file over 1 MiB, or one that takes more than 1.5 seconds to parse, is answered with `tooLarge: true` and no symbols. The second is not remembered, so the next request tries again |
 | Go to definition | Register a Monaco `DefinitionProvider` that asks the server for definitions by `name` and language. Ranking: same file > same directory > others. If the target file is in this PR, open its diff and go to the line. If not, open the head version in a read-only plain editor |
-| Find usages | Query the tags with the same name and `is_definition = false` (`@reference.*` in tags.scm), and list them in the sidebar. The results are approximate, so the UI must say "Matched by name" |
+| Find usages | Query the tags with the same name and `is_definition = false` (`@reference.*` in tags.scm), and list them in the sidebar. The results are approximate, so the UI must say "Matched by name". Each hit shows its line, which is read from the blob in the cache repo (hits are read in groups of at most 16 MiB by the sizes the index noted). A lookup never fetches, so a hit in a blob the repo lacks is listed without its line |
 
 **Scope:**
 - By default, index only the head version. When the user requests a jump on the old file (left side), index the merge-base version on demand.
