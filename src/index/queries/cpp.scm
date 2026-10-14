@@ -139,25 +139,14 @@
                                     name: (identifier) @name)
                             ]))))))) @definition.function
 
-; ... and a function that returns a function pointer or a pointer to an array, whose name is inside parentheses
-; (`int (*f(void))(int)`, `char *(**f(void))[3]`), with up to one pointer declarator in front and two inside
+; ... and a function that returns a function pointer or a pointer to an array, or a reference to one, whose name is
+; inside parentheses (`int (*f(void))(int)`, `char *(**f(void))[3]`, `int (&f())[3]`, `int (*&f())(int)`), with up to one
+; pointer declarator in front of the parentheses and up to two inside (a reference only as the innermost)
 
 (function_definition
     declarator: (_
         declarator: (parenthesized_declarator
-            (_
-                declarator: [
-                    (function_declarator
-                        declarator: (identifier) @name)
-                    (_
-                        declarator: (function_declarator
-                            declarator: (identifier) @name))
-                ])))) @definition.function
-
-(function_definition
-    declarator: (_
-        declarator: (_
-            declarator: (parenthesized_declarator
+            [
                 (_
                     declarator: [
                         (function_declarator
@@ -165,20 +154,74 @@
                         (_
                             declarator: (function_declarator
                                 declarator: (identifier) @name))
-                    ]))))) @definition.function
+                        (reference_declarator
+                            (function_declarator
+                                declarator: (identifier) @name))
+                    ])
+                (reference_declarator
+                    (function_declarator
+                        declarator: (identifier) @name))
+            ]))) @definition.function
+
+(function_definition
+    declarator: (_
+        declarator: (_
+            declarator: (parenthesized_declarator
+                [
+                    (_
+                        declarator: [
+                            (function_declarator
+                                declarator: (identifier) @name)
+                            (_
+                                declarator: (function_declarator
+                                    declarator: (identifier) @name))
+                            (reference_declarator
+                                (function_declarator
+                                    declarator: (identifier) @name))
+                        ])
+                    (reference_declarator
+                        (function_declarator
+                            declarator: (identifier) @name))
+                ])))) @definition.function
 
 ; ... and a function whose return type follows a macro with arguments (`__alloc_size(1, 2) void *f(int n)`): the parser
-; takes the rest for a parenthesized declarator
+; takes the rest for a parenthesized declarator, which holds the pointer or reference declarators of the return type.
+; The wildcards have a field, so they cannot be the error node that holds the arguments of the macro.
 
 (function_definition
     declarator: (parenthesized_declarator
-        (_
-            declarator: (function_declarator
+        [
+            (_
                 declarator: [
-                    (identifier) @name
-                    (template_function
-                        name: (identifier) @name)
-                ])))) @definition.function
+                    (function_declarator
+                        declarator: [
+                            (identifier) @name
+                            (template_function
+                                name: (identifier) @name)
+                        ])
+                    (_
+                        declarator: (function_declarator
+                            declarator: [
+                                (identifier) @name
+                                (template_function
+                                    name: (identifier) @name)
+                            ]))
+                    (reference_declarator
+                        (function_declarator
+                            declarator: [
+                                (identifier) @name
+                                (template_function
+                                    name: (identifier) @name)
+                            ]))
+                ])
+            (reference_declarator
+                (function_declarator
+                    declarator: [
+                        (identifier) @name
+                        (template_function
+                            name: (identifier) @name)
+                    ]))
+        ])) @definition.function
 
 ; method definitions: in a class body, qualified (`Foo::bar`, `ns::Foo::bar`), destructors and operators
 

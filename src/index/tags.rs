@@ -517,13 +517,21 @@ fn line_starts(src: &[u8]) -> Vec<usize> {
 /// Whether `name` looks like an identifier. The upstream queries also capture things like `ns.Thing`, `(getClass())` or
 /// a template function with its arguments (`make<int>`).
 ///
-/// C++ operators (`operator()`, `operator[]`, `operator bool`, `operator delete[]`, `operator<`) are the one kind of
+/// C++ operators (`operator()`, `operator[]`, `operator new`, `operator delete[]`, `operator<`) are the one kind of
 /// name with punctuation or a space in it, see `is_operator_name`.
 fn plausible_name(grammar: Grammar, name: &str) -> bool {
-    if name.is_empty() || name.len() > MAX_NAME_BYTES || name.chars().any(char::is_control) {
+    if name.is_empty() || name.len() > MAX_NAME_BYTES {
         return false;
     }
-    if is_operator_name(grammar, name) {
+    let operator = is_operator_name(grammar, name);
+    // An operator may be written across a tab (`operator\t==`), but not across a line break.
+    if name
+        .chars()
+        .any(|c| c.is_control() && !(operator && c == '\t'))
+    {
+        return false;
+    }
+    if operator {
         return true;
     }
     !name.chars().any(char::is_whitespace)
@@ -546,7 +554,7 @@ fn is_word_char(c: char) -> bool {
 }
 
 /// The name of a tag, from the source text of the name. A C++ operator is written without the whitespace that does not
-/// separate two words, so `operator ()` and `operator()` are one name, and `operator bool` and `operator new[]` keep
+/// separate two words, so `operator ()` and `operator()` are one name, and `operator new[]` and `operator co_await` keep
 /// the single space they need.
 fn tag_name(grammar: Grammar, text: &[u8]) -> String {
     let name = String::from_utf8_lossy(text);
@@ -588,8 +596,11 @@ enum Capture {
     Tag { is_def: bool },
     /// Captures that only serve the predicates of the query (`@local.reference`), and those of the `tree-sitter-tags`
     /// crate that mean nothing to this runner (`@doc`, `@ignore`, `@local.scope`, `@local.definition`). A query written
-    /// for the crate still loads, without what these captures would have added: the queries that ship with a grammar
-    /// can start to use them in a release, and every file of that grammar would otherwise fail.
+    /// for the crate still loads, but what these captures do there is not done here: `@ignore` keeps no later pattern
+    /// from tagging its name, and `@local.scope` and `@local.definition` do not hide the references to local variables
+    /// from a pattern with `(#is-not? local)`, so such a query tags more than it would in the crate. They are accepted
+    /// because the queries that ship with a grammar can start to use them in a release, and every file of that grammar
+    /// would otherwise fail.
     Other,
 }
 
@@ -1373,10 +1384,13 @@ static inline __alloc_size(1, 2) void *alloc_array(size_t n, size_t size) {
     return 0;
 }
 int declared_only(int x);
+char ****h4(void) { return 0; }
+char *****h5(void) { return 0; }
+char ******h6(void) { return 0; }
 "#;
         // The same as in C, with the qualified names and template functions of C++, and the macro with arguments in
         // front of a return type that the parser makes a parenthesized declarator of. A function declarator among the
-        // parameters is no function: `cb` is only called.
+        // parameters is no function: `cb` is only called. Up to five pointers are looked through, not six.
         assert_eq!(
             defs(Grammar::Cpp, src),
             [
@@ -1392,9 +1406,44 @@ int declared_only(int x);
                 "function make 12:27 12-12",
                 "function make 13:18 13-13",
                 "function alloc_array 14:40 14-16",
+                "function h4 18:10 18-18",
+                "function h5 19:11 19-19",
             ]
         );
         assert_has(&refs(Grammar::Cpp, src), &["call cb 1:30"]);
+    }
+
+    #[test]
+    fn cpp_functions_are_found_behind_a_macro_with_arguments_and_inside_parentheses() {
+        let src = r#"static inline __alloc_size(1, 2) void *alloc_ptr(size_t n) { return 0; }
+static inline __alloc_size(1, 2) Foo &alloc_ref(int n) { return x; }
+static inline __alloc_size(1, 2) void **alloc_ptrs(int n) { return 0; }
+static inline __alloc_size(1, 2) Foo *&alloc_ptr_ref(int n) { return x; }
+int (*get_cb(void))(int) { return 0; }
+int (&get_arr())[3] { return x; }
+void (&get_fn())(int) { return f; }
+int (*&get_ref())(int) { return f; }
+char *(**get_ptrs(void))[3] { return 0; }
+char *(&get_ptr_arr())[3] { return x; }
+"#;
+        // The parser takes what follows the macro for a parenthesized declarator, which holds the pointers and the
+        // reference of the return type. A function that returns a function pointer, or a pointer or reference to an
+        // array or function, has its name inside parentheses.
+        assert_eq!(
+            defs(Grammar::Cpp, src),
+            [
+                "function alloc_ptr 1:40 1-1",
+                "function alloc_ref 2:39 2-2",
+                "function alloc_ptrs 3:41 3-3",
+                "function alloc_ptr_ref 4:40 4-4",
+                "function get_cb 5:7 5-5",
+                "function get_arr 6:7 6-6",
+                "function get_fn 7:8 7-7",
+                "function get_ref 8:8 8-8",
+                "function get_ptrs 9:10 9-9",
+                "function get_ptr_arr 10:9 10-10",
+            ]
+        );
     }
 
     #[test]
@@ -1415,9 +1464,13 @@ template <> void ns::Foo::bar<int>() {}
 template <> void a::b::Foo::bar<int>() {}
 template <> Foo *Foo::baz<int>() { return 0; }
 template <> Foo &Foo::qux<int>() { return x; }
+void g() {
+    A::B::template get<0>(x);
+    A::B::C::template get<0>(x);
+}
 "#;
-        // Calls and method definitions are named by their identifier, at every depth of qualification and also when the
-        // template is a dependent name (`T::template cast<int>()`, `obj.template run<int>()`).
+        // Calls and method definitions are named by their identifier, under up to three levels of qualification, and
+        // also when the template is a dependent name (`T::template cast<int>()`, `obj.template run<int>()`).
         assert_has(
             &refs(Grammar::Cpp, src),
             &[
@@ -1430,6 +1483,8 @@ template <> Foo &Foo::qux<int>() { return x; }
                 "call run 8:9",
                 "call create 9:19",
                 "call plain 10:5",
+                "call get 18:20",
+                "call get 19:23",
             ],
         );
         assert_eq!(
@@ -1441,6 +1496,7 @@ template <> Foo &Foo::qux<int>() { return x; }
                 "method bar 14:29 14-14",
                 "method baz 15:23 15-15",
                 "method qux 16:23 16-16",
+                "function g 17:6 17-20",
             ]
         );
         let found = tags(Grammar::Cpp, src);
@@ -2015,7 +2071,8 @@ Foo::Foo() {}
                 "operators.Binary",
                 "operator_.x",
                 "operator1 x",
-                "operator\nbool",
+                // An operator may be written across a tab, not across a line break.
+                "operator\n==",
                 // A template function is named by its identifier, never with its template arguments.
                 "make<int>",
                 "forward<ActTypes>",
@@ -2045,9 +2102,10 @@ Foo::Foo() {}
             "operator()",
             "operator[]",
             "operator,",
-            "operator bool",
+            "operator co_await",
             "operator new",
             "operator delete[]",
+            "operator\t==",
             "operator std::string",
         ] {
             assert!(plausible_name(Grammar::Cpp, name), "{name}");
@@ -2129,10 +2187,10 @@ long operator""_km(long double x) { return 0; }
 
         for (written, tagged) in [
             ("operator ()", "operator()"),
-            ("operator  [ ]", "operator[]"),
             ("operator new  []", "operator new[]"),
             ("operator   delete", "operator delete"),
-            ("operator\tbool", "operator bool"),
+            ("operator\t==", "operator=="),
+            ("operator  co_await", "operator co_await"),
             ("operator \"\" _mi", "operator\"\"_mi"),
             ("operator<=>", "operator<=>"),
             ("operator", "operator"),
@@ -2142,6 +2200,20 @@ long operator""_km(long double x) { return 0; }
         }
         // Only a C++ operator is rewritten.
         assert_eq!(tag_name(Grammar::Go, b"operator  ()"), "operator  ()");
+    }
+
+    #[test]
+    fn cpp_operators_may_be_written_across_a_tab_but_not_across_a_line_break() {
+        let src = "struct S {\n  bool operator\t==(const S &o) const { return true; }\n  S &operator\t=(const S &o) { return *this; }\n  auto operator   co_await() { return 0; }\n  bool operator\n==(const S &o) const { return true; }\n};\n";
+        assert_eq!(
+            defs(Grammar::Cpp, src),
+            [
+                "class S 1:8 1-7",
+                "method operator== 2:8 2-2",
+                "method operator= 3:6 3-3",
+                "method operator co_await 4:8 4-4",
+            ]
+        );
     }
 
     #[test]
@@ -2288,13 +2360,16 @@ long operator""_km(long double x) { return 0; }
         let (snippet, column) = line_snippet(line.as_bytes(), 1, 5).unwrap();
         assert_eq!((snippet.encode_utf16().count(), column), (200, 5));
         assert!(snippet.starts_with("let value"));
-        // Indentation is not shown, so it does not push the name out: 80 units and 100 of indentation in front of it
-        // are no further out than the 80.
-        let line = format!("{}{} name() {{}}", " ".repeat(100), "a".repeat(80));
-        assert_eq!(
-            line_snippet(line.as_bytes(), 1, 182),
-            Some((format!("{} name() {{}}", "a".repeat(80)), 82))
-        );
+        // Indentation is not shown, so it does not push the name out: 80 units after 100 or after 1000 of indentation
+        // are no further out than the 80, also when the indentation reaches beyond the bytes that are looked at.
+        for indent in [100, 1000] {
+            let line = format!("{}{} name() {{}}", " ".repeat(indent), "a".repeat(80));
+            assert_eq!(
+                line_snippet(line.as_bytes(), 1, indent as u32 + 82),
+                Some((format!("{} name() {{}}", "a".repeat(80)), 82)),
+                "{indent} spaces"
+            );
+        }
         // Further out, the snippet starts 40 units before the name.
         for (name_column, expected) in [(161, 161), (162, 41), (601, 41), (200_001, 41)] {
             let before = format!(
