@@ -18,6 +18,7 @@ import {
   submitReview,
   type ChangedFile,
   type CommentMode,
+  type NavPos,
   type PrSummary,
   type RepoRef,
   type ReplyRequest,
@@ -28,7 +29,7 @@ import {
   type TreeEntry,
   type ViewedState,
 } from '../api'
-import { fileQuery, navigate, type PrRoute } from '../router'
+import { currentEntry, fileQuery, navigate, rememberPos, type PrRoute } from '../router'
 import {
   GENERATED_KEY,
   adjacentChanged,
@@ -59,6 +60,8 @@ import { REVIEW_KEY, ReviewDialog } from './ReviewDialog'
 interface Props {
   route: PrRoute
   search: string
+  /** Tells the history entries apart: a push to the same URL changes it. */
+  entryId: string
 }
 
 /**
@@ -69,6 +72,9 @@ interface Props {
 type Data = { pr: PrSummary; files: ChangedFile[]; requestedAt: number; threads: ReviewRead }
 
 const DOUBLE_SHIFT_MS = 350
+
+/** How long the caret rests before it is recorded in the history entry (the browser limits how often the history may be written). */
+const CARET_REMEMBER_MS = 1000
 
 /** The head tree of one head: its entries, or why listing it failed. */
 type Listing = { head: string; entries: TreeEntry[]; error: null } | { head: string; entries: null; error: string; stale: boolean }
@@ -90,7 +96,7 @@ function isLetterKey(e: KeyboardEvent, letter: string): boolean {
   return e.key.length === 1 && !/^[a-z]$/i.test(e.key) && e.code === `Key${letter.toUpperCase()}`
 }
 
-export function PrPage({ route, search }: Props) {
+export function PrPage({ route, search, entryId }: Props) {
   const repo = useMemo<RepoRef>(
     () => ({ host: route.host, owner: route.owner, repo: route.repo }),
     [route.host, route.owner, route.repo],
@@ -165,7 +171,7 @@ export function PrPage({ route, search }: Props) {
   }
   return (
     <MarkdownContext.Provider value={markdown}>
-      <PrView repo={repo} data={data} search={search} onRefresh={refresh} refreshing={refreshing} />
+      <PrView repo={repo} data={data} search={search} entryId={entryId} onRefresh={refresh} refreshing={refreshing} />
     </MarkdownContext.Provider>
   )
 }
@@ -174,11 +180,12 @@ interface ViewProps {
   repo: RepoRef
   data: Data
   search: string
+  entryId: string
   refreshing: boolean
   onRefresh(): void
 }
 
-function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
+function PrView({ repo, data, search, entryId, refreshing, onRefresh }: ViewProps) {
   const { pr, files, requestedAt } = data
   const head = pr.head.sha
   const [storedScope, setScope] = usePersistentState<TreeScope>('dr.treeScope', 'changed')
@@ -697,12 +704,51 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
     [changedCurrent, order, currentIndex, current, fullTree],
   )
 
+  /** Records the caret of the file shown in the history entry shown, so that Back and Forward return to it (and a reload keeps it). */
+  const rememberCaret = useCallback(() => {
+    const pos = pane.current?.position()
+    // Not the caret of a file the URL has left already.
+    if (pos && pos.path === new URLSearchParams(location.search).get('file')) rememberPos(pos)
+  }, [])
+
+  /** Moves to `url` as a new history entry, after recording the caret here for Back; `to` is where the caret lands there. */
+  const goTo = useCallback(
+    (url: string, to?: NavPos) => {
+      rememberCaret()
+      navigate(url, false, to)
+    },
+    [rememberCaret],
+  )
+
+  // The caret is also recorded once it has rested for a moment, for the ways out of an entry that don't pass through goTo:
+  // the browser's own Back, a reload. And as the page goes (pagehide is too late for a reload to keep it).
+  const caretTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  const caretMoved = useCallback(() => {
+    clearTimeout(caretTimer.current)
+    caretTimer.current = setTimeout(rememberCaret, CARET_REMEMBER_MS)
+  }, [rememberCaret])
+  useEffect(() => () => clearTimeout(caretTimer.current), [])
+  useEffect(() => {
+    window.addEventListener('beforeunload', rememberCaret)
+    return () => window.removeEventListener('beforeunload', rememberCaret)
+  }, [rememberCaret])
+
+  // Arriving at a history entry that has a place (Back, Forward, a reload, or a jump that came with one): reveal it. A pane
+  // that isn't there yet, or isn't showing the file, gets it queued.
+  useLayoutEffect(() => {
+    const pos = currentEntry().pos
+    if (!pos || pos.path !== requested) return
+    if (pane.current) pane.current.reveal(pos)
+    else pendingJump.current = { path: pos.path, pos }
+    // A different entry, also one with the same URL, is what makes it a new arrival.
+  }, [entryId])
+
   const openFile = useCallback(
     (path: string, jump?: 'first' | 'last') => {
       pendingJump.current = jump ? { path, where: jump } : null
-      if (path !== requested) navigate(location.pathname + fileQuery(path, location.search))
+      if (path !== requested) goTo(location.pathname + fileQuery(path, location.search))
     },
-    [requested],
+    [requested, goTo],
   )
 
   // Says once that a box lost its thread (again if it comes back and goes again).
@@ -780,15 +826,15 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
   }
 
   // Keep the latest navigation state for the window-level key handler.
-  const nav = useRef({ neighbor, openFile, dialogOpen, toggleCurrentViewed, commentHere })
+  const nav = useRef({ neighbor, openFile, dialogOpen, toggleCurrentViewed, commentHere, rememberCaret })
   useLayoutEffect(() => {
-    nav.current = { neighbor, openFile, dialogOpen, toggleCurrentViewed, commentHere }
+    nav.current = { neighbor, openFile, dialogOpen, toggleCurrentViewed, commentHere, rememberCaret }
   })
 
   useEffect(() => {
     let lastShift = 0
     const onKeyDown = (e: KeyboardEvent) => {
-      const { neighbor, openFile, dialogOpen, toggleCurrentViewed, commentHere } = nav.current
+      const { neighbor, openFile, dialogOpen, toggleCurrentViewed, commentHere, rememberCaret } = nav.current
       // In a comment box (or any text field) keys are text, but Ctrl+P (the box keeps its draft).
       const typing = isTypingTarget(e.target)
       if (e.key === 'Shift') {
@@ -841,6 +887,17 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
         consume()
         const target = neighbor(e.key === 'ArrowDown' ? 1 : -1)
         if (target) openFile(target.path)
+        return
+      }
+      if (e.ctrlKey && e.altKey && !e.metaKey && !e.shiftKey && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
+        // One step per press: a held key repeats faster than the history moves. Back stops at the first entry the app made;
+        // only the browser's own button leaves the app.
+        consume()
+        const back = e.key === 'ArrowLeft'
+        if (e.repeat || (back && currentEntry().depth === 0)) return
+        rememberCaret()
+        if (back) history.back()
+        else history.forward()
         return
       }
       if (plain && !e.shiftKey && isLetterKey(e, 'v') && !e.repeat) {
@@ -969,6 +1026,7 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
                 }
                 review={paneReview}
                 onChangeInfo={setChangeInfo}
+                onCaret={caretMoved}
               />
             </ThreadActionsContext.Provider>
           ) : unresolved ? (
@@ -999,6 +1057,7 @@ function PrView({ repo, data, search, refreshing, onRefresh }: ViewProps) {
         <span className="hint"><kbd>F7</kbd> next change</span>
         <span className="hint"><kbd>Shift+F7</kbd> previous</span>
         <span className="hint"><kbd>Alt+↓</kbd>/<kbd>Alt+↑</kbd> next/previous file</span>
+        <span className="hint"><kbd>Ctrl+Alt+←</kbd>/<kbd>→</kbd> back/forward</span>
         <span className="hint"><kbd>Shift Shift</kbd>/<kbd>Ctrl+P</kbd> find file</span>
         <span className="hint"><kbd>v</kbd> viewed</span>
         <span className="hint"><kbd>c</kbd> comment</span>

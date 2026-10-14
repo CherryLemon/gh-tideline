@@ -3,11 +3,11 @@ import { navigate, parsePrInput, parsePrPath, prPath, useLocation } from './rout
 import { PrPage } from './components/PrPage'
 
 export function App() {
-  const { pathname, search } = useLocation()
+  const { pathname, search, entryId } = useLocation()
   const route = parsePrPath(pathname)
   if (route) {
     const key = prPath(route)
-    return <PrPage key={key} route={route} search={search} />
+    return <PrPage key={key} route={route} search={search} entryId={entryId} />
   }
   return <Home />
 }

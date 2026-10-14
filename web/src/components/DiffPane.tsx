@@ -116,6 +116,8 @@ interface Props {
   /** Absent while the threads haven't been read. */
   review?: PaneReview
   onChangeInfo(info: ChangeInfo | null): void
+  /** The user moved the caret (mouse or keyboard), not a reveal or F7. */
+  onCaret?(): void
 }
 
 type PaneState =
@@ -178,8 +180,15 @@ function endLine(c: Monaco.editor.ILineChange, side: 'original' | 'modified'): n
   return end === 0 ? anchor(c, side) : end
 }
 
+/** Scrolls `at` to the middle if it is out of view, at once (smooth scrolling is cut short by a later scroll); true if it scrolled. */
+function centerIfOutside(editor: EditorT, at: Monaco.IPosition): boolean {
+  const from = editor.getScrollTop()
+  editor.revealPositionInCenterIfOutsideViewport(at, 1)
+  return editor.getScrollTop() !== from
+}
+
 export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
-  { repo, file, provisional = false, nextFile, sideBySide, ignoreTrimWhitespace, pendingJump, headerActions, review, onChangeInfo },
+  { repo, file, provisional = false, nextFile, sideBySide, ignoreTrimWhitespace, pendingJump, headerActions, review, onChangeInfo, onCaret },
   ref,
 ) {
   const editorRef = useRef<DiffEditorT | null>(null)
@@ -219,12 +228,15 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
    */
   const fresh = useRef(true)
   /**
-   * Where a reveal put the caret, until the view is moved: cards and unfolded lines that arrive later can push
-   * it out of view, so each card sync brings it back.
+   * Where a reveal put the caret, until the user acts: cards and unfolded lines that arrive later, and the diff
+   * editor aligning its two sides, can push it out of place, so each change of the layout brings it back. Once
+   * the caret has been scrolled to the middle it is kept there, else it is only kept in view.
    */
-  const settle = useRef<{ editor: EditorT; at: Monaco.IPosition; scrollTop: number } | null>(null)
+  const settle = useRef<{ editor: EditorT; at: Monaco.IPosition; centered: boolean } | null>(null)
   const onChangeInfoRef = useRef(onChangeInfo)
   onChangeInfoRef.current = onChangeInfo
+  const onCaretRef = useRef(onCaret)
+  onCaretRef.current = onCaret
   /** The thread cards in the diff editor. */
   const [host, setHost] = useState<ZoneHost | null>(null)
   /** Bumped when the diff editor has a new diff, so the cards are placed against it. */
@@ -257,6 +269,15 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
     }),
     [sideBySide, ignoreTrimWhitespace, attachedForced],
   )
+
+  const keepSettled = useCallback(() => {
+    const s = settle.current
+    if (!s) return
+    // Until Monaco has aligned the sides of a diff, the shorter one clamps the scroll of the other, so a caret that was
+    // centered is centered again after each change, not only once it has left the view.
+    if (s.centered) s.editor.revealPositionInCenter(s.at, 1)
+    else s.centered = centerIfOutside(s.editor, s.at)
+  }, [])
 
   const activeSide = useCallback((ed: DiffEditorT): 'original' | 'modified' => {
     return sideBySide && ed.getOriginalEditor().hasTextFocus() ? 'original' : 'modified'
@@ -372,6 +393,7 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
           fresh.current = false
           navIndex.current = null
           settle.current = null
+          onCaretRef.current?.()
         }
         reportRef.current()
       }
@@ -379,9 +401,18 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
       ed.getOriginalEditor().onDidChangeCursorPosition(onCursor)
       ed.getModifiedEditor().onDidFocusEditorText(() => (lastSide.current = 'modified'))
       ed.getOriginalEditor().onDidFocusEditorText(() => (lastSide.current = 'original'))
+      // Cards, unfolded lines and the two sides being aligned all change the size of an editor's content. Not scrolled
+      // from within the event: Monaco is laying out then, and its line numbers end up a few pixels off the text.
+      let frame = 0
+      const later = () => {
+        cancelAnimationFrame(frame)
+        frame = requestAnimationFrame(keepSettled)
+      }
+      ed.getModifiedEditor().onDidContentSizeChange(later)
+      ed.getOriginalEditor().onDidContentSizeChange(later)
       setDiffEditor(ed)
     },
-    [],
+    [keepSettled],
   )
   // The mount callback is registered once; route it to the latest closures.
   const consumeRef = useRef(consumePendingJump)
@@ -412,7 +443,10 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
     // @monaco-editor/react attached an empty model of its own; files are set per load.
     ed.getModel()?.dispose()
     ed.onDidChangeCursorPosition((e) => {
-      if (e.source === 'mouse' || e.source === 'keyboard') fresh.current = false
+      if (e.source === 'mouse' || e.source === 'keyboard') {
+        fresh.current = false
+        onCaretRef.current?.()
+      }
     })
     setSingleReady(true)
   }, [])
@@ -585,17 +619,23 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
       ...(placement?.zones ?? []).map((z) => spec(z.thread.id, z)),
       ...(draftPlacement?.zones ?? []).map((z) => spec(draftCardKey(z.draft.key), z)),
     ]
-    // The caret a reveal brought into view, unless the view has been moved since.
-    const settled = settle.current
-    const stay = settled !== null && settled.editor.getScrollTop() === settled.scrollTop
     // Unfolding moves the caret; in a file the user hasn't moved in, leave it on the first change.
     const first = editorRef.current?.getLineChanges()?.[0]
     host.sync(specs, fresh.current ? (first ? anchor(first, 'modified') : 1) : 'keep')
-    if (settled && stay) {
-      settled.editor.revealPositionInCenterIfOutsideViewport(settled.at, 1)
-      settled.scrollTop = settled.editor.getScrollTop()
-    } else if (settled) settle.current = null
-  }, [placed, placement, draftPlacement, host])
+    keepSettled()
+  }, [placed, placement, draftPlacement, host, keepSettled])
+
+  // Scrolling, clicking or typing ends the hold on the caret's place.
+  useEffect(() => {
+    const release = () => {
+      settle.current = null
+    }
+    const types = ['wheel', 'pointerdown', 'keydown'] as const
+    for (const type of types) window.addEventListener(type, release, { capture: true, passive: true })
+    return () => {
+      for (const type of types) window.removeEventListener(type, release, { capture: true })
+    }
+  }, [])
 
   // After the zones are synced: a box opened again is already placed, so `revealTick` runs this.
   useLayoutEffect(() => {
@@ -642,15 +682,14 @@ export const DiffPane = forwardRef<DiffPaneHandle, Props>(function DiffPane(
     const at = { lineNumber, column: Math.min(Math.max(1, pos.column), model.getLineMaxColumn(lineNumber)) }
     // Moving the caret also unfolds the unchanged lines that hide it.
     editor.setPosition(at)
-    // Immediate (1), not the default smooth scrolling that a later scroll would cut short. Only if it is
-    // out of view, so Back to a file keeps the scroll position it had.
-    editor.revealPositionInCenterIfOutsideViewport(at, 1)
+    // Only if it is out of view, so Back to a file keeps the scroll position it had.
+    const centered = centerIfOutside(editor, at)
     editor.focus()
     lastSide.current = side
     fresh.current = false
     navIndex.current = null
     if (editor === singleRef.current) return true
-    settle.current = { editor, at, scrollTop: editor.getScrollTop() }
+    settle.current = { editor, at, centered }
     reportChangeInfo()
     return true
   }
