@@ -175,7 +175,7 @@ fn parse_within(
             return budget.stopped();
         }
         let found = &found[i];
-        let name = String::from_utf8_lossy(&src[found.name.clone()]).into_owned();
+        let name = tag_name(grammar, &src[found.name.clone()]);
         let kind = config.kind(found.capture);
         let row = row_of(found.name.start);
         let (from_byte, from_column) = match previous {
@@ -431,7 +431,8 @@ fn snippet_at(line: &[u8], name_byte: usize) -> (String, u32) {
     let to = line.len().min(name_byte + SNIPPET_WINDOW);
     let head = String::from_utf8_lossy(&line[from..name_byte]);
     let tail = String::from_utf8_lossy(&line[name_byte..to]);
-    let head: &str = if from == 0 { head.trim_start() } else { &head };
+    // The indentation is not shown, so it does not count towards the name being too far into the line to fit.
+    let head = head.trim_start();
 
     let head_units = head.encode_utf16().count();
     // A name too far into the line to fit gets a window that starts shortly before it.
@@ -513,26 +514,59 @@ fn line_starts(src: &[u8]) -> Vec<usize> {
         .collect()
 }
 
-/// Whether `name` looks like an identifier. The upstream queries also capture things like `ns.Thing` or `(getClass())`.
+/// Whether `name` looks like an identifier. The upstream queries also capture things like `ns.Thing`, `(getClass())` or
+/// a template function with its arguments (`make<int>`).
 ///
-/// C++ operators (`operator()`, `operator[]`, `operator bool`, `operator delete[]`) are the one kind of name with
-/// punctuation or a space in it. They are told from identifiers that start with `operator` (a JavaScript
-/// `operators.Binary`) by the character after the keyword and by the grammar.
+/// C++ operators (`operator()`, `operator[]`, `operator bool`, `operator delete[]`, `operator<`) are the one kind of
+/// name with punctuation or a space in it, see `is_operator_name`.
 fn plausible_name(grammar: Grammar, name: &str) -> bool {
     if name.is_empty() || name.len() > MAX_NAME_BYTES || name.chars().any(char::is_control) {
         return false;
     }
-    let operator = grammar == Grammar::Cpp
-        && name.strip_prefix("operator").is_some_and(|rest| {
-            !rest.starts_with(|c: char| c.is_alphanumeric() || c == '_' || c == '$')
-        });
-    if operator {
+    if is_operator_name(grammar, name) {
         return true;
     }
     !name.chars().any(char::is_whitespace)
         && !name.contains([
-            '.', ',', ';', ':', '(', ')', '[', ']', '{', '}', '"', '\'', '`', '\\',
+            '.', ',', ';', ':', '(', ')', '[', ']', '{', '}', '"', '\'', '`', '\\', '<', '>',
         ])
+}
+
+/// Whether `name` is that of a C++ operator, told from an identifier that starts with `operator` (a JavaScript
+/// `operators.Binary`) by the grammar and by the character after the keyword.
+fn is_operator_name(grammar: Grammar, name: &str) -> bool {
+    grammar == Grammar::Cpp
+        && name
+            .strip_prefix("operator")
+            .is_some_and(|rest| !rest.starts_with(is_word_char))
+}
+
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '$'
+}
+
+/// The name of a tag, from the source text of the name. A C++ operator is written without the whitespace that does not
+/// separate two words, so `operator ()` and `operator()` are one name, and `operator bool` and `operator new[]` keep
+/// the single space they need.
+fn tag_name(grammar: Grammar, text: &[u8]) -> String {
+    let name = String::from_utf8_lossy(text);
+    if !is_operator_name(grammar, &name) {
+        return name.into_owned();
+    }
+    let mut normalized = String::from("operator");
+    let mut space = false;
+    for c in name["operator".len()..].chars() {
+        if c.is_whitespace() {
+            space = true;
+            continue;
+        }
+        if space && is_word_char(c) && normalized.ends_with(is_word_char) {
+            normalized.push(' ');
+        }
+        space = false;
+        normalized.push(c);
+    }
+    normalized
 }
 
 fn cancelled(cancel: Option<&AtomicUsize>) -> bool {
@@ -552,15 +586,23 @@ enum Capture {
     Name,
     /// `@definition.<kind>` or `@reference.<kind>`, the node that is tagged.
     Tag { is_def: bool },
-    /// Captures that only serve the predicates of the query (`@local.reference`).
+    /// Captures that only serve the predicates of the query (`@local.reference`), and those of the `tree-sitter-tags`
+    /// crate that mean nothing to this runner (`@doc`, `@ignore`, `@local.scope`, `@local.definition`). A query written
+    /// for the crate still loads, without what these captures would have added: the queries that ship with a grammar
+    /// can start to use them in a release, and every file of that grammar would otherwise fail.
     Other,
 }
 
 impl Config {
     fn new(grammar: Grammar) -> Result<Self, String> {
+        Config::compile(grammar, &tags_query(grammar))
+    }
+
+    /// `source` as the tags query of `grammar`. A capture that is neither one of ours nor one of the crate's is an error.
+    fn compile(grammar: Grammar, source: &str) -> Result<Self, String> {
         let error = |what: &dyn fmt::Display| format!("{} tags query: {what}", grammar.id());
         let language = language(grammar);
-        let query = Query::new(&language, &tags_query(grammar)).map_err(|e| error(&e))?;
+        let query = Query::new(&language, source).map_err(|e| error(&e))?;
         let mut has_name = false;
         let mut captures = Vec::new();
         for name in query.capture_names() {
@@ -569,7 +611,9 @@ impl Config {
                     has_name = true;
                     Capture::Name
                 }
-                "local.reference" => Capture::Other,
+                "local.reference" | "local.scope" | "local.definition" | "doc" | "ignore" => {
+                    Capture::Other
+                }
                 _ if name.starts_with("definition.") => Capture::Tag { is_def: true },
                 _ if name.starts_with("reference.") => Capture::Tag { is_def: false },
                 _ => return Err(error(&format!("invalid capture @{name}"))),
@@ -1311,6 +1355,102 @@ int declared_only(int x);
     }
 
     #[test]
+    fn cpp_functions_are_found_behind_declarators_and_not_among_their_parameters() {
+        let src = r#"void takes_fn(int cb(int)) { cb(1); }
+void takes_ptr(int (*cb)(int), char *names[]) {}
+int (*get_cb(void))(int) { return 0; }
+char ***h3(void) {
+    return 0;
+}
+char *(**get3(void))[3] { return 0; }
+Foo *f() { return 0; }
+Foo *&g() { return x; }
+Foo &&mv() { return x; }
+const Foo &Bar::h() const { return x; }
+template <typename T> T **make() { return 0; }
+template <> int *make<int>() { return 0; }
+static inline __alloc_size(1, 2) void *alloc_array(size_t n, size_t size) {
+    return 0;
+}
+int declared_only(int x);
+"#;
+        // The same as in C, with the qualified names and template functions of C++, and the macro with arguments in
+        // front of a return type that the parser makes a parenthesized declarator of. A function declarator among the
+        // parameters is no function: `cb` is only called.
+        assert_eq!(
+            defs(Grammar::Cpp, src),
+            [
+                "function takes_fn 1:6 1-1",
+                "function takes_ptr 2:6 2-2",
+                "function get_cb 3:7 3-3",
+                "function h3 4:9 4-6",
+                "function get3 7:10 7-7",
+                "function f 8:6 8-8",
+                "function g 9:7 9-9",
+                "function mv 10:7 10-10",
+                "method h 11:17 11-11",
+                "function make 12:27 12-12",
+                "function make 13:18 13-13",
+                "function alloc_array 14:40 14-16",
+            ]
+        );
+        assert_has(&refs(Grammar::Cpp, src), &["call cb 1:30"]);
+    }
+
+    #[test]
+    fn cpp_template_arguments_are_no_part_of_a_name() {
+        let src = r#"void f() {
+    auto p = std::make_unique<Foo>();
+    std::forward<ActTypes>(args);
+    auto q = a::b::make<int, long>(1);
+    auto r = a::b::c::get<0>(x);
+    T::template cast<int>(x);
+    obj.template run<int>();
+    obj.run<int>();
+    ns::Foo<int>::create<int>();
+    plain<int>(1);
+}
+template <> void Foo::bar<int>() {}
+template <> void ns::Foo::bar<int>() {}
+template <> void a::b::Foo::bar<int>() {}
+template <> Foo *Foo::baz<int>() { return 0; }
+template <> Foo &Foo::qux<int>() { return x; }
+"#;
+        // Calls and method definitions are named by their identifier, at every depth of qualification and also when the
+        // template is a dependent name (`T::template cast<int>()`, `obj.template run<int>()`).
+        assert_has(
+            &refs(Grammar::Cpp, src),
+            &[
+                "call make_unique 2:19",
+                "call forward 3:10",
+                "call make 4:20",
+                "call get 5:23",
+                "call cast 6:17",
+                "call run 7:18",
+                "call run 8:9",
+                "call create 9:19",
+                "call plain 10:5",
+            ],
+        );
+        assert_eq!(
+            defs(Grammar::Cpp, src),
+            [
+                "function f 1:6 1-11",
+                "method bar 12:23 12-12",
+                "method bar 13:27 13-13",
+                "method bar 14:29 14-14",
+                "method baz 15:23 15-15",
+                "method qux 16:23 16-16",
+            ]
+        );
+        let found = tags(Grammar::Cpp, src);
+        assert!(
+            found.iter().all(|t| !t.name.contains(['<', '>'])),
+            "{found:#?}"
+        );
+    }
+
+    #[test]
     fn cpp_tags() {
         assert_eq!(
             defs(Grammar::Cpp, CPP),
@@ -1508,6 +1648,40 @@ Foo::Foo() {}
             assert!(config(grammar).is_ok(), "{grammar:?}");
             assert!(tags(grammar, "").is_empty(), "{grammar:?}");
         }
+    }
+
+    #[test]
+    fn a_query_may_use_the_captures_of_the_tags_crate_but_no_others() {
+        // `tree-sitter-tags` knows these captures; the queries that ship with a grammar can start to use them.
+        let query = "(function_item name: (identifier) @name) @definition.function\n\
+            (source_file) @local.scope\n\
+            (let_declaration pattern: (identifier) @local.definition)\n\
+            ((identifier) @local.reference (#eq? @local.reference \"x\"))\n\
+            (line_comment) @doc\n\
+            (block_comment) @ignore\n";
+        let config = Config::compile(Grammar::Rust, query).unwrap();
+        let names = config.query.capture_names();
+        assert_eq!(names.len(), 7, "{names:?}");
+        for (name, capture) in names.iter().zip(&config.captures) {
+            match *name {
+                "name" => assert!(matches!(capture, Capture::Name)),
+                "definition.function" => assert!(matches!(capture, Capture::Tag { is_def: true })),
+                _ => assert!(matches!(capture, Capture::Other), "@{name}"),
+            }
+        }
+
+        // Any other capture is a mistake in the query and fails the grammar, as does a query that names nothing.
+        let error = Config::compile(
+            Grammar::Rust,
+            "(function_item name: (identifier) @name) @definition.function\n(identifier) @unknown\n",
+        )
+        .err()
+        .unwrap();
+        assert!(error.contains("invalid capture @unknown"), "{error}");
+        let error = Config::compile(Grammar::Rust, "(function_item) @definition.function")
+            .err()
+            .unwrap();
+        assert!(error.contains("no @name capture"), "{error}");
     }
 
     #[test]
@@ -1842,13 +2016,29 @@ Foo::Foo() {}
                 "operator_.x",
                 "operator1 x",
                 "operator\nbool",
+                // A template function is named by its identifier, never with its template arguments.
+                "make<int>",
+                "forward<ActTypes>",
+                "Foo<T>",
+                "a>b",
+                "operator_<int>",
                 long.as_str(),
             ] {
                 assert!(!plausible_name(grammar, name), "{grammar:?} {name:?}");
             }
             assert!(plausible_name(grammar, &"a".repeat(MAX_NAME_BYTES)));
         }
-        for name in ["operator==", "operator<<", "operator->"] {
+        for name in [
+            "operator==",
+            "operator<<",
+            "operator->",
+            "operator<",
+            "operator<=",
+            "operator<=>",
+            "operator>",
+            "operator>=",
+            "operator>>=",
+        ] {
             assert!(plausible_name(Grammar::Cpp, name), "{name}");
         }
         for name in [
@@ -1880,17 +2070,18 @@ Foo::Foo() {}
     }
 
     #[test]
-    fn cpp_operators_are_methods_named_as_written() {
-        let src = "struct S {\n  void *operator new(size_t n) { return 0; }\n  void operator delete[](void *p) {}\n  bool operator ()(int a) { return a; }\n  S operator+(S o) const { return o; }\n  bool operator==(const S &o) const { return true; }\n};\n";
+    fn cpp_operators_are_methods_named_by_their_operator() {
+        let src = "struct S {\n  void *operator new(size_t n) { return 0; }\n  void operator delete[](void *p) {}\n  bool operator()(int a) { return a; }\n  S operator+(S o) const { return o; }\n  bool operator==(const S &o) const { return true; }\n  bool operator<=>(const S &o) const = default;\n};\n";
         assert_eq!(
             defs(Grammar::Cpp, src),
             [
-                "class S 1:8 1-7",
+                "class S 1:8 1-8",
                 "method operator new 2:9 2-2",
                 "method operator delete[] 3:8 3-3",
-                "method operator () 4:8 4-4",
+                "method operator() 4:8 4-4",
                 "method operator+ 5:5 5-5",
                 "method operator== 6:8 6-6",
+                "method operator<=> 7:8 7-7",
             ]
         );
         // A name that merely starts with `operator` is no operator name: not with a template argument list in it.
@@ -1898,6 +2089,59 @@ Foo::Foo() {}
         let found = refs(Grammar::Cpp, src);
         assert_has(&found, &["call operatorFoo 1:49"]);
         assert_lacks(&found, &["operator_<detail::op_pow,L,R>"]);
+    }
+
+    #[test]
+    fn cpp_operator_names_do_not_depend_on_the_spacing_of_the_source() {
+        let src = r#"struct S {
+    bool operator ()(int a) { return a; }
+    bool operator  ==(const S &o) const { return true; }
+    void *operator new [](size_t n) { return 0; }
+    void operator delete   (void *p) {}
+    void operator delete [] (void *p) {}
+};
+S S::operator  -(S o) { return o; }
+bool operator   !=(const S &a, const S &b) { return false; }
+long operator "" _mi(long double x) { return 0; }
+long operator""_km(long double x) { return 0; }
+"#;
+        // Whitespace is written only where two words meet: `operator new`, but `operator()` and `operator delete[]`.
+        assert_eq!(
+            defs(Grammar::Cpp, src),
+            [
+                "class S 1:8 1-7",
+                "method operator() 2:10 2-2",
+                "method operator== 3:10 3-3",
+                "method operator new[] 4:11 4-4",
+                "method operator delete 5:10 5-5",
+                "method operator delete[] 6:10 6-6",
+                "method operator- 8:6 8-8",
+                "method operator!= 9:6 9-9",
+                "method operator\"\"_mi 10:6 10-10",
+                "method operator\"\"_km 11:6 11-11",
+            ]
+        );
+        // The columns are those of the name as written (`operator  ==` takes 12 units), not those of the tagged name.
+        let found = tags(Grammar::Cpp, src);
+        let operator = found.iter().find(|t| t.name == "operator==").unwrap();
+        assert_eq!((operator.column, operator.end_column), (10, 22));
+        assert_eq!(operator.snippet_column, 6);
+
+        for (written, tagged) in [
+            ("operator ()", "operator()"),
+            ("operator  [ ]", "operator[]"),
+            ("operator new  []", "operator new[]"),
+            ("operator   delete", "operator delete"),
+            ("operator\tbool", "operator bool"),
+            ("operator \"\" _mi", "operator\"\"_mi"),
+            ("operator<=>", "operator<=>"),
+            ("operator", "operator"),
+            ("operators.Binary", "operators.Binary"),
+        ] {
+            assert_eq!(tag_name(Grammar::Cpp, written.as_bytes()), tagged);
+        }
+        // Only a C++ operator is rewritten.
+        assert_eq!(tag_name(Grammar::Go, b"operator  ()"), "operator  ()");
     }
 
     #[test]
@@ -2044,6 +2288,13 @@ Foo::Foo() {}
         let (snippet, column) = line_snippet(line.as_bytes(), 1, 5).unwrap();
         assert_eq!((snippet.encode_utf16().count(), column), (200, 5));
         assert!(snippet.starts_with("let value"));
+        // Indentation is not shown, so it does not push the name out: 80 units and 100 of indentation in front of it
+        // are no further out than the 80.
+        let line = format!("{}{} name() {{}}", " ".repeat(100), "a".repeat(80));
+        assert_eq!(
+            line_snippet(line.as_bytes(), 1, 182),
+            Some((format!("{} name() {{}}", "a".repeat(80)), 82))
+        );
         // Further out, the snippet starts 40 units before the name.
         for (name_column, expected) in [(161, 161), (162, 41), (601, 41), (200_001, 41)] {
             let before = format!(

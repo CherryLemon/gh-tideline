@@ -516,7 +516,9 @@ impl IndexDb {
                 .iter()
                 .map(|(param, dir)| (param.as_str(), dir as &dyn ToSql)),
         );
-        let mut query = conn.prepare_cached(&sql).map_err(db_err)?;
+        // Not `prepare_cached`: the text depends on how deep the file of the click is (`rank::nearest_first_sql`), up to
+        // 65 different statements, which would push the statements that stay the same out of the cache.
+        let mut query = conn.prepare(&sql).map_err(db_err)?;
         let hits = query
             .query_map(params.as_slice(), |row| {
                 Ok(Hit {
