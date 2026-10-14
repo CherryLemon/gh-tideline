@@ -39,7 +39,7 @@ fn check_name(name: Option<&str>) -> Result<&str, AppError> {
     match name {
         Some(name) if (1..=MAX_NAME_BYTES).contains(&name.len()) && is_name(name) => Ok(name),
         _ => Err(AppError::bad_request(
-            "name must be 1 to 256 bytes without whitespace or control characters",
+            "name must be 1 to 256 bytes without control characters or whitespace, but for single spaces in a C++ operator",
         )),
     }
 }
