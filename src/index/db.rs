@@ -93,6 +93,10 @@ pub enum BlobStatus {
     TooLarge,
     /// Could not be read.
     Unreadable,
+    /// Stored by a newer version under a status this one does not know. The blob is held, so it is not done again, but
+    /// nothing is known of its tags, so it is neither fetched for the lines of its references nor read for its header.
+    /// This version never writes it.
+    Held,
 }
 
 impl BlobStatus {
@@ -101,11 +105,12 @@ impl BlobStatus {
             BlobStatus::Parsed => "parsed",
             BlobStatus::TooLarge => "too_large",
             BlobStatus::Unreadable => "unreadable",
+            BlobStatus::Held => "held",
         }
     }
 
     /// From the text in the database. A status this version does not know was stored by a newer one, which held the
-    /// blob: it counts as `parsed`, so that it is not done again, as a grammar this version does not know is left alone.
+    /// blob: it counts as `held`, as a grammar this version does not know is left alone.
     fn from_stored(text: &str) -> BlobStatus {
         [
             BlobStatus::Parsed,
@@ -114,7 +119,7 @@ impl BlobStatus {
         ]
         .into_iter()
         .find(|status| status.as_str() == text)
-        .unwrap_or(BlobStatus::Parsed)
+        .unwrap_or(BlobStatus::Held)
     }
 }
 
@@ -179,6 +184,9 @@ pub struct Hit {
     pub snippet_column: u32,
     pub tier: Tier,
 }
+
+/// The definitions a lookup found, and whether there were more than it returned.
+pub type Definitions = (Vec<Hit>, bool);
 
 /// The references a lookup found, each with the OID of its blob, and whether there were more than it returned.
 pub type References = (Vec<(Hit, String)>, bool);
@@ -475,8 +483,8 @@ impl IndexDb {
     }
 
     /// The definitions of `name` in the files of `family` in the commit, the nearest to `from_path`, the file of the
-    /// click, first (see `rank`); at most 200, which are the nearest of all. None when the commit is not completely
-    /// indexed.
+    /// click, first (see `rank`); at most 200, which are the nearest of all, and whether there are more. None when the
+    /// commit is not completely indexed.
     ///
     /// Constructors are left out (they remain symbols of their file): they have the name of their class, so the class
     /// would otherwise never be the only definition of `new Foo()`.
@@ -486,7 +494,7 @@ impl IndexDb {
         family: Family,
         name: &str,
         from_path: &str,
-    ) -> Result<Option<Vec<Hit>>, String> {
+    ) -> Result<Option<Definitions>, String> {
         let conn = lock(&self.reader);
         let Some((commit_id, used_at)) = complete_commit(&conn, commit)? else {
             return Ok(None);
@@ -503,7 +511,7 @@ impl IndexDb {
              LIMIT {limit}",
             tier = rank::TIER_SQL,
             order = rank::nearest_first_sql(&ancestors),
-            limit = rank::MAX_DEFINITIONS
+            limit = rank::MAX_DEFINITIONS + 1
         );
         let family = family.id();
         let mut params: Vec<(&str, &dyn ToSql)> = vec![
@@ -521,7 +529,7 @@ impl IndexDb {
         // Not `prepare_cached`: the text depends on how deep the file of the click is (`rank::nearest_first_sql`), up to
         // 65 different statements, which would push the statements that stay the same out of the cache.
         let mut query = conn.prepare(&sql).map_err(db_err)?;
-        let hits = query
+        let mut hits = query
             .query_map(params.as_slice(), |row| {
                 Ok(Hit {
                     path: row.get(0)?,
@@ -539,8 +547,11 @@ impl IndexDb {
             .map_err(db_err)?;
         drop(query);
         drop(conn);
+        // One more row than is returned tells whether there are more.
+        let truncated = hits.len() > rank::MAX_DEFINITIONS;
+        hits.truncate(rank::MAX_DEFINITIONS);
         self.touch(commit_id, used_at);
-        Ok(Some(hits))
+        Ok(Some((hits, truncated)))
     }
 
     /// The references to `name` in the files of `family` in the commit: the same file first, then its directory,
@@ -1000,7 +1011,7 @@ mod tests {
             (100, 1)
         );
         // The row is the same one: the commit that listed it finds the tags.
-        let hits = fx
+        let (hits, _) = fx
             .definitions(&commit(1), Family::Rust, "f", "a.rs")
             .unwrap()
             .unwrap();
@@ -1123,8 +1134,9 @@ mod tests {
         assert_eq!(sizes, HashMap::from([(oid(1), 100), (oid(2), 5 << 20)]));
         assert!(fx.blob_sizes(&[]).unwrap().is_empty());
 
-        // A status this version does not know was stored by a newer one, which held the blob: the row counts as held
-        // and parsed, instead of failing every build and outline that meets it. A grammar it does not know is left out.
+        // A status this version does not know was stored by a newer one, which held the blob: the row counts as held,
+        // instead of failing every build and outline that meets it, but not as parsed, since nothing is known of its tags.
+        // A grammar it does not know is left out.
         fx.side()
             .execute_batch(&format!(
                 "INSERT INTO blobs (oid, grammar, status, size) VALUES ('{0}', 'rust', 'surprise', 1);
@@ -1134,12 +1146,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             fx.stored_blobs(&[oid(9)]).unwrap(),
-            HashMap::from([(oid(9), vec![(Grammar::Rust, BlobStatus::Parsed)])])
+            HashMap::from([(oid(9), vec![(Grammar::Rust, BlobStatus::Held)])])
         );
         assert_eq!(
             fx.blob_symbols(&oid(9), Grammar::Rust).unwrap(),
             Some(StoredSymbols {
-                status: BlobStatus::Parsed,
+                status: BlobStatus::Held,
                 symbols: vec![]
             })
         );
@@ -1208,6 +1220,7 @@ mod tests {
             BlobStatus::Parsed,
             BlobStatus::TooLarge,
             BlobStatus::Unreadable,
+            BlobStatus::Held,
         ];
         for (n, status) in statuses.into_iter().enumerate() {
             assert_eq!(BlobStatus::from_stored(status.as_str()), status);
@@ -1227,9 +1240,9 @@ mod tests {
                 })
             );
         }
-        assert_eq!(BlobStatus::from_stored("surprise"), BlobStatus::Parsed);
-        let oids: Vec<_> = (0..3).map(oid).collect();
-        assert_eq!(fx.stored_blobs(&oids).unwrap().len(), 3);
+        assert_eq!(BlobStatus::from_stored("surprise"), BlobStatus::Held);
+        let oids: Vec<_> = (0..4).map(oid).collect();
+        assert_eq!(fx.stored_blobs(&oids).unwrap().len(), 4);
         let size = format!("SELECT size FROM blobs WHERE oid = '{}'", oid(1));
         assert_eq!(fx.count(&size), 5 << 20);
     }
@@ -1243,7 +1256,10 @@ mod tests {
             vec![def("f", 1, 4), call("f", 5, 5)],
         )])
         .unwrap();
-        let lookup = |commit: &str| fx.definitions(commit, Family::Rust, "f", "a.rs").unwrap();
+        let lookup = |commit: &str| {
+            let found = fx.definitions(commit, Family::Rust, "f", "a.rs").unwrap();
+            found.map(|(hits, _)| hits)
+        };
         let c = commit(1);
         assert!(!fx.commit_complete(&c).unwrap());
         assert_eq!(lookup(&c), None);
@@ -1374,9 +1390,12 @@ mod tests {
             ],
         );
         let lookup = |from: &str| {
-            fx.definitions(&commit(1), Family::Rust, "parse", from)
+            let (hits, truncated) = fx
+                .definitions(&commit(1), Family::Rust, "parse", from)
                 .unwrap()
-                .unwrap()
+                .unwrap();
+            assert!(!truncated);
+            hits
         };
 
         let hits = lookup("src/a/b/c.rs");
@@ -1438,11 +1457,10 @@ mod tests {
         );
 
         // The other names of the file are not found, and nothing is found under a name nobody defines.
-        assert!(
+        assert_eq!(
             fx.definitions(&commit(1), Family::Rust, "nobody", "zzz.rs")
-                .unwrap()
-                .unwrap()
-                .is_empty()
+                .unwrap(),
+            Some((Vec::new(), false))
         );
     }
 
@@ -1466,7 +1484,7 @@ mod tests {
             ],
         );
         let in_tier = |from: &str, tier: Tier| -> Vec<String> {
-            let hits = fx
+            let (hits, _) = fx
                 .definitions(&commit(1), Family::Rust, "f", from)
                 .unwrap()
                 .unwrap();
@@ -1500,10 +1518,11 @@ mod tests {
         }
         fx.insert_blobs(blobs).unwrap();
         fx.save_commit(&commit(1), &entries).unwrap();
-        let hits = fx
+        let (hits, truncated) = fx
             .definitions(&commit(1), Family::Rust, "dup", "zzzz/z.rs")
             .unwrap()
             .unwrap();
+        assert!(truncated);
         assert_eq!(hits.len(), 200);
         assert_eq!(
             (hits[0].path.as_str(), hits[0].tier),
@@ -1535,10 +1554,11 @@ mod tests {
         }
         fx.insert_blobs(blobs).unwrap();
         fx.save_commit(&commit(1), &entries).unwrap();
-        let hits = fx
+        let (hits, truncated) = fx
             .definitions(&commit(1), Family::Rust, "dup", "src/zeta/deep/main.rs")
             .unwrap()
             .unwrap();
+        assert!(truncated);
         assert_eq!(hits.len(), 200);
         assert!(hits.iter().all(|h| h.tier == Tier::Other));
         // Two directories shared, one, and none, which go by path.
@@ -1546,6 +1566,35 @@ mod tests {
         assert_eq!(hits[1].path, "src/zzz/z.rs");
         assert_eq!(hits[2].path, "a0000/x.rs");
         assert_eq!(hits[199].path, "a0197/x.rs");
+    }
+
+    #[test]
+    fn definitions_say_whether_there_are_more_than_the_200_they_return() {
+        let fx = TempDb::new("limits-exact");
+        // 201 files define `over`, the first 200 of them define `exact` too.
+        let mut blobs = Vec::new();
+        let mut entries = Vec::new();
+        for i in 0..201 {
+            let mut tags = vec![def("over", 1, 4)];
+            if i < 200 {
+                tags.push(def("exact", 2, 4));
+            }
+            blobs.push(blob(10 + i, Grammar::Rust, tags));
+            entries.push(entry(&format!("d{i:03}/x.rs"), 10 + i, Grammar::Rust));
+        }
+        fx.insert_blobs(blobs).unwrap();
+        fx.save_commit(&commit(1), &entries).unwrap();
+        let lookup = |name: &str| {
+            let (hits, truncated) = fx
+                .definitions(&commit(1), Family::Rust, name, "a.rs")
+                .unwrap()
+                .unwrap();
+            (hits.len(), truncated)
+        };
+        // Exactly 200 is not more than that.
+        assert_eq!(lookup("exact"), (200, false));
+        assert_eq!(lookup("over"), (200, true));
+        assert_eq!(lookup("nobody"), (0, false));
     }
 
     #[test]
@@ -1559,7 +1608,7 @@ mod tests {
             &commit(1),
             vec![("zz/y.rs", f()), (near.as_str(), f()), ("aa/y.rs", f())],
         );
-        let hits = fx
+        let (hits, _) = fx
             .definitions(&commit(1), Family::Rust, "f", &format!("{deep}main.rs"))
             .unwrap()
             .unwrap();
@@ -1601,6 +1650,7 @@ mod tests {
                 .definitions(&commit(1), family, "f", "a.ts")
                 .unwrap()
                 .unwrap()
+                .0
                 .into_iter()
                 .map(|h| h.path)
                 .collect();
@@ -1641,7 +1691,7 @@ mod tests {
         .unwrap();
         fx.save_commit(&commit(1), &[entry("Foo.java", 1, Grammar::Java)])
             .unwrap();
-        let hits = fx
+        let (hits, _) = fx
             .definitions(&commit(1), Family::Java, "Foo", "Bar.java")
             .unwrap()
             .unwrap();
@@ -1678,7 +1728,7 @@ mod tests {
         )
         .unwrap();
         let found = |commit: String| {
-            let defs = fx
+            let (defs, _) = fx
                 .definitions(&commit, Family::Rust, "f", "p1.rs")
                 .unwrap()
                 .unwrap();
@@ -1734,7 +1784,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let defs = fx
+        let (defs, _) = fx
             .definitions(&commit(1), Family::Rust, "f", "x/a.rs")
             .unwrap()
             .unwrap();
@@ -1766,14 +1816,14 @@ mod tests {
             .collect();
         rust_commit(&fx, &commit(1), vec![("dir/日本.rs", tags)]);
         for (i, name) in names.iter().enumerate() {
-            let hits = fx
+            let (hits, _) = fx
                 .definitions(&commit(1), Family::Rust, name, "dir/日本.rs")
                 .unwrap()
                 .unwrap();
             assert_eq!(places(&hits), [("dir/日本.rs", i as u32 + 1)], "{name}");
         }
         for name in ["", "%", "_", "a_", "a%", "GRÖSSE", "größ", "B", "a_b "] {
-            let hits = fx
+            let (hits, _) = fx
                 .definitions(&commit(1), Family::Rust, name, "dir/日本.rs")
                 .unwrap()
                 .unwrap();
@@ -1968,7 +2018,7 @@ mod tests {
         let other = fx.side();
         other.execute_batch("BEGIN IMMEDIATE").unwrap();
         let started = Instant::now();
-        let hits = fx
+        let (hits, _) = fx
             .definitions(&commit(1), Family::Rust, "f", "a.rs")
             .unwrap()
             .unwrap();
@@ -1992,7 +2042,7 @@ mod tests {
         let hits = receiver
             .recv_timeout(Duration::from_secs(10))
             .expect("the lookup waited for the writer");
-        assert_eq!(hits.unwrap().unwrap().len(), 1);
+        assert_eq!(hits.unwrap().unwrap().0.len(), 1);
         drop(writer);
         assert_eq!(used_at(), long_ago);
 
@@ -2034,7 +2084,7 @@ mod tests {
         let hits = receiver
             .recv_timeout(Duration::from_secs(10))
             .expect("the lookup of a click waited for the build");
-        assert_eq!(hits.unwrap().unwrap().len(), 1);
+        assert_eq!(hits.unwrap().unwrap().0.len(), 1);
         drop(build);
     }
 
@@ -2062,7 +2112,7 @@ mod tests {
             fx.count("SELECT count(*) FROM names WHERE name = 'half'"),
             0
         );
-        let hits = fx
+        let (hits, _) = fx
             .definitions(&commit(1), Family::Rust, "f", "a.rs")
             .unwrap()
             .unwrap();
@@ -2143,7 +2193,7 @@ mod tests {
         assert_eq!(stored.symbols, symbols);
 
         let foo = parsed.iter().find(|t| t.is_def && t.name == "Foo").unwrap();
-        let hits = fx
+        let (hits, _) = fx
             .definitions(&commit(1), Family::Rust, "Foo", "src/lib.rs")
             .unwrap()
             .unwrap();

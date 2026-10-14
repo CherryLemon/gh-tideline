@@ -3,6 +3,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use super::{GitAuth, Repo, STALL_INDEX, run_git};
 
@@ -278,5 +279,63 @@ impl PartialClone {
 impl Drop for PartialClone {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// The longest a test waits for a gated fetch to begin.
+const GATE_PATIENCE: Duration = Duration::from_secs(60);
+
+/// Holds back the fetches of the cache repo of a [`PartialClone`]: each reports that it has begun, and waits for the gate
+/// to open. That lets a test act while a fetch is under way.
+pub(crate) struct Gate {
+    begun: PathBuf,
+    open: PathBuf,
+}
+
+impl Gate {
+    /// Holds back every fetch from now on.
+    pub(crate) async fn install(clone: &PartialClone) -> Gate {
+        Gate::after(clone, 0).await
+    }
+
+    /// Lets the first `passes` fetches through and holds back the ones after them.
+    pub(crate) async fn after(clone: &PartialClone, passes: usize) -> Gate {
+        let begun = clone.dir.join("gate-begun");
+        let open = clone.dir.join("gate-open");
+        let passed = clone.dir.join("gate-passed");
+        let script = clone.dir.join("gate.sh");
+        // A test that fails leaves nothing behind: the loop also ends when its directory is removed.
+        std::fs::write(
+            &script,
+            format!(
+                "n=$(cat '{passed}' 2>/dev/null || echo 0)\necho $((n + 1)) > '{passed}'\nif [ \"$n\" -ge {passes} ]; then\n  touch '{begun}'\n  while [ ! -e '{open}' ] && [ -d '{dir}' ]; do sleep 0.01; done\nfi\nexec git upload-pack \"$@\"\n",
+                passed = passed.display(),
+                begun = begun.display(),
+                open = open.display(),
+                dir = clone.dir.display()
+            ),
+        )
+        .unwrap();
+        let command = format!("sh {}", script.display());
+        git_in(
+            &clone.repo.git_dir,
+            &["config", "remote.origin.uploadpack", &command],
+        )
+        .await;
+        Gate { begun, open }
+    }
+
+    /// Waits until a fetch has begun.
+    pub(crate) async fn begun(&self) {
+        let deadline = Instant::now() + GATE_PATIENCE;
+        while !self.begun.exists() {
+            assert!(Instant::now() < deadline, "no fetch began");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Lets the fetches that wait go on, and every later one through.
+    pub(crate) fn open(&self) {
+        std::fs::write(&self.open, "").unwrap();
     }
 }

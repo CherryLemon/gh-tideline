@@ -442,6 +442,14 @@ impl Build {
     async fn build(&self) -> Result<(), Stop> {
         let commit = self.job.commit.as_str();
         self.alive()?;
+        let entries = self.repo.ls_tree(commit).await?;
+        // From now on the blob endpoint may fetch any file of the commit, as it may those of a pull request. A job that
+        // finds the commit complete (below) has this to do as well: its clone may not have listed the commit yet.
+        self.repo.remember_oids(
+            entries
+                .iter()
+                .map(|entry| (entry.oid.as_str(), entry.mode != GITLINK_MODE)),
+        );
         // Another job may have completed the commit while this one waited for its turn.
         let complete = self.with_db({
             let commit = commit.to_string();
@@ -450,14 +458,7 @@ impl Build {
         if complete.await? {
             return Ok(());
         }
-        let entries = self.repo.ls_tree(commit).await?;
         let files = select_files(&entries, self.limits.max_files)?;
-        // From now on the blob endpoint may fetch any file of the commit, as it may those of a pull request.
-        self.repo.remember_oids(
-            entries
-                .iter()
-                .map(|entry| (entry.oid.as_str(), entry.mode != GITLINK_MODE)),
-        );
         let mut oids: Vec<String> = files.iter().map(|file| file.oid.clone()).collect();
         oids.sort();
         oids.dedup();
@@ -465,7 +466,7 @@ impl Build {
         // A blob that was left unreadable (it could not be fetched, or parsed in time) is tried again.
         let stored = self.stored(oids.clone()).await?;
         let (_, pending) = settle(&files, &without_unreadable(&stored));
-        self.index_blobs(&oids, &stored, pending).await?;
+        let missing = self.index_blobs(&oids, &stored, pending).await?;
 
         self.job.enter(Phase::Saving, 0);
         let stored = self.stored(oids).await?;
@@ -477,7 +478,8 @@ impl Build {
                 pending.len()
             )));
         }
-        self.headers_by_content(&mut listing, &stored).await?;
+        self.headers_by_content(&mut listing, &stored, &missing)
+            .await?;
         self.alive()?;
         self.with_db({
             let commit = commit.to_string();
@@ -488,31 +490,41 @@ impl Build {
 
     /// A `.h` file is C or C++ by its content, but the index only knows which grammars its blob is stored under, and
     /// `settle` takes the first of the C family. Where there is a choice (the same content is parsed as C and as C++,
-    /// because it has other names) the content, which is local by now, decides, if the grammar it names has the tags. The
-    /// blobs are read a group at a time, and only those the index parsed, which are no larger than it parses.
-    async fn headers_by_content(&self, listing: &mut Listing, stored: &Stored) -> Result<(), Stop> {
+    /// because it has other names) the content decides, if the grammar it names has the tags. The blobs are read a group
+    /// at a time, and only those that are local (`missing` lists the objects that are not, since the remote may not have
+    /// given a blob, or the fetch of a blob the index holds may have failed), whose size the index knows, and which are no
+    /// larger than it parses.
+    async fn headers_by_content(
+        &self,
+        listing: &mut Listing,
+        stored: &Stored,
+        missing: &HashSet<String>,
+    ) -> Result<(), Stop> {
         let choices = header_choices(listing, stored);
-        if choices.is_empty() {
+        let oids: Vec<String> = choices
+            .keys()
+            .filter(|oid| !missing.contains(*oid))
+            .cloned()
+            .collect();
+        if oids.is_empty() {
             return Ok(());
         }
-        let oids: Vec<String> = choices.keys().cloned().collect();
         let sizes = self
             .with_db({
                 let oids = oids.clone();
                 move |db| db.blob_sizes(&oids)
             })
             .await?;
-        let size = |oid: &String| sizes.get(oid).copied().unwrap_or(MAX_BLOB_BYTES);
         let readable: Vec<String> = oids
             .into_iter()
-            .filter(|oid| size(oid) <= MAX_BLOB_BYTES)
+            .filter(|oid| sizes.get(oid).is_some_and(|&size| size <= MAX_BLOB_BYTES))
             .collect();
         let has_tags = |oid: &str, wanted: Grammar| {
             stored[oid]
                 .iter()
                 .any(|&(held, status)| held == wanted && status == BlobStatus::Parsed)
         };
-        for group in groups(readable, size, self.limits.group_bytes) {
+        for group in groups(readable, |oid| sizes[oid], self.limits.group_bytes) {
             self.alive()?;
             for (oid, content) in self.repo.read_blobs(&group).await? {
                 for &i in choices.get(&oid).into_iter().flatten() {
@@ -527,28 +539,28 @@ impl Build {
         Ok(())
     }
 
-    /// Gets the blobs into the index: fetches those the index lacks that the repo lacks too, then parses and stores them
-    /// (`pending`). Last it fetches the blobs the index holds that the repo lacks (see `to_fetch`), which are not parsed.
+    /// Gets the blobs into the index: fetches the blobs the index lacks that the repo lacks too and, after them, the
+    /// blobs the index holds that the repo lacks (see `to_fetch`), then parses and stores the former (`pending`). The
+    /// phases follow one another and none comes back: fetching, which counts all the blobs it fetches, then parsing.
+    /// Returns the objects the repo lacks by then.
     async fn index_blobs(
         &self,
         oids: &[String],
         stored: &Stored,
         pending: Vec<Pending>,
-    ) -> Result<(), Stop> {
+    ) -> Result<HashSet<String>, Stop> {
         let commit = self.job.commit.as_str();
-        let missing = self.repo.missing_objects(commit).await?;
+        let mut missing = self.repo.missing_objects(commit).await?;
         let (to_parse, held) = to_fetch(oids, &pending, stored, &missing);
+        if !to_parse.is_empty() || !held.is_empty() {
+            self.fetch(to_parse, held).await?;
+            // What the remote did not give stays missing.
+            missing = self.repo.missing_objects(commit).await?;
+        }
         if !pending.is_empty() {
-            let missing = if to_parse.is_empty() {
-                missing
-            } else {
-                self.fetch(to_parse).await?;
-                // What the remote did not give stays missing.
-                self.repo.missing_objects(commit).await?
-            };
             self.parse_and_store(pending, &missing).await?;
         }
-        self.fetch_held(held).await
+        Ok(missing)
     }
 
     /// Parses and stores the blobs the index lacks. Those the repo lacks (`missing`), because the remote did not give
@@ -580,24 +592,15 @@ impl Build {
         parsed.and(inserted)
     }
 
-    async fn fetch(&self, oids: Vec<String>) -> Result<(), Stop> {
-        self.job.enter(Phase::Fetching, oids.len());
-        for chunk in oids.chunks(self.limits.chunk(oids.len())) {
-            self.alive()?;
-            self.fetch_chunk(chunk.to_vec()).await?;
-            self.job.advance(chunk.len());
-        }
-        Ok(())
-    }
-
-    /// Fetches the blobs the index holds that the repo lacks, for the lines of the references in them. The commit does
-    /// not need them to be indexed, and a lookup fetches the ones it needs, so a fetch that fails is told and the build
-    /// goes on, without the chunks after it. A cancellation ends the build.
-    async fn fetch_held(&self, oids: Vec<String>) -> Result<(), Stop> {
-        if oids.is_empty() {
-            return Ok(());
-        }
-        match self.fetch(oids).await {
+    /// Fetches the blobs to parse and then the blobs the index holds, in chunks, in one phase that counts them all. The
+    /// build cannot go on without the first, so a fetch of them that fails ends it. The others are fetched for the lines
+    /// of the references in them: the commit does not need them to be indexed, and a lookup fetches the ones it needs, so
+    /// a fetch of them that fails is told and the build goes on, without the chunks after it. A cancellation ends the
+    /// build either way.
+    async fn fetch(&self, to_parse: Vec<String>, held: Vec<String>) -> Result<(), Stop> {
+        self.job.enter(Phase::Fetching, to_parse.len() + held.len());
+        self.fetch_chunks(to_parse).await?;
+        match self.fetch_chunks(held).await {
             Err(Stop::Failed(message)) => {
                 eprintln!(
                     "gh-tideline: fetching the indexed blobs of {} failed: {message}",
@@ -607,6 +610,15 @@ impl Build {
             }
             result => result,
         }
+    }
+
+    async fn fetch_chunks(&self, oids: Vec<String>) -> Result<(), Stop> {
+        for chunk in oids.chunks(self.limits.chunk(oids.len())) {
+            self.alive()?;
+            self.fetch_chunk(chunk.to_vec()).await?;
+            self.job.advance(chunk.len());
+        }
+        Ok(())
     }
 
     /// Fetches in a detached task that owns the repo lock: if the build is dropped, git is not left running without it.
@@ -664,6 +676,7 @@ impl Build {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git::testing::{repo_at, temp_dir};
 
     fn oid(n: u32) -> String {
         format!("{n:040x}")
@@ -906,7 +919,7 @@ mod tests {
 
     #[test]
     fn blobs_the_repo_lacks_are_fetched_if_they_are_to_be_parsed_or_have_tags() {
-        let oids: Vec<String> = (1..=6).map(oid).collect();
+        let oids: Vec<String> = (1..=7).map(oid).collect();
         let stored = stored_as(&[
             (2, &[(Grammar::Rust, BlobStatus::Parsed)]),
             (3, &[(Grammar::Rust, BlobStatus::TooLarge)]),
@@ -919,13 +932,15 @@ mod tests {
                 ],
             ),
             (6, &[(Grammar::Rust, BlobStatus::Parsed)]),
+            // Stored by a version that knows more: nothing is known of its tags.
+            (7, &[(Grammar::Rust, BlobStatus::Held)]),
         ]);
         // The index lacks 1, and 4 is to be tried again.
         let pending_blobs = vec![pending(1, &["a.rs"]), pending(4, &["d.rs"])];
         // The repo lacks all but 6.
-        let missing: HashSet<String> = (1..=5).map(oid).collect();
+        let missing: HashSet<String> = [1, 2, 3, 4, 5, 7].map(oid).into_iter().collect();
         // The blobs to parse come apart from those the index holds, which are fetched last and for their lines only. Not
-        // 3, which is too large to have tags.
+        // 3, which is too large to have tags, nor 7, whose tags are not known to be there.
         assert_eq!(
             to_fetch(&oids, &pending_blobs, &stored, &missing),
             (vec![oid(1), oid(4)], vec![oid(2), oid(5)])
@@ -958,6 +973,8 @@ mod tests {
             ("stale.h".to_string(), oid(3), Grammar::Cpp),
             ("lone.h".to_string(), oid(4), Grammar::C),
             ("other.h".to_string(), oid(5), Grammar::C),
+            // One of the rows is held under a status this version does not know: it is not known to have tags.
+            ("held.h".to_string(), oid(6), Grammar::C),
         ];
         let both = |status: BlobStatus| [(Grammar::C, status), (Grammar::Cpp, status)];
         let stored = stored_as(&[
@@ -979,11 +996,78 @@ mod tests {
                     (Grammar::Rust, BlobStatus::Parsed),
                 ],
             ),
+            (
+                6,
+                &[
+                    (Grammar::C, BlobStatus::Parsed),
+                    (Grammar::Cpp, BlobStatus::Held),
+                ],
+            ),
         ]);
         assert_eq!(
             header_choices(&listing, &stored),
             BTreeMap::from([(oid(1), vec![0, 1])])
         );
+    }
+
+    #[test]
+    fn a_blob_stored_under_a_status_this_version_does_not_know_is_listed_and_not_parsed_again() {
+        let held = [(Grammar::Rust, BlobStatus::Held)];
+        assert_eq!(held_grammar("a.rs", &held), Some(Grammar::Rust));
+        let files = vec![file("a.rs", 1), file("b.py", 1)];
+        let stored = stored_as(&[(1, &held)]);
+        // The file the row is for is listed, as one that was parsed is. The row says nothing of the other name of the
+        // blob, which is to be parsed, as a blob that was not stored under it would be.
+        let (listing, pending_blobs) = settle(&files, &without_unreadable(&stored));
+        assert_eq!(listing, [("a.rs".to_string(), oid(1), Grammar::Rust)]);
+        assert_eq!(pending_blobs, [pending(1, &["b.py"])]);
+    }
+
+    #[tokio::test]
+    async fn a_header_is_read_for_its_language_only_if_it_is_local_and_its_size_is_known() {
+        let dir = temp_dir("build-headers");
+        // The repo does not exist, so that a read of any blob fails.
+        let build = Build {
+            job: Arc::new(Job::new(&oid(100))),
+            repo: Arc::new(repo_at(dir.join("none.git"), String::new())),
+            auth: GitAuth {
+                host: "example.invalid".to_string(),
+                token: "unused".to_string(),
+            },
+            db: IndexDb::open(&dir.join("index.sqlite")).unwrap(),
+            limits: Limits::default(),
+        };
+        // Headers 1, 2 and 3 are parsed as C and as C++, so that their content has to place them. The index has the
+        // size of 1 and 3, as a row that is stored has one.
+        let sized = [1, 3].into_iter().flat_map(|n| {
+            [Grammar::C, Grammar::Cpp].map(|grammar| row(n, grammar, BlobStatus::Parsed, 10))
+        });
+        build.db.insert_blobs(sized.collect()).unwrap();
+        let both = [
+            (Grammar::C, BlobStatus::Parsed),
+            (Grammar::Cpp, BlobStatus::Parsed),
+        ];
+        let stored = stored_as(&[(1, &both), (2, &both), (3, &both)]);
+        let mut listing: Listing = (1..=3)
+            .map(|n| (format!("h{n}.h"), oid(n), Grammar::C))
+            .collect();
+
+        // The repo lacks 1, which the remote did not give, and the size of 2 is not known: neither is read.
+        let missing = HashSet::from([oid(1)]);
+        let mut skipped = listing[..2].to_vec();
+        build
+            .headers_by_content(&mut skipped, &stored, &missing)
+            .await
+            .unwrap();
+        assert_eq!(skipped, listing[..2]);
+
+        // Header 3 is local and sized: it is read, which fails here.
+        let stop = build
+            .headers_by_content(&mut listing, &stored, &missing)
+            .await
+            .unwrap_err();
+        assert!(matches!(stop, Stop::Failed(_)), "{stop:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

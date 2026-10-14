@@ -161,6 +161,11 @@ pub struct PrService {
     index: Option<Indexer>,
     /// The files whose parse timed out lately, so that they are not parsed again at once (see [`PrService::symbols`]).
     slow_parses: nav::SlowParses,
+    /// The blobs whose fetch for the lines of references failed lately, so that no lookup asks for them again at once
+    /// (see [`PrService::references`]).
+    fetch_failures: nav::FetchFailures,
+    /// How long a lookup waits for the blobs it fetches for those lines (see [`PrService::references`]).
+    snippet_fetch_wait: Duration,
     cache: Mutex<HashMap<PrKey, CacheSlot>>,
     /// Detached work after a response (see [`PrService::set_viewed`]), awaited on shutdown.
     bookkeeping: Mutex<tokio::task::JoinSet<()>>,
@@ -181,6 +186,8 @@ impl PrService {
             state,
             index: index.map(|db| Indexer::new(db, Limits::default())),
             slow_parses: Default::default(),
+            fetch_failures: Default::default(),
+            snippet_fetch_wait: nav::SNIPPET_FETCH_WAIT,
             cache: Default::default(),
             bookkeeping: Default::default(),
             review_writes: Default::default(),

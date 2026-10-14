@@ -372,7 +372,7 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
-    use crate::git::testing::{PartialClone, git_in};
+    use crate::git::testing::{Gate, PartialClone, git_in};
     use db::{BlobStatus, Hit, NewBlob, Tier};
     use lang::{Family, Grammar};
     use tags::Tag;
@@ -520,52 +520,6 @@ mod tests {
         }
     }
 
-    /// Holds back the fetches of the cache repo: each reports that it has begun, and waits for the gate to open. That
-    /// lets a test act while a fetch is under way.
-    struct Gate {
-        begun: PathBuf,
-        open: PathBuf,
-    }
-
-    impl Gate {
-        async fn install(clone: &PartialClone) -> Gate {
-            let begun = clone.dir.join("gate-begun");
-            let open = clone.dir.join("gate-open");
-            let script = clone.dir.join("gate.sh");
-            // A test that fails leaves nothing behind: the loop also ends when its directory is removed.
-            std::fs::write(
-                &script,
-                format!(
-                    "touch '{}'\nwhile [ ! -e '{}' ] && [ -d '{}' ]; do sleep 0.01; done\nexec git upload-pack \"$@\"\n",
-                    begun.display(),
-                    open.display(),
-                    clone.dir.display()
-                ),
-            )
-            .unwrap();
-            let command = format!("sh {}", script.display());
-            git_in(
-                &clone.repo.git_dir,
-                &["config", "remote.origin.uploadpack", &command],
-            )
-            .await;
-            Gate { begun, open }
-        }
-
-        /// Waits until a fetch has begun.
-        async fn begun(&self) {
-            let deadline = Instant::now() + PATIENCE;
-            while !self.begun.exists() {
-                assert!(Instant::now() < deadline, "no fetch began");
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        }
-
-        fn open(&self) {
-            std::fs::write(&self.open, "").unwrap();
-        }
-    }
-
     /// Makes the remote of `repo` serve the first fetch it gets and refuse every one after it.
     async fn serve_one_fetch_only(clone: &PartialClone, repo: &Repo) {
         let served = clone.dir.join("fetch-served");
@@ -630,7 +584,7 @@ mod tests {
                 ("src/util/helpers.rs", "rust"),
             ])
         );
-        let hits =
+        let (hits, _) =
             s.db.definitions(&head, Family::Rust, "two", "src/lib.rs")
                 .unwrap()
                 .unwrap();
@@ -701,8 +655,9 @@ mod tests {
 
         assert_eq!(s.build(&head).await.state, IndexState::Ready);
         // The repo must hold a blob the index has tags of, for the lines of the references found in it, but not one
-        // that was too large to be parsed. The two sources the index lacked are fetched first and parsed, then the
-        // helpers are fetched in a fetch of their own, so that a failure of it cannot lose what was parsed.
+        // that was too large to be parsed. The two sources the index lacked are fetched first, then the helpers in a
+        // fetch of their own, so that a failure of it can be told apart and does not stop the build. The two sources
+        // are parsed after both fetches.
         let missing = s.clone.repo.missing_objects(&head).await.unwrap();
         assert!(!missing.contains(&helpers));
         assert!(missing.contains(&big));
@@ -714,6 +669,72 @@ mod tests {
         let listing = s.listing(&head);
         assert!(listing.contains(&("src/util/helpers.rs".to_string(), "rust".to_string())));
         assert!(listing.contains(&("big.rs".to_string(), "rust".to_string())));
+    }
+
+    #[tokio::test]
+    async fn the_phases_of_a_build_follow_one_another_and_the_fetching_counts_every_blob_it_fetches()
+     {
+        let s = Setup::with_limits("index-phases", limits_of_chunk(1)).await;
+        // The fetches of the two blobs to parse go through, and that of the blob the index holds is held back.
+        let gate = Gate::after(&s.clone, 2).await;
+        let head = s.clone.head.clone();
+        let helpers = s.clone.oid(&head, "src/util/helpers.rs").await;
+        let big = s.clone.oid(&head, "big.rs").await;
+        let lib = s.clone.oid(&head, "src/lib.rs").await;
+        let python = s.clone.oid(&head, "dir with space/a b.py").await;
+        let held = |oid: &String, status, tags| NewBlob {
+            oid: oid.clone(),
+            grammar: Grammar::Rust,
+            status,
+            size: 17,
+            tags,
+        };
+        s.db.insert_blobs(vec![
+            held(&helpers, BlobStatus::Parsed, vec![kept_tag()]),
+            held(&big, BlobStatus::TooLarge, Vec::new()),
+        ])
+        .unwrap();
+
+        s.start(&head).await;
+        gate.begun().await;
+        // One phase counts the blobs to parse and the blob held, and the third fetch is the last one: nothing is
+        // parsed before it, so that the phase does not go back to fetching when parsing has begun.
+        assert_eq!(
+            s.status(&head).await,
+            IndexStatus {
+                commit: head.clone(),
+                state: IndexState::Building,
+                phase: Some(Phase::Fetching),
+                done: 2,
+                total: 3,
+                cancelling: false,
+                message: None,
+            }
+        );
+        let missing = s.clone.repo.missing_objects(&head).await.unwrap();
+        assert!(!missing.contains(&lib) && !missing.contains(&python));
+        assert!(missing.contains(&helpers));
+        assert!(s.db.blob_symbols(&lib, Grammar::Rust).unwrap().is_none());
+        assert!(
+            s.db.blob_symbols(&python, Grammar::Python)
+                .unwrap()
+                .is_none()
+        );
+
+        gate.open();
+        assert_eq!(
+            s.end(&head).await,
+            IndexStatus::idle(&head, IndexState::Ready)
+        );
+        assert!(s.db.blob_symbols(&lib, Grammar::Rust).unwrap().is_some());
+        assert!(
+            !s.clone
+                .repo
+                .missing_objects(&head)
+                .await
+                .unwrap()
+                .contains(&helpers)
+        );
     }
 
     #[tokio::test]
@@ -921,6 +942,7 @@ mod tests {
             s.db.definitions(commit, Family::Rust, name, "src/lib.rs")
                 .unwrap()
                 .unwrap()
+                .0
                 .len()
         };
         assert_eq!((one(&base, "one"), one(&base, "two")), (1, 0));
@@ -1041,6 +1063,9 @@ mod tests {
         let head = s.clone.head.clone();
         let other = s.clone.another_cache().await;
         let lacking = other.missing_objects(&head).await.unwrap();
+        let text = s.clone.oid(&head, "same-1.txt").await;
+        let gitlink = "1234567890123456789012345678901234567890";
+        assert_eq!(other.known_oid(&text), None);
 
         // A build of the commit in one clone is under way, and another clone asks for the same commit: it waits.
         s.start(&head).await;
@@ -1055,6 +1080,10 @@ mod tests {
         let second = s.until_in(&other, &head, ended).await;
         assert_eq!(second, IndexStatus::idle(&head, IndexState::Ready));
         assert_eq!(other.missing_objects(&head).await.unwrap(), lacking);
+
+        // The blob endpoint of the second clone may serve the files of the commit all the same: its job listed them.
+        assert_eq!(other.known_oid(&text), Some(true));
+        assert_eq!(other.known_oid(gitlink), Some(false));
     }
 
     #[tokio::test]
@@ -1377,8 +1406,9 @@ mod tests {
         let ended = s.status(&head).await;
         assert_eq!(ended.state, IndexState::Failed);
         assert_eq!(ended.message.as_deref(), Some("the indexing task stopped"));
-        // Let the fetch that is left over end.
+        // Let the fetch that is left over end, and wait for the task that owns the repo lock to let it go.
         gate.open();
+        drop(s.clone.repo.lock().await.unwrap());
     }
 
     #[tokio::test]
@@ -1453,6 +1483,7 @@ mod tests {
             s.db.definitions(&head, Family::C, name, from)
                 .unwrap()
                 .unwrap()
+                .0
                 .into_iter()
                 .map(|hit| hit.path)
                 .collect()

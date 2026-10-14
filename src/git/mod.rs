@@ -90,8 +90,9 @@ pub const PRIVATE_DIR_MODE: u32 = 0o700;
 /// after a minute, so that a cancel waits that long at most for a fetch that is stuck.
 pub const STALL_INDEX: Duration = Duration::from_secs(60);
 
-/// The same for what opening a pull request fetches (its commits, its files, a file read lazily): GitHub may take
-/// longer than a minute to prepare the pack of a huge pull request, and sends nothing but keepalives meanwhile.
+/// The same for what opening a pull request fetches (its commits, its files, what its diff and attributes read, a file
+/// read lazily): GitHub may take longer than a minute to prepare the pack of a huge pull request, and sends nothing
+/// but keepalives meanwhile.
 pub const STALL_PR: Duration = Duration::from_secs(300);
 
 /// Creates `dir` (and missing parents) with mode 0700, and chmods it to 0700 if it exists.
@@ -591,7 +592,8 @@ impl Repo {
         .map(|_| ())
     }
 
-    /// Runs `diff-tree -r -z --raw --no-abbrev` (with `extra` flags) and parses it.
+    /// Runs `diff-tree -r -z --raw --no-abbrev` (with `extra` flags) and parses it. It reads the blobs that rename
+    /// detection needs, and fetches the ones the repo lacks, given up on after [`STALL_PR`] of a stalled transfer.
     pub async fn diff_tree(
         &self,
         auth: &GitAuth,
@@ -602,7 +604,7 @@ impl Repo {
         let mut args = vec!["diff-tree", "-r", "-z", "--raw", "--no-abbrev"];
         args.extend_from_slice(extra);
         args.extend_from_slice(&["--end-of-options", from, to]);
-        let out = self.git(Some(auth), &args, None).await?;
+        let out = self.git_stalling(STALL_PR, Some(auth), &args, None).await?;
         parse::parse_diff_tree(&out).map_err(|e| GitFailure {
             command: "diff-tree".into(),
             stderr: e,
@@ -677,7 +679,8 @@ impl Repo {
         .map(|_| ())
     }
 
-    /// Step 7: `linguist-generated` / `linguist-vendored` attributes as of `head`.
+    /// Step 7: `linguist-generated` / `linguist-vendored` attributes as of `head`. An attributes file the repo lacks is
+    /// fetched, given up on after [`STALL_PR`] of a stalled transfer.
     pub async fn check_attr(
         &self,
         auth: &GitAuth,
@@ -694,7 +697,8 @@ impl Repo {
             input.push(0);
         }
         let out = self
-            .git(
+            .git_stalling(
+                STALL_PR,
                 Some(auth),
                 &[
                     "check-attr",
@@ -1209,6 +1213,12 @@ mod tests {
         assert_eq!(low_speed(), guard_of(300));
         // A missing object is fetched lazily, by a fetch that git starts on its own.
         let _ = repo.read_object(Some(&guard), Some(&auth), oid).await;
+        assert_eq!(low_speed(), guard_of(300));
+        // So are the objects that `diff-tree` (the blobs of the renames it detects) and `check-attr` (the attributes of a
+        // tree) read, which opening a pull request does under the repo lock.
+        let _ = repo.diff_tree(&auth, &["-M"], oid, oid).await;
+        assert_eq!(low_speed(), guard_of(300));
+        let _ = repo.check_attr(&auth, oid, &["a.txt"]).await;
         assert_eq!(low_speed(), guard_of(300));
         drop(guard);
         std::fs::remove_dir_all(&dir).unwrap();

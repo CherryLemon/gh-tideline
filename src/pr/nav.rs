@@ -1,13 +1,14 @@
 //! Code navigation: the symbols of a file, the index of a pull request's commits, and what it finds there.
 
 use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::AppError;
-use crate::git::{GitAuth, STALL_INDEX};
+use crate::git::{GitAuth, Repo, STALL_INDEX};
 use crate::index::build::groups;
 use crate::index::db::{BlobStatus, Hit, IndexDb, NewBlob};
 use crate::index::lang::{Family, Grammar, MAX_BLOB_BYTES};
@@ -116,6 +117,56 @@ const SLOW_PARSES_KEPT: usize = 256;
 /// When the parse of a blob under a grammar last timed out.
 pub(super) type SlowParses = Mutex<HashMap<(String, Grammar), Instant>>;
 
+/// How long a lookup waits for the blobs it fetches for the lines of its references. The fetch goes on in a task of its
+/// own after that, for a later lookup to find the blobs there, and the lookup answers without the lines it lacks: the
+/// repo lock, which a fetch needs, may be held for long by a build or a pull request that is loading.
+pub(super) const SNIPPET_FETCH_WAIT: Duration = Duration::from_secs(5);
+
+/// How long a blob whose fetch failed is not asked for again by a lookup. A remote that cannot be reached, or does not
+/// give a blob, will most likely do the same at once, and every try holds the repo lock for as long as it takes.
+const FETCH_FAILURE_TTL: Duration = Duration::from_secs(120);
+
+/// How many such blobs are remembered at most; the oldest are forgotten first.
+const FETCH_FAILURES_KEPT: usize = 4096;
+
+/// When the fetch of a blob of a cache repo (by its git dir) for the lines of references last failed. Shared with the
+/// tasks that fetch, which outlive the lookups.
+#[derive(Clone, Default)]
+pub(super) struct FetchFailures(Arc<Mutex<HashMap<(PathBuf, String), Instant>>>);
+
+impl FetchFailures {
+    /// The blobs among `oids` of the repo at `git_dir` whose fetch did not fail less than `FETCH_FAILURE_TTL` before
+    /// `now`.
+    fn unfailed(&self, git_dir: &Path, oids: Vec<String>, now: Instant) -> Vec<String> {
+        let failed = self.0.lock().expect("fetch failures poisoned");
+        oids.into_iter()
+            .filter(|oid| {
+                let at = failed.get(&(git_dir.to_path_buf(), oid.clone()));
+                at.is_none_or(|&at| now.saturating_duration_since(at) >= FETCH_FAILURE_TTL)
+            })
+            .collect()
+    }
+
+    /// Notes that the fetch of the blobs of the repo at `git_dir` failed at `now`. The notes that have expired are
+    /// dropped, and when more than `FETCH_FAILURES_KEPT` are left, the oldest of them too.
+    fn note(&self, git_dir: &Path, oids: &[String], now: Instant) {
+        let mut failed = self.0.lock().expect("fetch failures poisoned");
+        failed.retain(|_, at| now.saturating_duration_since(*at) < FETCH_FAILURE_TTL);
+        for oid in oids {
+            failed.insert((git_dir.to_path_buf(), oid.clone()), now);
+        }
+        if failed.len() > FETCH_FAILURES_KEPT {
+            let mut by_age: Vec<(Instant, (PathBuf, String))> =
+                failed.iter().map(|(key, &at)| (at, key.clone())).collect();
+            by_age.sort();
+            let surplus = failed.len() - FETCH_FAILURES_KEPT;
+            for (_, key) in by_age.into_iter().take(surplus) {
+                failed.remove(&key);
+            }
+        }
+    }
+}
+
 /// A definition or a reference found in the index (`GET /definitions` and `GET /references`). Lines are 1-based and
 /// columns 1-based UTF-16 code units, like a [`Symbol`]'s.
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -157,7 +208,7 @@ pub struct NavResult {
     pub commit: String,
     pub name: String,
     pub hits: Vec<NavHit>,
-    /// There are more references than were returned. Definitions are cut at the best 200 without saying so.
+    /// There are more definitions (than the nearest 200) or references (than the first 1000) than were returned.
     pub truncated: bool,
 }
 
@@ -223,8 +274,8 @@ impl PrService {
                 Some(stored) if stored.status == BlobStatus::TooLarge && too_large => {
                     return Ok(outline(Vec::new()));
                 }
-                // Not stored yet, or left unreadable by a build that could not fetch the blob or parse it in time. A
-                // parse that works now replaces such a row.
+                // Not stored yet, or left unreadable by a build that could not fetch the blob or parse it in time (a
+                // parse that works now replaces such a row), or held by a newer version, whose tags are not known.
                 _ => {}
             }
         }
@@ -395,21 +446,21 @@ impl PrService {
             })
             .await?
         };
-        let hits = found.ok_or_else(|| not_indexed(&commit))?;
+        let (hits, truncated) = found.ok_or_else(|| not_indexed(&commit))?;
         Ok(NavResult {
             language: Some(language_of(index.db(), &commit, path).await?),
             commit,
             name: name.to_string(),
             hits: hits.into_iter().map(NavHit::from).collect(),
-            truncated: false,
+            truncated,
         })
     }
 
     /// Where `name` is used in the commit, as the file `path` of the commit sees it: the references of its family of
     /// languages, the nearest first. The index knows where they are; the lines come from the blobs of the cache repo.
     /// The index may hold a commit that another clone of the repository built, so the blobs of the references that the
-    /// repo lacks are fetched, as far as the remote gives them: a reference whose blob cannot be had has no snippet.
-    /// No build is started.
+    /// repo lacks are fetched, as far as the remote gives them and for as long as the lookup can wait (see
+    /// `SNIPPET_FETCH_WAIT`): a reference whose blob cannot be had in time has no snippet. No build is started.
     pub async fn references(
         self: &Arc<Self>,
         key: &PrKey,
@@ -497,11 +548,11 @@ impl PrService {
             .filter(|oid| missing.contains(*oid))
             .cloned()
             .collect();
-        if !lacking.is_empty() && self.fetch_for_snippets(key, lacking).await {
-            // What the remote did not give stays missing.
-            match repo.missing_objects(commit).await {
-                Ok(now) => missing = now,
-                Err(e) => eprintln!("gh-tideline: listing the blobs the repo lacks failed: {e}"),
+        if !lacking.is_empty() {
+            // A fetch gives all the blobs it asks for or fails, so the others stay missing: those it was not made for,
+            // because their fetch failed lately, or that did not come in time.
+            for oid in self.fetch_for_snippets(key, lacking).await {
+                missing.remove(&oid);
             }
         }
         let local: Vec<String> = in_blob
@@ -565,45 +616,82 @@ impl PrService {
         Ok(hits)
     }
 
-    /// Fetches blobs the cache repo lacks, for the snippets of a lookup, and tells whether it did. It is best effort: a
-    /// lookup without lines is better than none, so no token, a remote that cannot be reached or one that does not give the
-    /// blobs only costs the lines (and is told on stderr). A fetch that stays under 1 kB/s for `STALL_INDEX` is given up on;
-    /// the repo lock, which a fetch needs, may be held by a build or a pull request that is loading.
-    async fn fetch_for_snippets(&self, key: &PrKey, oids: Vec<String>) -> bool {
+    /// Fetches blobs the cache repo lacks, for the snippets of a lookup, and returns those it fetched in time. It is best
+    /// effort: a lookup without lines is better than none, so no token, a remote that cannot be reached or one that does
+    /// not give the blobs only costs the lines (and is told on stderr), and so does a blob whose fetch failed lately (see
+    /// `FETCH_FAILURE_TTL`). The lookup waits `snippet_fetch_wait` at most: the fetch is made by a task of its own, which
+    /// goes on after that, so that a later lookup finds the blobs. It needs the repo lock, which a build or a pull request
+    /// that is loading may hold for long, and gives up on a transfer that stays under 1 kB/s for `STALL_INDEX`.
+    async fn fetch_for_snippets(&self, key: &PrKey, oids: Vec<String>) -> Vec<String> {
+        let repo = self.repos.repo(&key.host, &key.owner, &key.repo);
+        let oids = self
+            .fetch_failures
+            .unfailed(&repo.git_dir, oids, Instant::now());
+        if oids.is_empty() {
+            return oids;
+        }
         let token = match self.tokens.get(&key.host).await {
             Ok(token) => token,
             Err(e) => {
                 eprintln!(
                     "gh-tideline: no token to fetch the blobs for the snippets of references: {e}"
                 );
-                return false;
+                return Vec::new();
             }
         };
         let auth = GitAuth {
             host: key.host.clone(),
             token,
         };
-        let repo = self.repos.repo(&key.host, &key.owner, &key.repo);
-        // A detached task owns the repo lock: a lookup that is dropped does not leave git running without it.
-        let fetched = tokio::spawn(async move {
-            let guard = repo.lock().await?;
-            repo.fetch_blobs(&guard, &auth, &oids, STALL_INDEX).await
-        })
-        .await;
-        match fetched {
-            Ok(Ok(())) => true,
+        let failures = self.fetch_failures.clone();
+        let task = tokio::spawn(fetch_under_lock(repo, auth, oids, failures));
+        match tokio::time::timeout(self.snippet_fetch_wait, task).await {
+            Ok(Ok(fetched)) => fetched,
             Ok(Err(e)) => {
-                eprintln!(
-                    "gh-tideline: fetching the blobs for the snippets of references failed: {e}"
-                );
-                false
-            }
-            Err(e) => {
                 eprintln!(
                     "gh-tideline: the fetch of the blobs for the snippets of references failed: {e}"
                 );
-                false
+                Vec::new()
             }
+            Err(_) => {
+                eprintln!(
+                    "gh-tideline: the blobs for the snippets of references did not come within {:?}; the lookup answers without their lines",
+                    self.snippet_fetch_wait
+                );
+                Vec::new()
+            }
+        }
+    }
+}
+
+/// The task that fetches the blobs for `PrService::fetch_for_snippets`, and returns the ones it fetched. It owns the repo
+/// lock, so that a lookup that is dropped, or has stopped waiting, does not leave git running without it. A blob whose
+/// fetch failed while the task waited for the lock is not asked for, and one whose fetch fails now is noted.
+async fn fetch_under_lock(
+    repo: Repo,
+    auth: GitAuth,
+    oids: Vec<String>,
+    failures: FetchFailures,
+) -> Vec<String> {
+    let guard = match repo.lock().await {
+        Ok(guard) => guard,
+        Err(e) => {
+            eprintln!(
+                "gh-tideline: locking the repo to fetch the blobs for the snippets of references failed: {e}"
+            );
+            return Vec::new();
+        }
+    };
+    let oids = failures.unfailed(&repo.git_dir, oids, Instant::now());
+    if oids.is_empty() {
+        return oids;
+    }
+    match repo.fetch_blobs(&guard, &auth, &oids, STALL_INDEX).await {
+        Ok(()) => oids,
+        Err(e) => {
+            eprintln!("gh-tideline: fetching the blobs for the snippets of references failed: {e}");
+            failures.note(&repo.git_dir, &oids, Instant::now());
+            Vec::new()
         }
     }
 }
@@ -615,7 +703,7 @@ mod tests {
     use super::*;
     use crate::error::ErrorCode;
     use crate::git::Repos;
-    use crate::git::testing::git_in;
+    use crate::git::testing::{Gate, git_in};
     use crate::index::{IndexState, Phase};
     use crate::pr::testing::{Fixture, Pull, RUST, UNKNOWN};
 
@@ -1559,10 +1647,46 @@ pub fn twice() {
         let want = (5, "over();".to_string(), 1, "file");
         assert!(got.hits.iter().all(|h| line(h) == want));
 
-        // A definition is never reported as cut.
+        // The single definition of a name with many references is not cut.
         let got = p.definitions(Side::Head, "gen.rs", "over").await.unwrap();
         assert_eq!(places(&got), [("gen.rs", 3, 4, "file")]);
         assert!(!got.truncated);
+    }
+
+    #[tokio::test]
+    async fn definitions_stop_at_two_hundred_and_say_so() {
+        let generated = format!(
+            "{}{}",
+            "fn exact() {}\n".repeat(200),
+            "fn over() {}\n".repeat(201)
+        );
+        let p = Pull::with_files(
+            "nav-truncated-definitions",
+            &[("old.rs", "fn old() {}\n")],
+            &[("gen.rs", generated.as_str())],
+        )
+        .await;
+        assert_eq!(p.build(Side::Head).await.state, IndexState::Ready);
+
+        // Exactly 200 is not more than that.
+        let got = p.definitions(Side::Head, "gen.rs", "exact").await.unwrap();
+        assert!(!got.truncated);
+        assert_eq!(got.hits.len(), 200);
+        assert_eq!((got.hits[0].line, got.hits[199].line), (1, 200));
+
+        let got = p.definitions(Side::Head, "gen.rs", "over").await.unwrap();
+        assert!(got.truncated);
+        assert_eq!(got.hits.len(), 200);
+        assert_eq!(
+            (got.hits[0].line, got.hits[199].line),
+            (201, 400),
+            "the 200 nearest are kept, the last one is cut"
+        );
+
+        // A name nobody defines is not cut either.
+        let got = p.definitions(Side::Head, "gen.rs", "nobody").await.unwrap();
+        assert!(!got.truncated);
+        assert!(got.hits.is_empty());
     }
 
     #[tokio::test]
@@ -1999,9 +2123,19 @@ pub fn twice() {
         assert!(files.iter().all(|(_, oid, _)| !after.contains(oid)));
     }
 
+    /// The references to `target` in the files of `TARGET_SOURCES`, with the line of each or, if `lines` is false,
+    /// without.
+    fn target_hits(lines: bool) -> [NavHit; 2] {
+        let line = if lines { ("target();", 1) } else { ("", 0) };
+        [
+            hit("target", "a.rs", (4, 5), "call", line, "file"),
+            hit("target", "b.rs", (2, 5), "call", line, "dir"),
+        ]
+    }
+
     #[tokio::test]
-    async fn a_lookup_that_cannot_fetch_the_blobs_answers_without_lines_and_tries_again_next_time()
-    {
+    async fn a_lookup_that_cannot_fetch_the_blobs_answers_without_lines_and_does_not_try_again_for_a_while()
+     {
         let sources = TARGET_SOURCES;
         let p = Pull::with_files("nav-fetch-fails", &[("old.rs", "fn old() {}\n")], &sources).await;
         let head = p.clone.head.clone();
@@ -2017,28 +2151,215 @@ pub fn twice() {
         git_in(git_dir, &["config", "remote.origin.url", &gone]).await;
         let got = p.references(Side::Head, "a.rs", "target").await.unwrap();
         // Not an error: the references are where the index says, without their lines.
-        assert_eq!(
-            got.hits,
-            [
-                hit("target", "a.rs", (4, 5), "call", ("", 0), "file"),
-                hit("target", "b.rs", (2, 5), "call", ("", 0), "dir"),
-            ]
-        );
+        assert_eq!(got.hits, target_hits(false));
         assert_eq!(p.clone.repo.missing_objects(&head).await.unwrap(), before);
+        assert_eq!(p.service.fetch_failures.0.lock().unwrap().len(), 2);
 
-        // Nothing about the failure is remembered: with the remote back, the next lookup has the lines.
+        // The failure is remembered: with the remote back, the next lookup does not ask for the blobs again, so it does
+        // not hold the repo for a fetch that most likely fails again.
         git_in(
             git_dir,
             &["config", "remote.origin.url", &url(&p.clone.origin)],
         )
         .await;
         let got = p.references(Side::Head, "a.rs", "target").await.unwrap();
+        assert_eq!(got.hits, target_hits(false));
+        assert_eq!(p.clone.repo.missing_objects(&head).await.unwrap(), before);
+
+        // When the notes have expired, the next lookup tries again, and has the lines.
+        p.service.fetch_failures.0.lock().unwrap().clear();
+        let got = p.references(Side::Head, "a.rs", "target").await.unwrap();
+        assert_eq!(got.hits, target_hits(true));
+        assert!(p.service.fetch_failures.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_notes_of_failed_fetches_expire_and_are_capped() {
+        let failures = FetchFailures::default();
+        let (repo, other) = (Path::new("/cache/a.git"), Path::new("/cache/b.git"));
+        let oid = |n: usize| format!("{n:040x}");
+        let failed = |repo: &Path, n: usize, at: Instant| {
+            failures.unfailed(repo, vec![oid(n)], at).is_empty()
+        };
+        let len = || failures.0.lock().unwrap().len();
+        let now = Instant::now();
+        failures.note(repo, &[oid(1), oid(2)], now);
+        assert!(failed(repo, 1, now) && failed(repo, 2, now));
+        // Another blob has not failed, and neither has the same blob of another repo.
+        assert!(!failed(repo, 3, now));
+        assert!(!failed(other, 1, now));
         assert_eq!(
-            got.hits,
-            [
-                hit("target", "a.rs", (4, 5), "call", ("target();", 1), "file"),
-                hit("target", "b.rs", (2, 5), "call", ("target();", 1), "dir"),
-            ]
+            failures.unfailed(repo, vec![oid(3), oid(1), oid(4)], now),
+            [oid(3), oid(4)]
         );
+        // The note holds for `FETCH_FAILURE_TTL`.
+        let almost = now + FETCH_FAILURE_TTL - Duration::from_secs(1);
+        assert!(failed(repo, 1, almost));
+        let expired = now + FETCH_FAILURE_TTL;
+        assert!(!failed(repo, 1, expired));
+
+        // Noting another blob drops the notes that have expired.
+        failures.note(repo, &[oid(3)], expired);
+        assert_eq!(len(), 1);
+
+        // At most `FETCH_FAILURES_KEPT` are kept, and the oldest go first, whichever repo they are of.
+        let at = |n: usize| expired + Duration::from_millis(n as u64);
+        for n in 0..FETCH_FAILURES_KEPT + 10 {
+            failures.note(other, &[oid(100 + n)], at(n));
+        }
+        assert_eq!(len(), FETCH_FAILURES_KEPT);
+        let last = FETCH_FAILURES_KEPT + 9;
+        assert!(!failed(repo, 3, at(last)));
+        assert!(!failed(other, 100, at(last)));
+        assert!(failed(other, 110, at(last)));
+        assert!(failed(other, 100 + last, at(last)));
+
+        // Noting a blob again only renews its note: nothing else goes. And the blobs of one fetch are capped together.
+        failures.note(other, &[oid(110)], at(last + 1));
+        assert_eq!(len(), FETCH_FAILURES_KEPT);
+        assert!(failed(other, 111, at(last + 1)));
+        let batch: Vec<String> = (0..FETCH_FAILURES_KEPT + 10)
+            .map(|n| oid(10_000 + n))
+            .collect();
+        failures.note(other, &batch, at(last + 2));
+        assert_eq!(len(), FETCH_FAILURES_KEPT);
+    }
+
+    #[tokio::test]
+    async fn a_lookup_does_not_wait_longer_than_a_moment_for_the_blobs_it_fetches() {
+        let sources = TARGET_SOURCES;
+        let mut p =
+            Pull::with_files("nav-fetch-wait", &[("old.rs", "fn old() {}\n")], &sources).await;
+        let head = p.clone.head.clone();
+        let files = stored_by_another_clone(&p, &sources).await;
+        p.db.save_commit(&head, &files).unwrap();
+        let before = p.clone.repo.missing_objects(&head).await.unwrap();
+        assert!(files.iter().all(|(_, oid, _)| before.contains(oid)));
+        Arc::get_mut(&mut p.service).unwrap().snippet_fetch_wait = Duration::from_millis(100);
+
+        // A pull request that is loading holds the repo, and the fetch of the lookup waits for it.
+        let repo = p.service.repos.repo("github.com", "o", "r");
+        let guard = repo.lock().await.unwrap();
+        let lookup = p.references(Side::Head, "a.rs", "target");
+        let got = tokio::time::timeout(Duration::from_secs(60), lookup)
+            .await
+            .expect("the lookup waited for the repo")
+            .unwrap();
+        assert_eq!(got.hits, target_hits(false));
+        assert_eq!(p.clone.repo.missing_objects(&head).await.unwrap(), before);
+        // A fetch that has not come yet has not failed.
+        assert!(p.service.fetch_failures.0.lock().unwrap().is_empty());
+
+        // The task of the lookup goes on: when the repo is free, it gets the blobs for a later lookup.
+        drop(guard);
+        drop(repo.lock().await.unwrap());
+        let after = p.clone.repo.missing_objects(&head).await.unwrap();
+        assert!(files.iter().all(|(_, oid, _)| !after.contains(oid)));
+        let got = p.references(Side::Head, "a.rs", "target").await.unwrap();
+        assert_eq!(got.hits, target_hits(true));
+    }
+
+    #[tokio::test]
+    async fn a_fetch_that_waited_for_the_repo_leaves_out_the_blobs_that_failed_meanwhile() {
+        let sources = TARGET_SOURCES;
+        let mut p =
+            Pull::with_files("nav-fetch-skips", &[("old.rs", "fn old() {}\n")], &sources).await;
+        let head = p.clone.head.clone();
+        let files = stored_by_another_clone(&p, &sources).await;
+        p.db.save_commit(&head, &files).unwrap();
+        Arc::get_mut(&mut p.service).unwrap().snippet_fetch_wait = Duration::from_millis(100);
+
+        // The lookup stops waiting for the repo, which is held; its fetch of both blobs waits for it.
+        let repo = p.service.repos.repo("github.com", "o", "r");
+        let guard = repo.lock().await.unwrap();
+        let got = p.references(Side::Head, "a.rs", "target").await.unwrap();
+        assert_eq!(got.hits, target_hits(false));
+        // Meanwhile the fetch of another lookup has failed on the blob of a.rs.
+        let (a_rs, b_rs) = (files[0].1.clone(), files[1].1.clone());
+        let failures = &p.service.fetch_failures;
+        failures.note(&repo.git_dir, std::slice::from_ref(&a_rs), Instant::now());
+        drop(guard);
+        drop(repo.lock().await.unwrap());
+
+        // The first fetch got the blob of b.rs only. A lookup that comes now asks for no other.
+        let after = p.clone.repo.missing_objects(&head).await.unwrap();
+        assert_eq!(after, HashSet::from([a_rs]));
+        let got = p.references(Side::Head, "a.rs", "target").await.unwrap();
+        let [from_a, mut from_b] = target_hits(false);
+        from_b.snippet = "target();".to_string();
+        from_b.snippet_column = 1;
+        assert_eq!(got.hits, [from_a, from_b]);
+        assert_eq!(p.clone.repo.missing_objects(&head).await.unwrap(), after);
+        assert!(!after.contains(&b_rs));
+    }
+
+    #[tokio::test]
+    async fn a_lookup_that_is_dropped_while_it_fetches_leaves_the_fetch_to_end_under_the_repo_lock()
+    {
+        let sources = TARGET_SOURCES;
+        let p = Pull::with_files(
+            "nav-fetch-dropped",
+            &[("old.rs", "fn old() {}\n")],
+            &sources,
+        )
+        .await;
+        let head = p.clone.head.clone();
+        let files = stored_by_another_clone(&p, &sources).await;
+        p.db.save_commit(&head, &files).unwrap();
+        let gate = Gate::install(&p.clone).await;
+
+        // The client goes away while the fetch of the lookup is under way: its request is dropped.
+        {
+            let mut lookup = Box::pin(p.references(Side::Head, "a.rs", "target"));
+            tokio::select! {
+                _ = &mut lookup => panic!("the lookup ended before its fetch began"),
+                _ = gate.begun() => {}
+            }
+        }
+        // The task that fetches still owns the repo lock, so nothing else touches the repo while git runs.
+        let repo = p.service.repos.repo("github.com", "o", "r");
+        let waited = tokio::time::timeout(Duration::from_millis(200), repo.lock()).await;
+        assert!(
+            waited.is_err(),
+            "the repo was free while a fetch was under way"
+        );
+
+        // The fetch ends, and the lock is let go.
+        gate.open();
+        drop(repo.lock().await.unwrap());
+        let after = p.clone.repo.missing_objects(&head).await.unwrap();
+        assert!(files.iter().all(|(_, oid, _)| !after.contains(oid)));
+        let got = p.references(Side::Head, "a.rs", "target").await.unwrap();
+        assert_eq!(got.hits, target_hits(true));
+    }
+
+    #[tokio::test]
+    async fn a_lookup_without_a_token_answers_without_lines_and_notes_no_failure() {
+        let sources = TARGET_SOURCES;
+        let p = Pull::with_files("nav-no-token", &[("old.rs", "fn old() {}\n")], &sources).await;
+        let head = p.clone.head.clone();
+        let files = stored_by_another_clone(&p, &sources).await;
+        p.db.save_commit(&head, &files).unwrap();
+        let before = p.clone.repo.missing_objects(&head).await.unwrap();
+        assert!(files.iter().all(|(_, oid, _)| before.contains(oid)));
+
+        // The same cache repo, for a host the viewer has no token for: the test service only has one for github.com.
+        std::os::unix::fs::symlink("github.com", p.clone.dir.join("repos/ghe.invalid")).unwrap();
+        let key = PrKey {
+            host: "ghe.invalid".to_string(),
+            ..p.key.clone()
+        };
+        let p = Pull { key, ..p };
+        p.at(&head).await;
+        assert!(
+            p.service.tokens.get("ghe.invalid").await.is_err(),
+            "the test needs a host without a token: unset GH_ENTERPRISE_TOKEN and GITHUB_ENTERPRISE_TOKEN"
+        );
+
+        let got = p.references(Side::Head, "a.rs", "target").await.unwrap();
+        assert_eq!(got.hits, target_hits(false));
+        assert_eq!(p.clone.repo.missing_objects(&head).await.unwrap(), before);
+        // Having no token is no failure of a blob.
+        assert!(p.service.fetch_failures.0.lock().unwrap().is_empty());
     }
 }

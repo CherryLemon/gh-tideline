@@ -104,12 +104,12 @@ impl Pull {
 
     async fn over(clone: PartialClone) -> Pull {
         let db = IndexDb::open(&clone.dir.join("index.sqlite")).unwrap();
-        let service = Arc::new(PrService::new(
-            Repos::new(clone.dir.join("repos")),
-            None,
-            Some(db.clone()),
-        ));
+        let mut service =
+            PrService::new(Repos::new(clone.dir.join("repos")), None, Some(db.clone()));
+        // A fetch of a lookup takes what a loaded machine gives it; the test that watches the wait shortens it.
+        service.snippet_fetch_wait = Duration::from_secs(60);
         service.tokens.insert("github.com", "unused");
+        let service = Arc::new(service);
         let key = PrKey {
             host: "github.com".to_string(),
             owner: "o".to_string(),
