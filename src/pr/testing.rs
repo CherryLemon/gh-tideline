@@ -3,12 +3,14 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use super::nav::Side;
 use super::{Cached, PrData, PrService, PrSummary, RefInfo};
 use crate::git::Repos;
 use crate::git::testing::{PartialClone, bare_repo_with_blobs, temp_dir};
 use crate::index::db::IndexDb;
+use crate::index::{IndexState, IndexStatus};
 use crate::state::PrKey;
 
 pub(crate) use crate::git::testing::UNKNOWN;
@@ -88,7 +90,19 @@ pub(crate) struct Pull {
 impl Pull {
     /// A pull request at the clone's head, whose merge base is the clone's base.
     pub(crate) async fn new(name: &str) -> Pull {
-        let clone = PartialClone::new(name).await;
+        Pull::over(PartialClone::new(name).await).await
+    }
+
+    /// Like `new`, but the base and the head hold just these files.
+    pub(crate) async fn with_files(
+        name: &str,
+        base: &[(&str, &str)],
+        head: &[(&str, &str)],
+    ) -> Pull {
+        Pull::over(PartialClone::with_files(name, base, head).await).await
+    }
+
+    async fn over(clone: PartialClone) -> Pull {
         let db = IndexDb::open(&clone.dir.join("index.sqlite")).unwrap();
         let service = Arc::new(PrService::new(
             Repos::new(clone.dir.join("repos")),
@@ -144,6 +158,31 @@ impl Pull {
             finished: now,
             data: Arc::new(data),
         });
+    }
+
+    /// Waits until the build of `side` has ended, and returns how it ended.
+    pub(crate) async fn end(&self, head: &str, side: Side) -> IndexStatus {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let status = self.service.index_status(&self.key, head, side).await;
+            let status = status.unwrap();
+            if !matches!(status.state, IndexState::Queued | IndexState::Building) {
+                return status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out; the status is {status:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Builds the index of `side` to the end, and returns how the build ended.
+    pub(crate) async fn build(&self, side: Side) -> IndexStatus {
+        let head = self.clone.head.clone();
+        let started = self.service.start_index(&self.key, &head, side).await;
+        started.unwrap();
+        self.end(&head, side).await
     }
 
     /// A service over the same repos that has no index.

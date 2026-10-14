@@ -18,6 +18,7 @@ pub enum ErrorCode {
     PendingReviewExists,
     ReviewChanged,
     IndexUnavailable,
+    IndexMissing,
 }
 
 impl ErrorCode {
@@ -35,6 +36,7 @@ impl ErrorCode {
             ErrorCode::PendingReviewExists => "pending_review_exists",
             ErrorCode::ReviewChanged => "review_changed",
             ErrorCode::IndexUnavailable => "index_unavailable",
+            ErrorCode::IndexMissing => "index_missing",
         }
     }
 
@@ -52,6 +54,7 @@ impl ErrorCode {
             ErrorCode::PendingReviewExists => StatusCode::CONFLICT,
             ErrorCode::ReviewChanged => StatusCode::CONFLICT,
             ErrorCode::IndexUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            ErrorCode::IndexMissing => StatusCode::CONFLICT,
         }
     }
 }
@@ -109,6 +112,10 @@ impl AppError {
     /// Code navigation cannot answer: its index database could not be opened or failed.
     pub fn index_unavailable(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::IndexUnavailable, message)
+    }
+    /// A lookup in a commit whose index is not complete: it has to be built first.
+    pub fn index_missing(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::IndexMissing, message)
     }
 }
 

@@ -3,8 +3,6 @@ mod config;
 mod error;
 mod git;
 mod github;
-// The server uses the rest of the index in later commits; until then only its tests do.
-#[allow(dead_code)]
 mod index;
 mod pr;
 mod server;

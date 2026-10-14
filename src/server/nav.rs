@@ -1,4 +1,4 @@
-//! Code navigation handlers: the symbols of a file, and the index of a commit.
+//! Code navigation handlers: the symbols of a file, the index of a commit, and the definitions and references in it.
 
 use axum::Json;
 use axum::body::Bytes;
@@ -15,6 +15,8 @@ use crate::pr::nav::{IndexRequest, Side};
 
 /// The longest path accepted, in bytes (Linux's `PATH_MAX`).
 const MAX_PATH_BYTES: usize = 4096;
+/// The longest name to look up accepted, in bytes.
+const MAX_NAME_BYTES: usize = 256;
 
 /// A path in the repository: 1 to 4096 bytes without control characters.
 fn check_path(path: Option<&str>) -> Result<&str, AppError> {
@@ -27,6 +29,21 @@ fn check_path(path: Option<&str>) -> Result<&str, AppError> {
         }
         _ => Err(AppError::bad_request(
             "path must be 1 to 4096 bytes without control characters",
+        )),
+    }
+}
+
+/// A name to look up: 1 to 256 bytes without whitespace or control characters.
+fn check_name(name: Option<&str>) -> Result<&str, AppError> {
+    match name {
+        Some(name)
+            if (1..=MAX_NAME_BYTES).contains(&name.len())
+                && !name.chars().any(|c| c.is_whitespace() || c.is_control()) =>
+        {
+            Ok(name)
+        }
+        _ => Err(AppError::bad_request(
+            "name must be 1 to 256 bytes without whitespace or control characters",
         )),
     }
 }
@@ -116,6 +133,52 @@ pub(super) async fn cancel_index(
     let key = pr_key(&state, params)?;
     let (head, side) = q.parts()?;
     Ok(uncached(state.pr.cancel_index(&key, head, side).await?))
+}
+
+/// What a lookup is about: the commit, the file the click came from and the name under the caret.
+#[derive(Deserialize)]
+pub(super) struct LookupQuery {
+    #[serde(flatten)]
+    commit: CommitQuery,
+    path: Option<String>,
+    name: Option<String>,
+}
+
+impl LookupQuery {
+    fn parts(&self) -> Result<(&str, Side, &str, &str), AppError> {
+        let (head, side) = self.commit.parts()?;
+        let path = check_path(self.path.as_deref())?;
+        let name = check_name(self.name.as_deref())?;
+        Ok((head, side, path, name))
+    }
+}
+
+/// `GET /api/{host}/{owner}/{repo}/pulls/{n}/definitions?head=&side=&path=&name=`: where `name` is defined, the
+/// nearest to `path` first. The commit has to be indexed already.
+pub(super) async fn definitions(
+    State(state): State<AppState>,
+    Path(params): PrPath,
+    Query(q): Query<LookupQuery>,
+) -> Result<Response, AppError> {
+    let key = pr_key(&state, params)?;
+    let (head, side, path, name) = q.parts()?;
+    Ok(uncached(
+        state.pr.definitions(&key, head, side, path, name).await?,
+    ))
+}
+
+/// `GET /api/{host}/{owner}/{repo}/pulls/{n}/references?head=&side=&path=&name=`: where `name` is used, the nearest
+/// to `path` first. The commit has to be indexed already.
+pub(super) async fn references(
+    State(state): State<AppState>,
+    Path(params): PrPath,
+    Query(q): Query<LookupQuery>,
+) -> Result<Response, AppError> {
+    let key = pr_key(&state, params)?;
+    let (head, side, path, name) = q.parts()?;
+    Ok(uncached(
+        state.pr.references(&key, head, side, path, name).await?,
+    ))
 }
 
 #[cfg(test)]
@@ -550,6 +613,349 @@ mod tests {
         ];
         for (status, _, answer) in answers {
             assert_eq!((status, error_code(&answer)), (503, "index_unavailable"));
+        }
+    }
+
+    /// The lookups of pull request 1 of `github.com/o/r`.
+    const DEFINITIONS: &str = "/api/github.com/o/r/pulls/1/definitions";
+    const REFERENCES: &str = "/api/github.com/o/r/pulls/1/references";
+
+    /// The query of a lookup of `name` from the file `path`; the parts are put in as they are.
+    fn lookup(head: &str, side: &str, path: &str, name: &str) -> String {
+        format!("?head={head}&side={side}&path={path}&name={name}")
+    }
+
+    /// Builds the index of `side` over HTTP and waits until it is ready.
+    async fn build(server: &TestServer, head: &str, side: &str) {
+        let start = json!({ "head": head, "side": side }).to_string();
+        let (status, _, body) = server.post(INDEX, &start).await;
+        assert_eq!(status, 200, "{body}");
+        let query = format!("{INDEX}?head={head}&side={side}");
+        let status = server.until(&query, ended).await;
+        assert_eq!(status["state"], "ready", "{status}");
+    }
+
+    #[test]
+    fn a_name_is_one_to_256_bytes_without_whitespace_or_control_characters() {
+        for name in [
+            "a",
+            "parse",
+            "größe",
+            "_x1",
+            "$scope",
+            "operator()",
+            &"n".repeat(256),
+            &"é".repeat(128),
+        ] {
+            assert_eq!(check_name(Some(name)).unwrap(), name);
+        }
+        for name in [
+            None,
+            Some(""),
+            Some("a b"),
+            Some(" a"),
+            Some("a\tb"),
+            Some("a\nb"),
+            Some("a\u{a0}b"),
+            Some("a\u{2003}b"),
+            Some("a\u{85}b"),
+            Some("a\u{7f}"),
+            Some("nul\0"),
+            Some(&"n".repeat(257)),
+            Some(&"é".repeat(129)),
+        ] {
+            assert!(check_name(name).is_err(), "{name:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn lookups_are_served_as_json_and_never_cached() {
+        let p = Pull::with_files(
+            "srv-lookups",
+            &[("src/lib.rs", "pub fn old() {}\n")],
+            &[
+                (
+                    "src/lib.rs",
+                    "pub fn parse() {}\n\npub fn run() {\n    parse();\n}\n",
+                ),
+                (
+                    "src/util.rs",
+                    "fn parse() {}\n\nfn helper() {\n    parse();\n}\n",
+                ),
+                ("dir with space/é.py", "def größe():\n    pass\n"),
+                ("README.md", "# parse\n"),
+            ],
+        )
+        .await;
+        let server = TestServer::start(p.service.clone()).await;
+        let (base, head) = (p.clone.base.clone(), p.clone.head.clone());
+        build(&server, &head, "head").await;
+        build(&server, &head, "base").await;
+
+        let query = lookup(&head, "head", "src/lib.rs", "parse");
+        let (status, headers, body) = server.get(&format!("{DEFINITIONS}{query}")).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(headers["cache-control"], "no-store");
+        assert_eq!(
+            body,
+            json!({
+                "language": "rust",
+                "commit": head,
+                "name": "parse",
+                "hits": [
+                    {
+                        "path": "src/lib.rs", "line": 1, "column": 8, "endColumn": 13,
+                        "kind": "function", "snippet": "pub fn parse() {}", "snippetColumn": 8,
+                        "tier": "file"
+                    },
+                    {
+                        "path": "src/util.rs", "line": 1, "column": 4, "endColumn": 9,
+                        "kind": "function", "snippet": "fn parse() {}", "snippetColumn": 4,
+                        "tier": "dir"
+                    }
+                ],
+                "truncated": false
+            })
+        );
+
+        let (status, headers, body) = server.get(&format!("{REFERENCES}{query}")).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(headers["cache-control"], "no-store");
+        assert_eq!(
+            body,
+            json!({
+                "language": "rust",
+                "commit": head,
+                "name": "parse",
+                "hits": [
+                    {
+                        "path": "src/lib.rs", "line": 4, "column": 5, "endColumn": 10,
+                        "kind": "call", "snippet": "parse();", "snippetColumn": 1, "tier": "file"
+                    },
+                    {
+                        "path": "src/util.rs", "line": 4, "column": 5, "endColumn": 10,
+                        "kind": "call", "snippet": "parse();", "snippetColumn": 1, "tier": "dir"
+                    }
+                ],
+                "truncated": false
+            })
+        );
+
+        // The merge base has its own commit and its own code.
+        let query = lookup(&head, "base", "src/lib.rs", "old");
+        let (status, _, body) = server.get(&format!("{DEFINITIONS}{query}")).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["commit"], json!(base));
+        assert_eq!(
+            body["hits"],
+            json!([{
+                "path": "src/lib.rs", "line": 1, "column": 8, "endColumn": 11,
+                "kind": "function", "snippet": "pub fn old() {}", "snippetColumn": 8,
+                "tier": "file"
+            }])
+        );
+        let query = lookup(&head, "head", "src/lib.rs", "old");
+        let (_, _, body) = server.get(&format!("{DEFINITIONS}{query}")).await;
+        assert_eq!(body["commit"], json!(head));
+        assert_eq!(body["hits"], json!([]));
+
+        // Percent-encoded UTF-8 in the path and in the name.
+        let query = lookup(
+            &head,
+            "head",
+            "dir%20with%20space/%C3%A9.py",
+            "gr%C3%B6%C3%9Fe",
+        );
+        let (status, _, body) = server.get(&format!("{DEFINITIONS}{query}")).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["language"], "python");
+        assert_eq!(body["name"], "größe");
+        assert_eq!(
+            body["hits"],
+            json!([{
+                "path": "dir with space/é.py", "line": 1, "column": 5, "endColumn": 10,
+                "kind": "function", "snippet": "def größe():", "snippetColumn": 5, "tier": "file"
+            }])
+        );
+
+        // A file of no language the index knows has nothing to find.
+        let query = lookup(&head, "head", "README.md", "parse");
+        for endpoint in [DEFINITIONS, REFERENCES] {
+            let (status, headers, body) = server.get(&format!("{endpoint}{query}")).await;
+            assert_eq!(status, 200, "{body}");
+            assert_eq!(headers["cache-control"], "no-store");
+            assert_eq!(
+                body,
+                json!({
+                    "language": null, "commit": head, "name": "parse", "hits": [],
+                    "truncated": false
+                })
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_lookup_with_bad_parts_is_a_bad_request() {
+        let p = Pull::new("srv-lookup-400").await;
+        let server = TestServer::start(p.service.clone()).await;
+        let head = p.clone.head.clone();
+        let upper = head.to_uppercase();
+        let short = &head[..39];
+        let long_path = "a".repeat(4097);
+        let long_name = "n".repeat(257);
+
+        let queries = [
+            String::new(),
+            "?side=head&path=a.rs&name=x".to_string(),
+            lookup("", "head", "a.rs", "x"),
+            lookup(&upper, "head", "a.rs", "x"),
+            lookup(short, "head", "a.rs", "x"),
+            lookup(&"z".repeat(40), "head", "a.rs", "x"),
+            format!("?head={head}&path=a.rs&name=x"),
+            lookup(&head, "", "a.rs", "x"),
+            lookup(&head, "both", "a.rs", "x"),
+            lookup(&head, "HEAD", "a.rs", "x"),
+            format!("?head={head}&side=head&name=x"),
+            lookup(&head, "head", "", "x"),
+            lookup(&head, "head", "a%0Ab.rs", "x"),
+            lookup(&head, "head", &long_path, "x"),
+            format!("?head={head}&side=head&path=a.rs"),
+            lookup(&head, "head", "a.rs", ""),
+            lookup(&head, "head", "a.rs", "a%20b"),
+            lookup(&head, "head", "a.rs", "a%09b"),
+            lookup(&head, "head", "a.rs", "a%0Ab"),
+            lookup(&head, "head", "a.rs", "a%C2%A0b"),
+            lookup(&head, "head", "a.rs", &long_name),
+        ];
+        for endpoint in [DEFINITIONS, REFERENCES] {
+            for query in &queries {
+                let url = format!("{endpoint}{query}");
+                let (status, _, body) = server.get(&url).await;
+                assert_eq!((status, error_code(&body)), (400, "bad_request"), "{url}");
+            }
+        }
+
+        // The longest path and name allowed get as far as the index, which has not been built.
+        let longest_path = format!("{}.rs", "a".repeat(4093));
+        let longest_name = "n".repeat(256);
+        for endpoint in [DEFINITIONS, REFERENCES] {
+            let query = lookup(&head, "head", &longest_path, &longest_name);
+            let (status, _, body) = server.get(&format!("{endpoint}{query}")).await;
+            assert_eq!((status, error_code(&body)), (409, "index_missing"));
+        }
+
+        // Neither a pull request nor a repository is named.
+        let query = lookup(&head, "head", "src/lib.rs", "one");
+        for path in [
+            "/api/github.com/o/r/pulls/0",
+            "/api/github.com/o/r/pulls/x",
+            "/api/github.com/o/r/pulls/-1",
+            "/api/github.com/bad%20owner/r/pulls/1",
+        ] {
+            for endpoint in ["definitions", "references"] {
+                let url = format!("{path}/{endpoint}{query}");
+                let (status, _, body) = server.get(&url).await;
+                assert_eq!((status, error_code(&body)), (400, "bad_request"), "{url}");
+            }
+        }
+
+        // Only the configured hosts.
+        for endpoint in ["definitions", "references"] {
+            let url = format!("/api/evil.example/o/r/pulls/1/{endpoint}{query}");
+            let (status, _, body) = server.get(&url).await;
+            assert_eq!(
+                (status, error_code(&body)),
+                (403, "forbidden_host"),
+                "{url}"
+            );
+        }
+
+        // None of it started anything.
+        let (_, _, body) = server.get(&format!("{INDEX}?head={head}&side=head")).await;
+        assert_eq!(body, idle(&head, "missing"));
+    }
+
+    #[tokio::test]
+    async fn a_lookup_in_a_commit_that_is_not_indexed_asks_for_a_build() {
+        let p = Pull::new("srv-lookup-409").await;
+        let server = TestServer::start(p.service.clone()).await;
+        let (base, head) = (p.clone.base.clone(), p.clone.head.clone());
+
+        for (side, commit) in [("head", &head), ("base", &base)] {
+            for endpoint in [DEFINITIONS, REFERENCES] {
+                let query = lookup(&head, side, "src/lib.rs", "one");
+                let (status, _, body) = server.get(&format!("{endpoint}{query}")).await;
+                assert_eq!(
+                    (status, error_code(&body)),
+                    (409, "index_missing"),
+                    "{side}"
+                );
+                let message = body["error"]["message"].as_str().unwrap();
+                assert!(message.contains(commit), "{message}");
+            }
+        }
+
+        // A file the index could not tell anything about needs no index.
+        let query = lookup(&head, "head", "README.md", "one");
+        for endpoint in [DEFINITIONS, REFERENCES] {
+            let (status, _, body) = server.get(&format!("{endpoint}{query}")).await;
+            assert_eq!((status, &body["hits"]), (200, &json!([])), "{body}");
+            assert_eq!(body["language"], json!(null));
+        }
+
+        // Asking did not start a build.
+        for side in ["head", "base"] {
+            let commit = if side == "head" { &head } else { &base };
+            let (_, _, body) = server
+                .get(&format!("{INDEX}?head={head}&side={side}"))
+                .await;
+            assert_eq!(body, idle(commit, "missing"));
+        }
+
+        // Once the head is built it can be asked; the merge base is another commit and still can not.
+        build(&server, &head, "head").await;
+        let query = lookup(&head, "head", "src/lib.rs", "one");
+        let (status, _, body) = server.get(&format!("{DEFINITIONS}{query}")).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["hits"][0]["path"], "src/lib.rs");
+        let query = lookup(&head, "base", "src/lib.rs", "one");
+        let (status, _, body) = server.get(&format!("{DEFINITIONS}{query}")).await;
+        assert_eq!((status, error_code(&body)), (409, "index_missing"));
+    }
+
+    #[tokio::test]
+    async fn a_lookup_from_a_page_behind_the_pull_request_is_told_to_refresh() {
+        let p = Pull::new("srv-lookup-stale").await;
+        let server = TestServer::start(p.service.clone()).await;
+        // A commit that is not the head the service knows.
+        let behind = p.clone.base.clone();
+        for side in ["head", "base"] {
+            for path in ["src/lib.rs", "README.md"] {
+                for endpoint in [DEFINITIONS, REFERENCES] {
+                    let query = lookup(&behind, side, path, "one");
+                    let (status, _, body) = server.get(&format!("{endpoint}{query}")).await;
+                    assert_eq!((status, error_code(&body)), (409, "stale_head"), "{side}");
+                }
+            }
+        }
+
+        // Nothing was started.
+        let head = p.clone.head.clone();
+        let (_, _, body) = server.get(&format!("{INDEX}?head={head}&side=head")).await;
+        assert_eq!(body, idle(&head, "missing"));
+    }
+
+    #[tokio::test]
+    async fn without_an_index_the_lookups_are_unavailable() {
+        let p = Pull::new("srv-lookup-503").await;
+        let server = TestServer::start(p.without_index()).await;
+        let head = p.clone.head.clone();
+        for path in ["src/lib.rs", "README.md"] {
+            for endpoint in [DEFINITIONS, REFERENCES] {
+                let query = lookup(&head, "head", path, "one");
+                let (status, _, body) = server.get(&format!("{endpoint}{query}")).await;
+                assert_eq!((status, error_code(&body)), (503, "index_unavailable"));
+            }
         }
     }
 }

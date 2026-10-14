@@ -81,6 +81,14 @@ pub fn router(state: AppState) -> Router {
                 .delete(nav::cancel_index),
         )
         .route(
+            "/api/{host}/{owner}/{repo}/pulls/{n}/definitions",
+            get(nav::definitions),
+        )
+        .route(
+            "/api/{host}/{owner}/{repo}/pulls/{n}/references",
+            get(nav::references),
+        )
+        .route(
             "/api/{host}/{owner}/{repo}/pulls/{n}/threads",
             get(review::threads).post(review::create_thread),
         )

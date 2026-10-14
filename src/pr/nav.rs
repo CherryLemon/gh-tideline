@@ -1,13 +1,14 @@
-//! Code navigation: the symbols of a file, and the index of a pull request's commits.
+//! Code navigation: the symbols of a file, the index of a pull request's commits, and what it finds there.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::AppError;
-use crate::git::GitAuth;
-use crate::index::db::{BlobStatus, IndexDb, NewBlob};
-use crate::index::lang::{Grammar, MAX_BLOB_BYTES};
+use crate::git::{GitAuth, Repo};
+use crate::index::db::{BlobStatus, Hit, IndexDb, NewBlob};
+use crate::index::lang::{Family, Grammar, MAX_BLOB_BYTES};
 use crate::index::tags::{self, Tag};
 use crate::index::{IndexStatus, Indexer};
 use crate::state::PrKey;
@@ -96,6 +97,68 @@ pub struct IndexRequest {
     /// The head the client shows.
     pub head: String,
     pub side: Side,
+}
+
+/// How many blobs are read at once to cut the snippets of references out of them. The blobs of the index are at most
+/// `MAX_BLOB_BYTES` each, so a read holds at most 16 MiB.
+const SNIPPET_BLOBS_PER_READ: usize = 16;
+
+/// A definition or a reference found in the index (`GET /definitions` and `GET /references`). Lines are 1-based and
+/// columns 1-based UTF-16 code units, like a [`Symbol`]'s.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NavHit {
+    pub path: String,
+    pub line: u32,
+    pub column: u32,
+    pub end_column: u32,
+    pub kind: String,
+    /// The trimmed source line and the column of the name inside it; empty when the line could not be read.
+    pub snippet: String,
+    pub snippet_column: u32,
+    /// How close the file is to the one the lookup came from: `file`, `dir` or `other`.
+    pub tier: &'static str,
+}
+
+impl From<Hit> for NavHit {
+    fn from(hit: Hit) -> NavHit {
+        NavHit {
+            path: hit.path,
+            line: hit.line,
+            column: hit.column,
+            end_column: hit.end_column,
+            kind: hit.kind,
+            snippet: hit.snippet,
+            snippet_column: hit.snippet_column,
+            tier: hit.tier.as_str(),
+        }
+    }
+}
+
+/// What a lookup found, closest to the file it came from first.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NavResult {
+    /// The id of the grammar of the file the lookup came from; None for a file of no language the index knows.
+    pub language: Option<&'static str>,
+    pub commit: String,
+    pub name: String,
+    pub hits: Vec<NavHit>,
+    /// There are more references than were returned. Definitions are cut at the best 200 without saying so.
+    pub truncated: bool,
+}
+
+impl NavResult {
+    /// The answer for a file of no language the index knows: nothing to find.
+    fn unsupported(commit: String, name: &str) -> NavResult {
+        NavResult {
+            language: None,
+            commit,
+            name: name.to_string(),
+            hits: Vec::new(),
+            truncated: false,
+        }
+    }
 }
 
 impl PrService {
@@ -246,12 +309,141 @@ impl PrService {
             .await
             .map_err(AppError::index_unavailable)
     }
+
+    /// Where `name` is defined in the commit, as the file `path` of the commit sees it: the definitions of its
+    /// family of languages, the nearest first. Asks the index only: it never fetches and never starts a build.
+    pub async fn definitions(
+        self: &Arc<Self>,
+        key: &PrKey,
+        head: &str,
+        side: Side,
+        path: &str,
+        name: &str,
+    ) -> Result<NavResult, AppError> {
+        let (index, commit) = self.index_target(key, head, side).await?;
+        let Some(family) = Family::for_path(path) else {
+            return Ok(NavResult::unsupported(commit, name));
+        };
+        let found = {
+            let (commit, name, path) = (commit.clone(), name.to_string(), path.to_string());
+            with_index(index.db(), move |db| {
+                db.definitions(&commit, family, &name, &path)
+            })
+            .await?
+        };
+        let hits = found.ok_or_else(|| not_indexed(&commit))?;
+        Ok(NavResult {
+            language: Some(language_of(index.db(), &commit, path).await?),
+            commit,
+            name: name.to_string(),
+            hits: hits.into_iter().map(NavHit::from).collect(),
+            truncated: false,
+        })
+    }
+
+    /// Where `name` is used in the commit, as the file `path` of the commit sees it: the references of its family of
+    /// languages, the nearest first. The index knows where they are; the lines come from the blobs the cache repo
+    /// holds. Nothing is fetched and no build is started, so a reference whose blob is not local has no snippet.
+    pub async fn references(
+        self: &Arc<Self>,
+        key: &PrKey,
+        head: &str,
+        side: Side,
+        path: &str,
+        name: &str,
+    ) -> Result<NavResult, AppError> {
+        let (index, commit) = self.index_target(key, head, side).await?;
+        let Some(family) = Family::for_path(path) else {
+            return Ok(NavResult::unsupported(commit, name));
+        };
+        let found = {
+            let (commit, name, path) = (commit.clone(), name.to_string(), path.to_string());
+            with_index(index.db(), move |db| {
+                db.references(&commit, family, &name, &path)
+            })
+            .await?
+        };
+        let (found, truncated) = found.ok_or_else(|| not_indexed(&commit))?;
+        let repo = self.repos.repo(&key.host, &key.owner, &key.repo);
+        Ok(NavResult {
+            language: Some(language_of(index.db(), &commit, path).await?),
+            commit,
+            name: name.to_string(),
+            hits: with_snippets(&repo, found).await?,
+            truncated,
+        })
+    }
+}
+
+fn not_indexed(commit: &str) -> AppError {
+    AppError::index_missing(format!(
+        "the index of commit {commit} is not complete; build it first"
+    ))
+}
+
+/// The language of the file `path` of the commit: the grammar its extension names, and for a `.h` file the one the
+/// index holds it under, which went by its content (C when the commit does not list it).
+async fn language_of(db: &IndexDb, commit: &str, path: &str) -> Result<&'static str, AppError> {
+    if let Some(grammar) = Grammar::for_path_only(path) {
+        return Ok(grammar.id());
+    }
+    let (commit, path) = (commit.to_string(), path.to_string());
+    let held = with_index(db, move |db| db.path_grammar(&commit, &path)).await?;
+    Ok(held.unwrap_or(Grammar::C).id())
+}
+
+/// A hit that wants its snippet: its index among the hits, and the line and column of its name.
+type Wanted = (usize, u32, u32);
+
+/// The references with the line each is on, cut out of the blob that holds it (`found` has the OID of the blob with
+/// each hit). Blobs the repo cannot read leave their hits without a snippet.
+async fn with_snippets(repo: &Repo, found: Vec<(Hit, String)>) -> Result<Vec<NavHit>, AppError> {
+    let mut hits: Vec<NavHit> = Vec::with_capacity(found.len());
+    let mut in_blob: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (hit, oid) in found {
+        in_blob.entry(oid).or_default().push(hits.len());
+        hits.push(hit.into());
+    }
+    let oids: Vec<String> = in_blob.keys().cloned().collect();
+    for chunk in oids.chunks(SNIPPET_BLOBS_PER_READ) {
+        let blobs = match repo.read_blobs(chunk).await {
+            Ok(blobs) => blobs,
+            Err(e) => {
+                eprintln!("gh-tideline: reading blobs for the snippets of references failed: {e}");
+                continue;
+            }
+        };
+        let cut: Vec<(Vec<u8>, Vec<Wanted>)> = blobs
+            .into_iter()
+            .filter_map(|(oid, text)| {
+                let at = in_blob.get(&oid)?;
+                let wanted = at.iter().map(|&i| (i, hits[i].line, hits[i].column));
+                Some((text, wanted.collect()))
+            })
+            .collect();
+        let snippets = tokio::task::spawn_blocking(move || {
+            let mut snippets = Vec::new();
+            for (text, wanted) in cut {
+                for (i, line, column) in wanted {
+                    if let Some((snippet, at)) = tags::line_snippet(&text, line, column) {
+                        snippets.push((i, snippet, at));
+                    }
+                }
+            }
+            snippets
+        })
+        .await
+        .map_err(|e| AppError::index_unavailable(format!("reading snippets failed: {e}")))?;
+        for (i, snippet, column) in snippets {
+            hits[i].snippet = snippet;
+            hits[i].snippet_column = column;
+        }
+    }
+    Ok(hits)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
-
     use super::*;
     use crate::error::ErrorCode;
     use crate::index::IndexState;
@@ -266,21 +458,31 @@ mod tests {
     }
 
     impl Pull {
-        /// Waits until the build of `side` has ended, and returns how it ended.
-        async fn end(&self, head: &str, side: Side) -> IndexStatus {
-            let deadline = Instant::now() + Duration::from_secs(60);
-            loop {
-                let status = self.service.index_status(&self.key, head, side).await;
-                let status = status.unwrap();
-                if !matches!(status.state, IndexState::Queued | IndexState::Building) {
-                    return status;
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "timed out; the status is {status:?}"
-                );
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
+        /// The definitions of `name` for a click in `path` of the commit on `side`, as the page showing the
+        /// current head asks for them.
+        async fn definitions(
+            &self,
+            side: Side,
+            path: &str,
+            name: &str,
+        ) -> Result<NavResult, AppError> {
+            let head = self.clone.head.clone();
+            self.service
+                .definitions(&self.key, &head, side, path, name)
+                .await
+        }
+
+        /// Like `definitions`, for the references.
+        async fn references(
+            &self,
+            side: Side,
+            path: &str,
+            name: &str,
+        ) -> Result<NavResult, AppError> {
+            let head = self.clone.head.clone();
+            self.service
+                .references(&self.key, &head, side, path, name)
+                .await
         }
     }
 
@@ -601,6 +803,16 @@ mod tests {
                 Err(ErrorCode::StaleHead)
             );
         }
+        // Neither does a lookup, whatever file it comes from.
+        let lookup = |r: Result<NavResult, AppError>| r.map(|_| ()).map_err(|e| e.code);
+        for side in [Side::Head, Side::Base] {
+            for path in ["src/lib.rs", "README.md"] {
+                let found = p.service.definitions(&p.key, &behind, side, path, "one");
+                assert_eq!(lookup(found.await), Err(ErrorCode::StaleHead));
+                let found = p.service.references(&p.key, &behind, side, path, "one");
+                assert_eq!(lookup(found.await), Err(ErrorCode::StaleHead));
+            }
+        }
         // Nothing was started.
         let head = p.clone.head.clone();
         let status = p.service.index_status(&p.key, &head, Side::Head).await;
@@ -625,5 +837,726 @@ mod tests {
             code(service.cancel_index(&p.key, &head, Side::Head).await),
             Err(ErrorCode::IndexUnavailable)
         );
+        let lookup = |r: Result<NavResult, AppError>| r.map(|_| ()).map_err(|e| e.code);
+        for path in ["src/lib.rs", "README.md"] {
+            let found = service.definitions(&p.key, &head, Side::Head, path, "one");
+            assert_eq!(lookup(found.await), Err(ErrorCode::IndexUnavailable));
+            let found = service.references(&p.key, &head, Side::Head, path, "one");
+            assert_eq!(lookup(found.await), Err(ErrorCode::IndexUnavailable));
+        }
+    }
+
+    /// `(path, line, column, tier)` of each hit.
+    fn places(result: &NavResult) -> Vec<(&str, u32, u32, &str)> {
+        result
+            .hits
+            .iter()
+            .map(|hit| (hit.path.as_str(), hit.line, hit.column, hit.tier))
+            .collect()
+    }
+
+    /// A hit on `name` at `at` (line, column) of `path`, on a line whose trimmed text is `snippet` with the name at
+    /// its `snippet_column`. The names of the tests are ASCII, so the end column is the column plus the length.
+    fn hit(
+        name: &str,
+        path: &str,
+        at: (u32, u32),
+        kind: &str,
+        snippet: (&str, u32),
+        tier: &'static str,
+    ) -> NavHit {
+        NavHit {
+            path: path.to_string(),
+            line: at.0,
+            column: at.1,
+            end_column: at.1 + name.len() as u32,
+            kind: kind.to_string(),
+            snippet: snippet.0.to_string(),
+            snippet_column: snippet.1,
+            tier,
+        }
+    }
+
+    /// The files of `lookup_pull`'s head. `parse` is defined at line 5 of the first and used at line 10.
+    const MAIN_RS: &str = "use std::fmt;
+
+struct Local;
+
+fn parse(input: u32) -> usize {
+    input as usize
+}
+
+fn main() {
+    let first = parse(1);
+}
+";
+    const OTHER_RS: &str = "pub fn parse(buf: &[u8]) -> usize {
+    buf.len()
+}
+
+pub fn caller() -> usize {
+    parse(&[1])
+}
+";
+    const MORE_RS: &str = "pub fn parse() {}
+
+pub fn again() {
+    parse();
+}
+";
+    const TWICE_RS: &str = "pub fn parse() {}
+
+pub fn twice() {
+    parse();
+    parse();
+}
+";
+    const SCRIPT_PY: &str = "def parse(text):
+    return parse(text)
+";
+
+    /// A pull request whose head defines `parse` in five Rust files and a Python one, and uses it in four Rust files
+    /// and the Python one; its merge base has a different file in the first directory and another `parse`.
+    async fn lookup_pull(name: &str) -> Pull {
+        Pull::with_files(
+            name,
+            &[
+                (
+                    "src/a/main.rs",
+                    "fn only_in_base() {}\n\nfn run() {\n    only_in_base();\n}\n",
+                ),
+                ("lib/parse.rs", "pub fn parse() {}\n"),
+            ],
+            &[
+                ("src/a/main.rs", MAIN_RS),
+                ("src/a/other.rs", OTHER_RS),
+                ("src/a/deep/more.rs", MORE_RS),
+                ("src/a/script.py", SCRIPT_PY),
+                ("src/b/parse.rs", "pub fn parse() {}\n"),
+                ("lib/parse.rs", TWICE_RS),
+                ("README.md", "# parse\n"),
+            ],
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn definitions_come_nearest_first_within_the_language_of_the_click() {
+        let p = lookup_pull("nav-defs").await;
+        let head = p.clone.head.clone();
+        assert_eq!(p.build(Side::Head).await.state, IndexState::Ready);
+
+        let got = p
+            .definitions(Side::Head, "src/a/main.rs", "parse")
+            .await
+            .unwrap();
+        let func = |path, at, snippet, tier| hit("parse", path, at, "function", snippet, tier);
+        assert_eq!(
+            got,
+            NavResult {
+                language: Some("rust"),
+                commit: head.clone(),
+                name: "parse".to_string(),
+                hits: vec![
+                    // The same file, then its directory, then the rest by the directories shared with the file.
+                    func(
+                        "src/a/main.rs",
+                        (5, 4),
+                        ("fn parse(input: u32) -> usize {", 4),
+                        "file"
+                    ),
+                    func(
+                        "src/a/other.rs",
+                        (1, 8),
+                        ("pub fn parse(buf: &[u8]) -> usize {", 8),
+                        "dir"
+                    ),
+                    func(
+                        "src/a/deep/more.rs",
+                        (1, 8),
+                        ("pub fn parse() {}", 8),
+                        "other"
+                    ),
+                    func("src/b/parse.rs", (1, 8), ("pub fn parse() {}", 8), "other"),
+                    func("lib/parse.rs", (1, 8), ("pub fn parse() {}", 8), "other"),
+                ],
+                truncated: false,
+            }
+        );
+
+        // From another file the order is another: no directory is shared, so the paths decide.
+        let got = p
+            .definitions(Side::Head, "lib/parse.rs", "parse")
+            .await
+            .unwrap();
+        assert_eq!(
+            places(&got),
+            [
+                ("lib/parse.rs", 1, 8, "file"),
+                ("src/a/deep/more.rs", 1, 8, "other"),
+                ("src/a/main.rs", 5, 4, "other"),
+                ("src/a/other.rs", 1, 8, "other"),
+                ("src/b/parse.rs", 1, 8, "other"),
+            ]
+        );
+
+        // The Python file defines `parse` too, but a Rust click does not see it, and the other way round.
+        let got = p
+            .definitions(Side::Head, "src/a/script.py", "parse")
+            .await
+            .unwrap();
+        assert_eq!(got.language, Some("python"));
+        assert_eq!(
+            got.hits,
+            [hit(
+                "parse",
+                "src/a/script.py",
+                (1, 5),
+                "function",
+                ("def parse(text):", 5),
+                "file"
+            )]
+        );
+
+        // Names are exact, and a name nobody defines has no hits.
+        for name in ["Parse", "pars", "parse_all"] {
+            let got = p
+                .definitions(Side::Head, "src/a/main.rs", name)
+                .await
+                .unwrap();
+            assert_eq!(got.language, Some("rust"), "{name}");
+            assert_eq!(got.name, name);
+            assert!(got.hits.is_empty(), "{name}: {:?}", got.hits);
+            assert!(!got.truncated, "{name}");
+        }
+        let got = p
+            .definitions(Side::Head, "src/a/main.rs", "caller")
+            .await
+            .unwrap();
+        assert_eq!(places(&got), [("src/a/other.rs", 5, 8, "dir")]);
+    }
+
+    #[tokio::test]
+    async fn references_have_their_lines_and_come_nearest_first() {
+        let p = lookup_pull("nav-refs").await;
+        let head = p.clone.head.clone();
+        assert_eq!(p.build(Side::Head).await.state, IndexState::Ready);
+
+        let got = p
+            .references(Side::Head, "src/a/main.rs", "parse")
+            .await
+            .unwrap();
+        let call = |path, at, snippet, tier| hit("parse", path, at, "call", snippet, tier);
+        assert_eq!(
+            got,
+            NavResult {
+                language: Some("rust"),
+                commit: head,
+                name: "parse".to_string(),
+                hits: vec![
+                    call(
+                        "src/a/main.rs",
+                        (10, 17),
+                        ("let first = parse(1);", 13),
+                        "file"
+                    ),
+                    call("src/a/other.rs", (6, 5), ("parse(&[1])", 1), "dir"),
+                    // The rest by path and line.
+                    call("lib/parse.rs", (4, 5), ("parse();", 1), "other"),
+                    call("lib/parse.rs", (5, 5), ("parse();", 1), "other"),
+                    call("src/a/deep/more.rs", (4, 5), ("parse();", 1), "other"),
+                ],
+                truncated: false,
+            }
+        );
+
+        let got = p
+            .references(Side::Head, "lib/parse.rs", "parse")
+            .await
+            .unwrap();
+        assert_eq!(
+            places(&got),
+            [
+                ("lib/parse.rs", 4, 5, "file"),
+                ("lib/parse.rs", 5, 5, "file"),
+                ("src/a/deep/more.rs", 4, 5, "other"),
+                ("src/a/main.rs", 10, 17, "other"),
+                ("src/a/other.rs", 6, 5, "other"),
+            ]
+        );
+
+        // Rust does not see the call in the Python file, and Python does not see the Rust ones.
+        let got = p
+            .references(Side::Head, "src/a/script.py", "parse")
+            .await
+            .unwrap();
+        assert_eq!(got.language, Some("python"));
+        assert_eq!(
+            got.hits,
+            [hit(
+                "parse",
+                "src/a/script.py",
+                (2, 12),
+                "call",
+                ("return parse(text)", 8),
+                "file"
+            )]
+        );
+
+        // A definition is not a reference to its name, and a name nobody uses has no hits.
+        for name in ["Parse", "main", "Local", "caller"] {
+            let got = p
+                .references(Side::Head, "src/a/main.rs", name)
+                .await
+                .unwrap();
+            assert_eq!(got.name, name);
+            assert!(got.hits.is_empty(), "{name}: {:?}", got.hits);
+            assert!(!got.truncated, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_base_side_looks_in_the_merge_base() {
+        let p = lookup_pull("nav-lookup-sides").await;
+        let (base, head) = (p.clone.base.clone(), p.clone.head.clone());
+        assert_eq!(p.build(Side::Head).await.state, IndexState::Ready);
+        assert_eq!(p.build(Side::Base).await.state, IndexState::Ready);
+
+        let got = p
+            .definitions(Side::Base, "src/a/main.rs", "only_in_base")
+            .await
+            .unwrap();
+        assert_eq!(got.commit, base);
+        assert_eq!(places(&got), [("src/a/main.rs", 1, 4, "file")]);
+        let got = p
+            .definitions(Side::Head, "src/a/main.rs", "only_in_base")
+            .await
+            .unwrap();
+        assert_eq!(got.commit, head);
+        assert!(got.hits.is_empty());
+
+        let got = p
+            .references(Side::Base, "src/a/main.rs", "only_in_base")
+            .await
+            .unwrap();
+        assert_eq!(got.commit, base);
+        assert_eq!(places(&got), [("src/a/main.rs", 4, 5, "file")]);
+        assert_eq!(got.hits[0].snippet, "only_in_base();");
+        assert_eq!(got.hits[0].snippet_column, 1);
+        let got = p
+            .references(Side::Head, "src/a/main.rs", "only_in_base")
+            .await
+            .unwrap();
+        assert!(got.hits.is_empty());
+
+        // `parse` is defined by one file of the merge base and five of the head, and used by none at the base.
+        let got = p
+            .definitions(Side::Base, "lib/parse.rs", "parse")
+            .await
+            .unwrap();
+        assert_eq!(places(&got), [("lib/parse.rs", 1, 8, "file")]);
+        let got = p
+            .definitions(Side::Head, "lib/parse.rs", "parse")
+            .await
+            .unwrap();
+        assert_eq!(got.hits.len(), 5);
+        let got = p
+            .references(Side::Base, "lib/parse.rs", "parse")
+            .await
+            .unwrap();
+        assert!(got.hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn references_stop_at_a_thousand_and_say_so() {
+        let calls = format!(
+            "{}{}",
+            "    exact();\n".repeat(1000),
+            "    over();\n".repeat(1001)
+        );
+        let generated = format!("fn exact() {{}}\n\nfn over() {{}}\n\nfn caller() {{\n{calls}}}\n");
+        let p = Pull::with_files(
+            "nav-truncated",
+            &[("old.rs", "fn old() {}\n")],
+            &[("gen.rs", generated.as_str())],
+        )
+        .await;
+        assert_eq!(p.build(Side::Head).await.state, IndexState::Ready);
+
+        // Exactly a thousand is not more than that.
+        let got = p.references(Side::Head, "gen.rs", "exact").await.unwrap();
+        assert!(!got.truncated);
+        assert_eq!(got.hits.len(), 1000);
+        assert_eq!(
+            (got.hits[0].line, got.hits[999].line),
+            (6, 1005),
+            "the references are in the order of the file"
+        );
+
+        let got = p.references(Side::Head, "gen.rs", "over").await.unwrap();
+        assert!(got.truncated);
+        assert_eq!(got.hits.len(), 1000);
+        assert_eq!(
+            (got.hits[0].line, got.hits[999].line),
+            (1006, 2005),
+            "the thousand nearest are kept, the last one is cut"
+        );
+        let line = |h: &NavHit| (h.column, h.snippet.clone(), h.snippet_column, h.tier);
+        let want = (5, "over();".to_string(), 1, "file");
+        assert!(got.hits.iter().all(|h| line(h) == want));
+
+        // A definition is never reported as cut.
+        let got = p.definitions(Side::Head, "gen.rs", "over").await.unwrap();
+        assert_eq!(places(&got), [("gen.rs", 3, 4, "file")]);
+        assert!(!got.truncated);
+    }
+
+    #[tokio::test]
+    async fn every_reference_gets_its_snippet_however_many_blobs_hold_them() {
+        // Different blobs, more than the snippets of one read come from: two full reads and a part of a third.
+        let blobs = SNIPPET_BLOBS_PER_READ * 2 + 8;
+        let sources: Vec<(String, String)> = (0..blobs)
+            .map(|i| {
+                let source = format!("fn f{i}() {{\n    needle();\n}}\n");
+                (format!("src/m{i:02}.rs"), source)
+            })
+            .collect();
+        let head: Vec<(&str, &str)> = sources
+            .iter()
+            .map(|(path, source)| (path.as_str(), source.as_str()))
+            .collect();
+        let p = Pull::with_files("nav-many-blobs", &[("old.rs", "fn old() {}\n")], &head).await;
+        assert_eq!(p.build(Side::Head).await.state, IndexState::Ready);
+
+        let got = p
+            .references(Side::Head, "src/m07.rs", "needle")
+            .await
+            .unwrap();
+        assert!(!got.truncated);
+        let want: Vec<&str> = std::iter::once("src/m07.rs")
+            .chain(
+                sources
+                    .iter()
+                    .map(|(path, _)| path.as_str())
+                    .filter(|path| *path != "src/m07.rs"),
+            )
+            .collect();
+        let paths: Vec<&str> = got.hits.iter().map(|hit| hit.path.as_str()).collect();
+        assert_eq!(paths, want);
+        assert_eq!(got.hits.len(), blobs);
+        assert_eq!(got.hits[0].tier, "file");
+        assert!(got.hits[1..].iter().all(|h| h.tier == "dir"));
+        for h in &got.hits {
+            let seen = (h.line, h.column, h.snippet.as_str(), h.snippet_column);
+            assert_eq!(seen, (2, 5, "needle();", 1), "{}", h.path);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_file_of_no_known_language_finds_nothing_and_starts_nothing() {
+        let p = lookup_pull("nav-unsupported").await;
+        let (base, head) = (p.clone.base.clone(), p.clone.head.clone());
+        let nothing = |commit: &str| NavResult {
+            language: None,
+            commit: commit.to_string(),
+            name: "parse".to_string(),
+            hits: Vec::new(),
+            truncated: false,
+        };
+
+        // No index is built, and none is asked for: the answer does not depend on one.
+        for (side, commit) in [(Side::Head, &head), (Side::Base, &base)] {
+            for path in ["README.md", "Makefile", "dir.rs/file", "src/.rs"] {
+                let got = p.definitions(side, path, "parse").await.unwrap();
+                assert_eq!(got, nothing(commit), "{path}");
+                let got = p.references(side, path, "parse").await.unwrap();
+                assert_eq!(got, nothing(commit), "{path}");
+            }
+        }
+        for side in [Side::Head, Side::Base] {
+            let status = p.service.index_status(&p.key, &head, side).await;
+            assert_eq!(status.unwrap().state, IndexState::Missing);
+        }
+
+        // With the index, the name is defined and used elsewhere, which a click in such a file does not see.
+        assert_eq!(p.build(Side::Head).await.state, IndexState::Ready);
+        let got = p.definitions(Side::Head, "README.md", "parse").await;
+        assert_eq!(got.unwrap(), nothing(&head));
+        let got = p.references(Side::Head, "README.md", "parse").await;
+        assert_eq!(got.unwrap(), nothing(&head));
+    }
+
+    #[tokio::test]
+    async fn a_commit_that_is_not_indexed_is_asked_to_be_built_first() {
+        let p = lookup_pull("nav-not-built").await;
+        let (base, head) = (p.clone.base.clone(), p.clone.head.clone());
+        let lookup = |r: Result<NavResult, AppError>| r.map(|_| ()).map_err(|e| e.code);
+
+        for side in [Side::Head, Side::Base] {
+            let found = p.definitions(side, "src/a/main.rs", "parse").await;
+            assert_eq!(lookup(found), Err(ErrorCode::IndexMissing));
+            let found = p.references(side, "src/a/main.rs", "parse").await;
+            assert_eq!(lookup(found), Err(ErrorCode::IndexMissing));
+        }
+        let error = p
+            .definitions(Side::Head, "src/a/main.rs", "parse")
+            .await
+            .unwrap_err();
+        assert!(error.message.contains(&head), "{}", error.message);
+        let error = p
+            .references(Side::Base, "src/a/main.rs", "parse")
+            .await
+            .unwrap_err();
+        assert!(error.message.contains(&base), "{}", error.message);
+        // Asking did not start a build.
+        for side in [Side::Head, Side::Base] {
+            let status = p.service.index_status(&p.key, &head, side).await;
+            assert_eq!(status.unwrap().state, IndexState::Missing);
+        }
+
+        // The head is built; the merge base is another commit and still is not.
+        assert_eq!(p.build(Side::Head).await.state, IndexState::Ready);
+        assert!(
+            p.definitions(Side::Head, "src/a/main.rs", "parse")
+                .await
+                .is_ok()
+        );
+        assert!(
+            p.references(Side::Head, "src/a/main.rs", "parse")
+                .await
+                .is_ok()
+        );
+        let found = p.definitions(Side::Base, "src/a/main.rs", "parse").await;
+        assert_eq!(lookup(found), Err(ErrorCode::IndexMissing));
+        let found = p.references(Side::Base, "src/a/main.rs", "parse").await;
+        assert_eq!(lookup(found), Err(ErrorCode::IndexMissing));
+        let status = p.service.index_status(&p.key, &head, Side::Base).await;
+        assert_eq!(status.unwrap().state, IndexState::Missing);
+    }
+
+    #[tokio::test]
+    async fn a_lookup_only_sees_the_languages_that_share_names_with_its_file() {
+        let p = Pull::with_files(
+            "nav-families",
+            &[("old.rs", "fn old() {}\n")],
+            &[
+                ("web/app.ts", "export function main() {\n    render();\n}\n"),
+                ("web/view.ts", "function render(): void {}\n"),
+                (
+                    "web/view.tsx",
+                    "function render() {\n    return <div />;\n}\n",
+                ),
+                ("web/legacy.js", "function render() {}\n"),
+                ("lib/other.ts", "function render(): void {}\n"),
+                ("tool/render.py", "def render():\n    pass\n\nrender()\n"),
+                (
+                    "src/render.rs",
+                    "fn render() {}\n\nfn run() {\n    render();\n}\n",
+                ),
+                (
+                    "cmd/render.go",
+                    "package main\n\nfunc render() {}\n\nfunc run() {\n\trender()\n}\n",
+                ),
+            ],
+        )
+        .await;
+        assert_eq!(p.build(Side::Head).await.state, IndexState::Ready);
+
+        // TypeScript, TSX and JavaScript share names; the language is the one of the file of the click.
+        let cases = [
+            (
+                "web/app.ts",
+                "typescript",
+                vec![
+                    ("web/legacy.js", 1, 10, "dir"),
+                    ("web/view.ts", 1, 10, "dir"),
+                    ("web/view.tsx", 1, 10, "dir"),
+                    ("lib/other.ts", 1, 10, "other"),
+                ],
+            ),
+            (
+                "web/view.tsx",
+                "tsx",
+                vec![
+                    ("web/view.tsx", 1, 10, "file"),
+                    ("web/legacy.js", 1, 10, "dir"),
+                    ("web/view.ts", 1, 10, "dir"),
+                    ("lib/other.ts", 1, 10, "other"),
+                ],
+            ),
+            (
+                "web/legacy.js",
+                "javascript",
+                vec![
+                    ("web/legacy.js", 1, 10, "file"),
+                    ("web/view.ts", 1, 10, "dir"),
+                    ("web/view.tsx", 1, 10, "dir"),
+                    ("lib/other.ts", 1, 10, "other"),
+                ],
+            ),
+            (
+                "tool/render.py",
+                "python",
+                vec![("tool/render.py", 1, 5, "file")],
+            ),
+            (
+                "src/render.rs",
+                "rust",
+                vec![("src/render.rs", 1, 4, "file")],
+            ),
+            ("cmd/render.go", "go", vec![("cmd/render.go", 3, 6, "file")]),
+        ];
+        for (path, language, want) in cases {
+            let got = p.definitions(Side::Head, path, "render").await.unwrap();
+            assert_eq!(got.language, Some(language), "{path}");
+            assert_eq!(places(&got), want, "{path}");
+        }
+
+        // The same for the uses.
+        let got = p
+            .references(Side::Head, "web/view.ts", "render")
+            .await
+            .unwrap();
+        assert_eq!(got.language, Some("typescript"));
+        assert_eq!(places(&got), [("web/app.ts", 2, 5, "dir")]);
+        let got = p
+            .references(Side::Head, "tool/render.py", "render")
+            .await
+            .unwrap();
+        assert_eq!(got.language, Some("python"));
+        assert_eq!(places(&got), [("tool/render.py", 4, 1, "file")]);
+        let got = p
+            .references(Side::Head, "src/render.rs", "render")
+            .await
+            .unwrap();
+        assert_eq!(got.language, Some("rust"));
+        assert_eq!(places(&got), [("src/render.rs", 4, 5, "file")]);
+        let got = p
+            .references(Side::Head, "cmd/render.go", "render")
+            .await
+            .unwrap();
+        assert_eq!(got.language, Some("go"));
+        assert_eq!(places(&got), [("cmd/render.go", 6, 2, "file")]);
+    }
+
+    #[tokio::test]
+    async fn c_and_cpp_share_names_and_a_header_is_whichever_its_content_says() {
+        let same_source =
+            "int add(int a, int b) { return a + b; }\nint twice(int x) { return add(x, x); }\n";
+        let p = Pull::with_files(
+            "nav-c-family",
+            &[("old.c", "int old(void) { return 0; }\n")],
+            &[
+                ("include/add.h", "int add(int a, int b);\n"),
+                ("include/shape.h", "class Shape { public: int sides; };\n"),
+                // One blob under two names, which are two grammars of the family.
+                ("src/add.c", same_source),
+                ("src/add.cc", same_source),
+            ],
+        )
+        .await;
+        assert_eq!(p.build(Side::Head).await.state, IndexState::Ready);
+
+        // The language of a `.h` file is the one the index holds it under, C when the commit does not list it.
+        let cases = [
+            ("include/add.h", "c"),
+            ("include/shape.h", "cpp"),
+            ("include/ghost.h", "c"),
+            ("src/add.c", "c"),
+            ("src/add.cc", "cpp"),
+        ];
+        for (path, language) in cases {
+            let got = p.definitions(Side::Head, path, "add").await.unwrap();
+            assert_eq!(got.language, Some(language), "{path}");
+            let got = p.references(Side::Head, path, "add").await.unwrap();
+            assert_eq!(got.language, Some(language), "{path}");
+        }
+
+        // A prototype is no definition; both bodies are, whatever grammar the click goes by.
+        let want = [("src/add.c", 1, 5, "other"), ("src/add.cc", 1, 5, "other")];
+        for path in ["include/add.h", "include/shape.h", "include/ghost.h"] {
+            let got = p.definitions(Side::Head, path, "add").await.unwrap();
+            assert_eq!(places(&got), want, "{path}");
+        }
+        let got = p
+            .definitions(Side::Head, "include/shape.h", "Shape")
+            .await
+            .unwrap();
+        assert_eq!(
+            got.hits,
+            [hit(
+                "Shape",
+                "include/shape.h",
+                (1, 7),
+                "class",
+                ("class Shape { public: int sides; };", 7),
+                "file"
+            )]
+        );
+
+        // Two files hold the same blob, and each of their uses has its line.
+        let got = p.references(Side::Head, "src/add.c", "add").await.unwrap();
+        let line = "int twice(int x) { return add(x, x); }";
+        assert_eq!(
+            got.hits,
+            [
+                hit("add", "src/add.c", (2, 27), "call", (line, 27), "file"),
+                hit("add", "src/add.cc", (2, 27), "call", (line, 27), "dir"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn references_of_blobs_the_cache_repo_does_not_hold_have_no_snippets() {
+        let sources = [
+            ("a.rs", "fn target() {}\n\nfn run() {\n    target();\n}\n"),
+            ("b.rs", "fn other() {\n    target();\n}\n"),
+        ];
+        let p = Pull::with_files("nav-no-blobs", &[("old.rs", "fn old() {}\n")], &sources).await;
+        let head = p.clone.head.clone();
+        // The index of the commit is complete, but the cache repo never fetched its blobs: they were evicted, or
+        // another repo's build stored them.
+        let mut blobs = Vec::new();
+        let mut files = Vec::new();
+        for (path, source) in sources {
+            let oid = p.clone.oid(&head, path).await;
+            blobs.push(NewBlob {
+                oid: oid.clone(),
+                grammar: Grammar::Rust,
+                status: BlobStatus::Parsed,
+                size: source.len() as u64,
+                tags: tags::parse(Grammar::Rust, source.as_bytes(), None).unwrap(),
+            });
+            files.push((path.to_string(), oid, Grammar::Rust));
+        }
+        p.db.insert_blobs(blobs).unwrap();
+        p.db.save_commit(&head, &files).unwrap();
+        let before = p.clone.repo.missing_objects(&head).await.unwrap();
+        assert!(files.iter().all(|(_, oid, _)| before.contains(oid)));
+
+        let got = p.references(Side::Head, "a.rs", "target").await.unwrap();
+        assert_eq!(
+            got.hits,
+            [
+                hit("target", "a.rs", (4, 5), "call", ("", 0), "file"),
+                hit("target", "b.rs", (2, 5), "call", ("", 0), "dir"),
+            ]
+        );
+        // The definitions come from the index alone, with their lines.
+        let got = p.definitions(Side::Head, "a.rs", "target").await.unwrap();
+        assert_eq!(
+            got.hits,
+            [hit(
+                "target",
+                "a.rs",
+                (1, 4),
+                "function",
+                ("fn target() {}", 4),
+                "file"
+            )]
+        );
+        // Nothing was fetched to answer.
+        let after = p.clone.repo.missing_objects(&head).await.unwrap();
+        assert_eq!(after, before);
     }
 }

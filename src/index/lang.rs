@@ -101,15 +101,7 @@ pub enum Family {
 }
 
 impl Family {
-    pub const ALL: [Family; 6] = [
-        Family::Rust,
-        Family::Go,
-        Family::Python,
-        Family::Js,
-        Family::Java,
-        Family::C,
-    ];
-
+    /// The name the index stores.
     pub fn id(self) -> &'static str {
         match self {
             Family::Rust => "rust",
@@ -119,10 +111,6 @@ impl Family {
             Family::Java => "java",
             Family::C => "c",
         }
-    }
-
-    pub fn from_id(id: &str) -> Option<Family> {
-        Family::ALL.into_iter().find(|f| f.id() == id)
     }
 
     /// From the extension alone (`.h` is C). None: unsupported extension.
@@ -222,10 +210,16 @@ mod tests {
         }
         assert_eq!(Grammar::from_id("js"), None);
         assert_eq!(Grammar::from_id(""), None);
-        for family in Family::ALL {
-            assert_eq!(Family::from_id(family.id()), Some(family));
-        }
-        assert_eq!(Family::from_id("typescript"), None);
+        let families = [
+            Family::Rust,
+            Family::Go,
+            Family::Python,
+            Family::Js,
+            Family::Java,
+            Family::C,
+        ];
+        let ids: Vec<_> = families.iter().map(|f| f.id()).collect();
+        assert_eq!(ids, ["rust", "go", "python", "js", "java", "c"]);
         let ids: Vec<_> = Grammar::ALL.iter().map(|g| g.id()).collect();
         assert_eq!(
             ids,

@@ -356,6 +356,25 @@ impl IndexDb {
         Ok(complete_commit(&conn, commit)?.is_some())
     }
 
+    /// The grammar the complete commit holds the file at `path` under; None when it does not list the file. A `.h`
+    /// file is the only one whose grammar its name does not give.
+    pub fn path_grammar(&self, commit: &str, path: &str) -> Result<Option<Grammar>, String> {
+        let conn = lock(&self.reader);
+        let Some((commit_id, _)) = complete_commit(&conn, commit)? else {
+            return Ok(None);
+        };
+        let id: Option<String> = conn
+            .query_row(
+                "SELECT b.grammar FROM tree_entries te JOIN blobs b ON b.id = te.blob_id
+                 WHERE te.commit_id = ?1 AND te.path = ?2",
+                params![commit_id, path],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_err)?;
+        Ok(id.as_deref().and_then(Grammar::from_id))
+    }
+
     /// Records the files of a commit, with the OID and grammar of the blob at each path, and marks the commit
     /// complete, in one transaction. Every blob must be stored; if one is not, nothing is recorded.
     pub fn save_commit(
@@ -1045,6 +1064,34 @@ mod tests {
         fx.save_commit(&c, &[entry("a.rs", 1, Grammar::Rust)])
             .unwrap();
         assert!(fx.commit_complete(&c).unwrap());
+    }
+
+    #[test]
+    fn a_file_of_a_commit_is_known_by_the_grammar_it_is_held_under() {
+        let fx = TempDb::new("path-grammar");
+        fx.insert_blobs(vec![
+            blob(1, Grammar::Cpp, Vec::new()),
+            blob(2, Grammar::C, Vec::new()),
+        ])
+        .unwrap();
+        let c = commit(1);
+        // Nothing is known about the files of a commit that is not saved.
+        assert_eq!(fx.path_grammar(&c, "include/a.h").unwrap(), None);
+
+        fx.save_commit(
+            &c,
+            &[
+                entry("include/a.h", 1, Grammar::Cpp),
+                entry("include/b.h", 2, Grammar::C),
+            ],
+        )
+        .unwrap();
+        let grammar = |commit: &str, path: &str| fx.path_grammar(commit, path).unwrap();
+        assert_eq!(grammar(&c, "include/a.h"), Some(Grammar::Cpp));
+        assert_eq!(grammar(&c, "include/b.h"), Some(Grammar::C));
+        // A file the commit does not list, and a commit that is not saved.
+        assert_eq!(grammar(&c, "include/c.h"), None);
+        assert_eq!(grammar(&commit(2), "include/a.h"), None);
     }
 
     #[test]
