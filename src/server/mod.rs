@@ -75,6 +75,12 @@ pub fn router(state: AppState) -> Router {
             put(set_viewed),
         )
         .route(
+            "/api/{host}/{owner}/{repo}/pulls/{n}/index",
+            post(nav::start_index)
+                .get(nav::index_status)
+                .delete(nav::cancel_index),
+        )
+        .route(
             "/api/{host}/{owner}/{repo}/pulls/{n}/threads",
             get(review::threads).post(review::create_thread),
         )

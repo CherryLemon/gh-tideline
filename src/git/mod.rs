@@ -714,7 +714,6 @@ impl Repo {
     /// fetches by itself (`protocol.allow=never` is a second safeguard); it does not descend
     /// into gitlinks, so submodules are never listed. Needs no lock. An unknown `commit` is an
     /// error.
-    #[allow(dead_code)] // The index build uses it (not wired in yet).
     pub async fn missing_objects(&self, commit: &str) -> Result<HashSet<String>, GitFailure> {
         debug_assert!(is_oid(commit));
         let out = self
@@ -800,7 +799,6 @@ impl Repo {
     /// Sizes of the objects among `oids` that are local (`cat-file --batch-check`); the others
     /// are left out of the map. Needs no lock and never fetches. `oids` must satisfy [`is_oid`];
     /// an unfetched blob among them costs two more git runs (see `cat_file_local_with`).
-    #[allow(dead_code)] // The index build uses it (not wired in yet).
     pub async fn object_sizes(&self, oids: &[String]) -> Result<HashMap<String, u64>, GitFailure> {
         let out = self
             .cat_file_local("--batch-check=%(objectname) %(objectsize)", oids)
@@ -816,7 +814,6 @@ impl Repo {
     /// fetches. The output is buffered, so the caller bounds the total size (see
     /// [`Repo::object_sizes`]). `oids` must satisfy [`is_oid`]; an unfetched blob among them
     /// costs two more git runs (see `cat_file_local_with`).
-    #[allow(dead_code)] // The index build uses it (not wired in yet).
     pub async fn read_blobs(&self, oids: &[String]) -> Result<Vec<(String, Vec<u8>)>, GitFailure> {
         let out = self.cat_file_local("--batch", oids).await?;
         parse::parse_batch_blobs(&out).map_err(|e| GitFailure {
@@ -894,41 +891,11 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::testing::{git_in, temp_dir};
+    use super::testing::{
+        BINARY, HELPERS, LIB_V2, PartialClone, UNKNOWN, big_rs, git_in, make_repo, repo_at,
+        temp_dir,
+    };
     use super::*;
-
-    /// Creates a work-tree repo with the given files committed; returns the head commit.
-    async fn make_repo(dir: &Path, files: &[(&str, &str)]) -> String {
-        git_in(dir, &["init", "-q"]).await;
-        for (path, content) in files {
-            let file = dir.join(path);
-            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-            std::fs::write(file, content).unwrap();
-        }
-        git_in(dir, &["add", "-A"]).await;
-        git_in(
-            dir,
-            &[
-                "-c",
-                "user.name=t",
-                "-c",
-                "user.email=t@example.com",
-                "commit",
-                "-qm",
-                "init",
-            ],
-        )
-        .await;
-        git_in(dir, &["rev-parse", "HEAD"]).await
-    }
-
-    fn repo_at(git_dir: PathBuf, remote_url: String) -> Repo {
-        Repo {
-            git_dir,
-            remote_url,
-            shared: Default::default(),
-        }
-    }
 
     #[test]
     fn oid_validation() {
@@ -1230,142 +1197,6 @@ mod tests {
             ObjectLookup::Missing
         ));
         std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    const LIB_V1: &str = "pub fn one() {}\n";
-    const LIB_V2: &str = "pub fn one() {}\npub fn two() {}\n";
-    const HELPERS: &str = "pub fn help() {}\n";
-    const BINARY: &[u8] = b"\0\x01\xff\xfe\r\n\n\0tail";
-    const UNKNOWN: &str = "1234567890123456789012345678901234567891";
-
-    /// Over 1 MiB, the size from which the index leaves a file out.
-    fn big_rs() -> String {
-        "// filler line\n".repeat(80_000)
-    }
-
-    /// A source repo with two commits and the blob-less cache repo a pull request from the first
-    /// (`base`) to the second (`head`) leaves behind: both commits and their trees, no blobs.
-    /// Besides plain files the commits hold a path with a space, a subdirectory, two paths with
-    /// one content, a binary file, a file over 1 MiB and a gitlink.
-    struct PartialClone {
-        dir: PathBuf,
-        origin: PathBuf,
-        repo: Repo,
-        auth: GitAuth,
-        base: String,
-        head: String,
-    }
-
-    impl PartialClone {
-        async fn new(name: &str) -> PartialClone {
-            let dir = temp_dir(name);
-            let origin = dir.join("origin");
-            std::fs::create_dir_all(&origin).unwrap();
-            let base = make_repo(
-                &origin,
-                &[
-                    ("README.md", "readme\n"),
-                    ("src/lib.rs", LIB_V1),
-                    ("src/util/helpers.rs", HELPERS),
-                    ("dir with space/a b.py", "print('a b')\n"),
-                    ("same-1.txt", "same\n"),
-                    ("same-2.txt", "same\n"),
-                ],
-            )
-            .await;
-            std::fs::write(origin.join("src/lib.rs"), LIB_V2).unwrap();
-            std::fs::write(origin.join("big.rs"), big_rs()).unwrap();
-            std::fs::write(origin.join("data.bin"), BINARY).unwrap();
-            std::fs::remove_file(origin.join("README.md")).unwrap();
-            git_in(&origin, &["add", "-A"]).await;
-            let sub = "1234567890123456789012345678901234567890";
-            git_in(
-                &origin,
-                &[
-                    "update-index",
-                    "--add",
-                    "--cacheinfo",
-                    &format!("160000,{sub},vendor/lib"),
-                ],
-            )
-            .await;
-            git_in(
-                &origin,
-                &[
-                    "-c",
-                    "user.name=t",
-                    "-c",
-                    "user.email=t@example.com",
-                    "commit",
-                    "-qm",
-                    "second",
-                ],
-            )
-            .await;
-            let head = git_in(&origin, &["rev-parse", "HEAD"]).await;
-            git_in(&origin, &["config", "uploadpack.allowFilter", "true"]).await;
-            git_in(
-                &origin,
-                &["config", "uploadpack.allowAnySHA1InWant", "true"],
-            )
-            .await;
-
-            let repo = repo_at(
-                dir.join("cache/o/r.git"),
-                format!("file://{}", origin.display()),
-            );
-            let auth = GitAuth {
-                host: "example.invalid".into(),
-                token: "unused".into(),
-            };
-            let guard = repo.lock().await.unwrap();
-            repo.fetch_commits(&guard, &auth, 1, &base, &head)
-                .await
-                .unwrap();
-            drop(guard);
-            PartialClone {
-                dir,
-                origin,
-                repo,
-                auth,
-                base,
-                head,
-            }
-        }
-
-        /// The OID of `path` in `commit`, from the source repo.
-        async fn oid(&self, commit: &str, path: &str) -> String {
-            git_in(&self.origin, &["rev-parse", &format!("{commit}:{path}")]).await
-        }
-
-        /// The blobs of `commit`'s tree (not its gitlinks), from the source repo.
-        async fn blobs(&self, commit: &str) -> HashSet<String> {
-            let listing = git_in(
-                &self.origin,
-                &[
-                    "ls-tree",
-                    "-r",
-                    "--format=%(objecttype) %(objectname)",
-                    commit,
-                ],
-            )
-            .await;
-            listing
-                .lines()
-                .filter_map(|line| line.strip_prefix("blob "))
-                .map(String::from)
-                .collect()
-        }
-
-        /// Fetches blobs the way the index build does.
-        async fn fetch(&self, oids: &[&str]) {
-            let oids: Vec<String> = oids.iter().map(|oid| oid.to_string()).collect();
-            let guard = self.repo.lock().await.unwrap();
-            self.repo
-                .fetch_blobs(&guard, &self.auth, &oids)
-                .await
-                .unwrap();
-        }
     }
 
     #[tokio::test]

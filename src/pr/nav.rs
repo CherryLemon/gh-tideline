@@ -1,11 +1,16 @@
-//! Code navigation: the symbols of a file.
+//! Code navigation: the symbols of a file, and the index of a pull request's commits.
 
-use serde::Serialize;
+use std::sync::Arc;
+
+use serde::{Deserialize, Serialize};
 
 use crate::error::AppError;
+use crate::git::GitAuth;
 use crate::index::db::{BlobStatus, IndexDb, NewBlob};
 use crate::index::lang::{Grammar, MAX_BLOB_BYTES};
 use crate::index::tags::{self, Tag};
+use crate::index::{IndexStatus, Indexer};
+use crate::state::PrKey;
 
 use super::PrService;
 
@@ -74,6 +79,25 @@ async fn with_index<T: Send + 'static>(
         .map_err(AppError::index_unavailable)
 }
 
+/// Which of the two commits of a pull request code navigation looks at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Side {
+    /// The head: the code the pull request proposes.
+    Head,
+    /// The merge base: the code it changes.
+    Base,
+}
+
+/// `POST /pulls/{n}/index`: the commit to index.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IndexRequest {
+    /// The head the client shows.
+    pub head: String,
+    pub side: Side,
+}
+
 impl PrService {
     /// The symbols of the file `path` whose blob is `oid`. The bytes come through
     /// [`PrService::blob`], so an OID is served exactly where the blob endpoint serves it, whatever
@@ -97,13 +121,14 @@ impl PrService {
         };
         let size = bytes.len() as u64;
         let too_large = size > MAX_BLOB_BYTES;
+        let db = self.index.as_ref().map(Indexer::db);
         let outline = |symbols: Vec<Symbol>| FileSymbols {
             language: Some(grammar.id()),
             too_large,
             symbols,
         };
 
-        if let Some(db) = &self.index {
+        if let Some(db) = db {
             let key = oid.to_string();
             let stored = with_index(db, move |db| db.blob_symbols(&key, grammar)).await?;
             match stored {
@@ -129,7 +154,7 @@ impl PrService {
             (BlobStatus::Parsed, tags)
         };
         let symbols = symbols_of(&tags);
-        if let Some(db) = &self.index {
+        if let Some(db) = db {
             let blob = NewBlob {
                 oid: oid.to_string(),
                 grammar,
@@ -144,19 +169,118 @@ impl PrService {
         }
         Ok(outline(symbols))
     }
+
+    /// The index and the commit that `side` of the pull request means to the page showing `head`. A page
+    /// that is behind the pull request gets `stale_head`: its positions are in files that have changed.
+    async fn index_target(
+        self: &Arc<Self>,
+        key: &PrKey,
+        head: &str,
+        side: Side,
+    ) -> Result<(&Indexer, String), AppError> {
+        let index = self.index.as_ref().ok_or_else(|| {
+            AppError::index_unavailable(
+                "code navigation is unavailable: its index database could not be opened",
+            )
+        })?;
+        let data = self.open_at(key, head).await?;
+        if data.summary.head.sha != head {
+            return Err(AppError::stale_head(
+                "the pull request has new commits; refresh before using code navigation",
+            ));
+        }
+        let commit = match side {
+            Side::Head => data.summary.head.sha.clone(),
+            Side::Base => data.summary.merge_base.clone(),
+        };
+        Ok((index, commit))
+    }
+
+    /// Starts building the index of one commit of the pull request, joins the build that is running, or
+    /// reports that the commit is indexed already. Fetching blobs needs the viewer's token.
+    pub async fn start_index(
+        self: &Arc<Self>,
+        key: &PrKey,
+        head: &str,
+        side: Side,
+    ) -> Result<IndexStatus, AppError> {
+        let (index, commit) = self.index_target(key, head, side).await?;
+        let auth = GitAuth {
+            host: key.host.clone(),
+            token: self.tokens.get(&key.host).await?,
+        };
+        let repo = Arc::new(self.repos.repo(&key.host, &key.owner, &key.repo));
+        index
+            .start(repo, auth, &commit)
+            .await
+            .map_err(AppError::index_unavailable)
+    }
+
+    /// How far the index of one commit of the pull request has come.
+    pub async fn index_status(
+        self: &Arc<Self>,
+        key: &PrKey,
+        head: &str,
+        side: Side,
+    ) -> Result<IndexStatus, AppError> {
+        let (index, commit) = self.index_target(key, head, side).await?;
+        let repo = self.repos.repo(&key.host, &key.owner, &key.repo);
+        index
+            .status(&repo, &commit)
+            .await
+            .map_err(AppError::index_unavailable)
+    }
+
+    /// Asks the build of one commit of the pull request to stop; the answer is its status, which says
+    /// `cancelling` until it has.
+    pub async fn cancel_index(
+        self: &Arc<Self>,
+        key: &PrKey,
+        head: &str,
+        side: Side,
+    ) -> Result<IndexStatus, AppError> {
+        let (index, commit) = self.index_target(key, head, side).await?;
+        let repo = self.repos.repo(&key.host, &key.owner, &key.repo);
+        index
+            .cancel(&repo, &commit)
+            .await
+            .map_err(AppError::index_unavailable)
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use super::*;
     use crate::error::ErrorCode;
-    use crate::pr::testing::{Fixture, RUST, UNKNOWN};
+    use crate::index::IndexState;
+    use crate::pr::testing::{Fixture, Pull, RUST, UNKNOWN};
 
     impl Fixture {
         async fn symbols(&self, oid: &str, path: &str) -> Result<FileSymbols, AppError> {
             self.service
                 .symbols("github.com", "o", "r", oid, path)
                 .await
+        }
+    }
+
+    impl Pull {
+        /// Waits until the build of `side` has ended, and returns how it ended.
+        async fn end(&self, head: &str, side: Side) -> IndexStatus {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                let status = self.service.index_status(&self.key, head, side).await;
+                let status = status.unwrap();
+                if !matches!(status.state, IndexState::Queued | IndexState::Building) {
+                    return status;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out; the status is {status:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
         }
     }
 
@@ -384,5 +508,122 @@ mod tests {
         assert_eq!(code(other), Err(ErrorCode::NotFound));
         // A known blob is served.
         assert!(f.symbols(&f.oids[0], "a.rs").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn the_head_and_the_merge_base_are_indexed_apart() {
+        let p = Pull::new("nav-sides").await;
+        let (base, head) = (p.clone.base.clone(), p.clone.head.clone());
+
+        let started = p
+            .service
+            .start_index(&p.key, &head, Side::Head)
+            .await
+            .unwrap();
+        assert_eq!(
+            (started.commit.as_str(), started.state),
+            (head.as_str(), IndexState::Queued)
+        );
+        let ended = p.end(&head, Side::Head).await;
+        assert_eq!(
+            (ended.commit.as_str(), ended.state),
+            (head.as_str(), IndexState::Ready)
+        );
+        assert!(p.db.commit_complete(&head).unwrap());
+
+        // The merge base is another commit, which nobody has built.
+        let other = p.service.index_status(&p.key, &head, Side::Base).await;
+        let other = other.unwrap();
+        assert_eq!(
+            (other.commit.as_str(), other.state),
+            (base.as_str(), IndexState::Missing)
+        );
+        assert!(!p.db.commit_complete(&base).unwrap());
+        p.service
+            .start_index(&p.key, &head, Side::Base)
+            .await
+            .unwrap();
+        let ended = p.end(&head, Side::Base).await;
+        assert_eq!(
+            (ended.commit.as_str(), ended.state),
+            (base.as_str(), IndexState::Ready)
+        );
+        assert!(p.db.commit_complete(&base).unwrap());
+
+        // Built already: ready at once.
+        let again = p.service.start_index(&p.key, &head, Side::Head).await;
+        assert_eq!(again.unwrap().state, IndexState::Ready);
+    }
+
+    #[tokio::test]
+    async fn a_build_is_cancelled_through_the_service() {
+        let p = Pull::new("nav-cancel").await;
+        let head = p.clone.head.clone();
+
+        let nothing = p.service.cancel_index(&p.key, &head, Side::Head).await;
+        assert_eq!(nothing.unwrap().state, IndexState::Missing);
+
+        p.service
+            .start_index(&p.key, &head, Side::Head)
+            .await
+            .unwrap();
+        let cancelling = p
+            .service
+            .cancel_index(&p.key, &head, Side::Head)
+            .await
+            .unwrap();
+        assert!(cancelling.cancelling);
+        let ended = p.end(&head, Side::Head).await;
+        assert_eq!(
+            (ended.state, ended.cancelling),
+            (IndexState::Cancelled, false)
+        );
+        assert!(!p.db.commit_complete(&head).unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_page_behind_the_pull_request_is_told_to_refresh() {
+        let p = Pull::new("nav-stale").await;
+        // A commit that is not the head the service knows.
+        let behind = p.clone.base.clone();
+        let code = |r: Result<IndexStatus, AppError>| r.map_err(|e| e.code);
+        for side in [Side::Head, Side::Base] {
+            assert_eq!(
+                code(p.service.start_index(&p.key, &behind, side).await),
+                Err(ErrorCode::StaleHead)
+            );
+            assert_eq!(
+                code(p.service.index_status(&p.key, &behind, side).await),
+                Err(ErrorCode::StaleHead)
+            );
+            assert_eq!(
+                code(p.service.cancel_index(&p.key, &behind, side).await),
+                Err(ErrorCode::StaleHead)
+            );
+        }
+        // Nothing was started.
+        let head = p.clone.head.clone();
+        let status = p.service.index_status(&p.key, &head, Side::Head).await;
+        assert_eq!(status.unwrap().state, IndexState::Missing);
+    }
+
+    #[tokio::test]
+    async fn without_an_index_code_navigation_is_unavailable() {
+        let p = Pull::new("nav-no-index-service").await;
+        let service = p.without_index();
+        let head = p.clone.head.clone();
+        let code = |r: Result<IndexStatus, AppError>| r.map_err(|e| e.code);
+        assert_eq!(
+            code(service.start_index(&p.key, &head, Side::Head).await),
+            Err(ErrorCode::IndexUnavailable)
+        );
+        assert_eq!(
+            code(service.index_status(&p.key, &head, Side::Head).await),
+            Err(ErrorCode::IndexUnavailable)
+        );
+        assert_eq!(
+            code(service.cancel_index(&p.key, &head, Side::Head).await),
+            Err(ErrorCode::IndexUnavailable)
+        );
     }
 }

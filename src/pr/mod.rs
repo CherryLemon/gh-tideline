@@ -18,6 +18,8 @@ use crate::git::{
     ChangedFile, GitAuth, GitFailure, ObjectLookup, Repo, RepoGuard, Repos, TreeEntry,
 };
 use crate::github::{Github, Tokens, ViewedState};
+use crate::index::Indexer;
+use crate::index::build::Limits;
 use crate::index::db::IndexDb;
 use crate::state::{PrKey, StateDb};
 
@@ -156,7 +158,7 @@ pub struct PrService {
     state: Option<StateDb>,
     /// None if the index database could not be opened; a file's symbols are then parsed on demand,
     /// without a cache, and nothing else of code navigation works.
-    index: Option<IndexDb>,
+    index: Option<Indexer>,
     cache: Mutex<HashMap<PrKey, CacheSlot>>,
     /// Detached work after a response (see [`PrService::set_viewed`]), awaited on shutdown.
     bookkeeping: Mutex<tokio::task::JoinSet<()>>,
@@ -175,7 +177,7 @@ impl PrService {
             github: Github::new(),
             tokens: Tokens::default(),
             state,
-            index,
+            index: index.map(|db| Indexer::new(db, Limits::default())),
             cache: Default::default(),
             bookkeeping: Default::default(),
             review_writes: Default::default(),
@@ -556,9 +558,9 @@ impl PrService {
         }
     }
 
-    /// Waits for detached bookkeeping, then for in-flight git work (see [`Repos::drain`]).
-    /// Bookkeeping still running at the deadline is cancelled first, so it cannot start git
-    /// work that the repo drain no longer waits for.
+    /// Waits for detached bookkeeping, then stops the index builds, then waits for in-flight git
+    /// work (see [`Repos::drain`]). Bookkeeping still running at the deadline is cancelled first,
+    /// so it cannot start git work that the repo drain no longer waits for.
     pub async fn drain(&self, timeout: Duration) {
         let deadline = tokio::time::Instant::now() + timeout;
         let mut tasks =
@@ -568,6 +570,11 @@ impl PrService {
         })
         .await;
         tasks.shutdown().await;
+        if let Some(index) = &self.index {
+            index
+                .drain(deadline.saturating_duration_since(tokio::time::Instant::now()))
+                .await;
+        }
         self.repos
             .drain(deadline.saturating_duration_since(tokio::time::Instant::now()))
             .await;

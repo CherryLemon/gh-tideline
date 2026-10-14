@@ -38,6 +38,15 @@ impl Tokens {
             .insert(host.to_string(), (Instant::now(), token.clone()));
         Ok(token)
     }
+
+    /// Makes `get` return `token` for `host`, so that tests need neither `gh` nor the environment.
+    #[cfg(test)]
+    pub(crate) fn insert(&self, host: &str, token: &str) {
+        self.cache
+            .lock()
+            .expect("token cache poisoned")
+            .insert(host.to_string(), (Instant::now(), token.to_string()));
+    }
 }
 
 async fn resolve_token(host: &str) -> Result<String, AppError> {
