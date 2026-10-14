@@ -4,7 +4,7 @@
 import type * as Monaco from 'monaco-editor/editor/editor.api'
 import type { RepoRef, SymbolInfo } from '../api'
 import { colorizedRuns, type TextRun } from '../nav/colorized'
-import { sameLines, scrollToUncover, stickyLines } from '../nav/sticky'
+import { lineBelow, type LineEdges, nextBar, rowsBeforeBar, sameLines, scrollToUncover, stickyLines } from '../nav/sticky'
 import { getSymbols } from '../nav/symbols'
 import { parseModelUri } from './files'
 import { monaco } from './setup'
@@ -13,6 +13,8 @@ type EditorT = Monaco.editor.ICodeEditor
 
 /** A line longer than this is cut and left uncolored: the header holds names, and a minified file is one huge line. */
 const MAX_ROW_CHARS = 1000
+/** Monaco draws the handle for dragging the top edge of a bar of unchanged lines this many pixels above the view zone it is in. */
+const BAR_REACH = 6
 /** Waits before asking again for symbols that could not be fetched (a server that was busy or restarting); then it gives up. */
 const RETRY_MS = [2000, 8000]
 
@@ -20,22 +22,6 @@ export interface StickyHost {
   repo(): RepoRef
   /** A row was clicked: take the editor to `line`. False if it is not showing the file yet (it has the previous one), and nothing was done. */
   reveal(line: number): boolean
-}
-
-/** The first line of `ranges` (the lines in view) that reaches below `y`, an offset from the top of the content; undefined if none does. */
-function lineBelow(editor: EditorT, ranges: readonly Monaco.IRange[], y: number): number | undefined {
-  for (const range of ranges) {
-    if (editor.getBottomForLineNumber(range.endLineNumber) <= y) continue
-    let low = range.startLineNumber
-    let high = range.endLineNumber
-    while (low < high) {
-      const mid = (low + high) >> 1
-      if (editor.getBottomForLineNumber(mid) > y) high = mid
-      else low = mid + 1
-    }
-    return low
-  }
-  return undefined
 }
 
 /** Puts `runs` in `el` as text nodes only: repository text is never parsed as markup (design.md §8). */
@@ -58,6 +44,7 @@ export class StickyHeader {
   private readonly node = document.createElement('div')
   private readonly widget: Monaco.editor.IOverlayWidget
   private readonly listeners: Monaco.IDisposable[]
+  private readonly edges: LineEdges
   private active = false
   /** The URI of the model `symbols` are for; null while none are (or are wanted). */
   private forModel: string | null = null
@@ -67,6 +54,10 @@ export class StickyHeader {
   private rows = new Map<number, HTMLElement>()
   /** Where the caret was when `keepCaretClear` last looked. */
   private caret: Monaco.IPosition | null = null
+  /** What the rule under the rows adds to the height of the header. */
+  private border = 0
+  /** Counts the models whose symbols were wanted (and the disposal): an answer to an earlier request is not for the one shown. */
+  private generation = 0
   /** How many requests for the symbols of the model have failed, and the wait before the next one. */
   private failures = 0
   private retry: ReturnType<typeof setTimeout> | undefined
@@ -75,6 +66,11 @@ export class StickyHeader {
     private readonly editor: EditorT,
     private readonly host: StickyHost,
   ) {
+    this.edges = {
+      top: (line) => editor.getTopForLineNumber(line),
+      zonesTop: (line) => editor.getTopForLineNumber(line, true),
+      bottom: (line) => editor.getBottomForLineNumber(line),
+    }
     const node = this.node
     node.className = 'tl-sticky'
     node.hidden = true
@@ -87,7 +83,10 @@ export class StickyHeader {
       if (!row) return
       // The press did not move the focus (above); the click does, as one on the code would, also from a box or a field.
       // Not while the editor still shows the previous file: it is not where the user goes.
-      if (this.host.reveal(Number(row.dataset.line))) this.editor.focus()
+      if (!this.host.reveal(Number(row.dataset.line))) return
+      this.editor.focus()
+      // A caret that is on the line already does not move, and Monaco has no reason to scroll: it may be under the rows.
+      queueMicrotask(() => this.keepCaretClear(true))
     })
     node.addEventListener('wheel', (e) => this.onWheel(e), { passive: false })
     const position = { preference: { top: 0, left: 0 } }
@@ -113,7 +112,10 @@ export class StickyHeader {
         this.layout()
         this.update()
       }),
-      editor.onDidChangeModel(() => this.load()),
+      editor.onDidChangeModel(() => {
+        this.caret = null
+        this.load()
+      }),
       editor.onDidChangeModelLanguage(() => this.load()),
     ]
   }
@@ -129,6 +131,7 @@ export class StickyHeader {
   dispose(): void {
     this.active = false
     this.forModel = null
+    this.generation++
     clearTimeout(this.retry)
     this.listeners.forEach((l) => l.dispose())
     this.editor.removeOverlayWidget(this.widget)
@@ -148,6 +151,7 @@ export class StickyHeader {
     style.setProperty('--tl-sticky-num', `${info.lineNumbersLeft + info.lineNumbersWidth}px`)
     style.setProperty('--tl-sticky-text', `${info.contentLeft}px`)
     this.editor.applyFontInfo(this.node)
+    this.border = parseFloat(getComputedStyle(this.node).borderBottomWidth) || 0
   }
 
   /** Asks for the symbols of the model shown, unless the header is off or the model is not a file with a grammar. */
@@ -157,28 +161,31 @@ export class StickyHeader {
     const key = model && target?.oid ? model.uri.toString() : null
     if (key === this.forModel) return
     this.forModel = key
+    this.generation++
     this.symbols = []
     this.failures = 0
     clearTimeout(this.retry)
     this.update()
-    if (key !== null && target?.oid) this.fetch(key, target.oid, target.path)
+    if (key !== null && target?.oid) this.fetch(target.oid, target.path)
   }
 
-  /** Gets the symbols of the model `key`; if that fails, asks again after a wait, a few times. */
-  private fetch(key: string, oid: string, path: string): void {
+  /** Gets the symbols of the model shown; if that fails, asks again after a wait, a few times. */
+  private fetch(oid: string, path: string): void {
+    const generation = this.generation
     getSymbols(this.host.repo(), oid, path).then(
       (r) => {
         const model = this.editor.getModel()
         // Not the model any more, or no longer wanted.
-        if (this.forModel !== key || !model) return
+        if (generation !== this.generation || !model) return
         // A name on a line the model does not have has no row to show.
         const count = model.getLineCount()
         this.symbols = r.symbols.filter((s) => s.line >= 1 && s.line <= count)
         this.update()
       },
       () => {
-        if (this.forModel !== key || this.failures >= RETRY_MS.length) return
-        this.retry = setTimeout(() => this.fetch(key, oid, path), RETRY_MS[this.failures++])
+        if (generation !== this.generation || this.failures >= RETRY_MS.length) return
+        clearTimeout(this.retry)
+        this.retry = setTimeout(() => this.fetch(oid, path), RETRY_MS[this.failures++])
       },
     )
   }
@@ -187,15 +194,14 @@ export class StickyHeader {
   private scopeLines(): number[] {
     const editor = this.editor
     const ranges = editor.getVisibleRanges()
-    const first = ranges[0]?.startLineNumber
-    if (first === undefined) return []
     const scrollTop = editor.getScrollTop()
-    // Only whitespace is above the first line, and some of it is in view: the bar of the unchanged lines above the first change
-    // (or a card at the top of the file). The view cannot go above it, so rows would cover it for good; they come once it is gone.
-    const nothingAbove = editor.getTopForLineNumber(first, true) <= editor.getOption(monaco.editor.EditorOption.padding).top
-    if (nothingAbove && editor.getTopForLineNumber(first) > scrollTop) return []
     const rowHeight = editor.getOption(monaco.editor.EditorOption.lineHeight)
-    return stickyLines(this.symbols, (rows) => lineBelow(editor, ranges, scrollTop + rows * rowHeight)).map((s) => s.line)
+    // The rows would cover the controls of a bar of unchanged lines (and the handle that drags its top edge, which is drawn above
+    // it): they stay above it, as many as fit (none once it reaches the top, which the one over the first change does at once),
+    // and come whole when it has scrolled out of view.
+    const bar = nextBar(ranges, this.edges, scrollTop, editor.getOption(monaco.editor.EditorOption.padding).top)
+    const maxRows = rowsBeforeBar(bar, scrollTop, rowHeight, this.border + BAR_REACH)
+    return stickyLines(this.symbols, (rows) => lineBelow(ranges, this.edges.bottom, scrollTop + rows * rowHeight), maxRows).map((s) => s.line)
   }
 
   /** Redraws the rows if they are not the ones the lines in view call for. */
@@ -224,11 +230,10 @@ export class StickyHeader {
     this.caret = caret
     if (!this.active || !(always || moved)) return
     const editor = this.editor
-    const rowHeight = editor.getOption(monaco.editor.EditorOption.lineHeight)
     const top = editor.getTopForLineNumber(caret.lineNumber)
     for (let round = 0; round < 4; round++) {
       this.update()
-      const next = scrollToUncover(top, editor.getScrollTop(), this.lines.length * rowHeight)
+      const next = scrollToUncover(top, editor.getScrollTop(), this.height())
       if (next === null) return
       editor.setScrollTop(next, monaco.editor.ScrollType.Immediate)
     }
