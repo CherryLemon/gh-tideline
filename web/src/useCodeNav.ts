@@ -62,6 +62,8 @@ export interface CodeNav {
   open: boolean
   /** Whether a look-up is waiting for the server, with no dialog of its own to say so. */
   looking: boolean
+  /** The look-up that is under way, or was: new for each, which `looking` can't tell when a look-up replaces another (it stays on). */
+  lookId: number
   /** The dialog for the index being built; shown once a look-up has waited for it for a moment. */
   index: (IndexProgress & { onCancel(): void; onRetry(): void; onClose(): void }) | null
   /** The list to choose from; `id` is new for each. */
@@ -85,6 +87,7 @@ export function useCodeNav(deps: CodeNavDeps): CodeNav {
   const [index, setIndex] = useState<CodeNav['index']>(null)
   const [list, setList] = useState<CodeNav['list']>(null)
   const [looking, setLooking] = useState(false)
+  const [lookId, setLookId] = useState(0)
   const current = useRef<Run | null>(null)
   const listId = useRef(0)
 
@@ -217,10 +220,11 @@ export function useCodeNav(deps: CodeNavDeps): CodeNav {
       const run: Run = { abort: new AbortController() }
       current.current = run
       setLooking(true)
+      setLookId((id) => id + 1)
       void lookUp(run, source)
     },
     [dismiss, lookUp],
   )
 
-  return { request, dismiss, open: index !== null || list !== null, looking: looking && index === null, index, list }
+  return { request, dismiss, open: index !== null || list !== null, looking: looking && index === null, lookId, index, list }
 }

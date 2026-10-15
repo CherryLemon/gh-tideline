@@ -10,7 +10,11 @@ export const POLL_MS = 300
 export const MAX_BUILDS = 3
 /** The waits before a call that failed is tried again; once they are used up, the failure is shown. */
 export const RETRY_MS = [500, 1000, 2000]
-/** The longest a start waits for the stops of its build to be answered, and a stop for the starts of it: no call holds up another longer. */
+/**
+ * The longest a call that the server does not answer holds up the next: a stop waits for the starts of its build, and a start for the stops
+ * of it, each for this long from when its call was sent. A stop that has to wait for a start that is not answered, and is not answered itself,
+ * holds the next start up for twice this.
+ */
 export const STOP_WAIT_MS = 3000
 
 export interface Clock {
@@ -54,11 +58,13 @@ export interface Builds {
   /**
    * Asks the server, through `cancel`, to stop the build under `key`: once it has answered the starts of that build that are on their
    * way, or the stop would be overtaken by the start it is for. The next build under `key` starts once the server has answered the stop.
+   * Neither is waited for longer than STOP_WAIT_MS: the stop has that long from when it is sent.
    */
   stop(key: string, cancel: () => Promise<unknown>): void
   /**
    * Waits for the index under `key` to be built, starting its build if need be. True once it is there; false when the wait is to
    * stop (aborted, the build was cancelled elsewhere, the user gave up); throws when the index can't be built or a call is refused.
+   * An abort ends the wait at once, with a call that the server has not answered yet: that call goes on, and a stop waits for it.
    */
   wait(key: string, calls: BuildCalls, view: BuildView, signal: AbortSignal): Promise<boolean>
 }
@@ -73,28 +79,43 @@ function transient(e: unknown): boolean {
 }
 
 export function createBuilds(clock: Clock = realClock): Builds {
-  // The starts and the stops the server has not answered yet, by build.
+  // The starts and the stops the server has not answered yet, by build; each is in there for no longer than STOP_WAIT_MS.
   const starting = new Map<string, Promise<void>>()
   const stopping = new Map<string, Promise<void>>()
 
-  /** Waits for `call`, if there is one, but for no longer than STOP_WAIT_MS, and not past an abort of `signal`. */
-  const within = async (call: Promise<unknown> | undefined, signal?: AbortSignal): Promise<void> => {
-    if (!call) return
+  /** Waits for `call` to be answered, or to fail, but for no longer than STOP_WAIT_MS: one the server never answers holds nothing up for good. */
+  const capped = async (call: Promise<unknown>): Promise<void> => {
     const timeout = new AbortController()
-    const end = () => timeout.abort()
-    if (signal?.aborted) end()
-    signal?.addEventListener('abort', end, { once: true })
     try {
-      await Promise.race([call, clock.sleep(STOP_WAIT_MS, timeout.signal)])
+      await Promise.race([call.catch(() => {}), clock.sleep(STOP_WAIT_MS, timeout.signal)])
     } finally {
-      signal?.removeEventListener('abort', end)
-      end()
+      timeout.abort()
     }
   }
 
-  /** Notes `call` as not answered yet under `key`, together with the calls noted before it, until the server answers it (or STOP_WAIT_MS are over). */
-  const track = (pending: Map<string, Promise<void>>, key: string, call: Promise<unknown>) => {
-    const answered = within(Promise.all([pending.get(key), call.catch(() => {})]))
+  /** What `call` answers; null as soon as `signal` aborts, whatever the server is yet to say: the call itself is not cancelled. */
+  const unlessAborted = <T>(signal: AbortSignal, call: Promise<T>): Promise<T | null> =>
+    new Promise((resolve, reject) => {
+      const abort = () => resolve(null)
+      const done = () => signal.removeEventListener('abort', abort)
+      // Handled even when the abort comes first, so that a call that fails after it is no unhandled rejection.
+      call.then(
+        (value) => {
+          done()
+          resolve(value)
+        },
+        (error) => {
+          done()
+          reject(error)
+        },
+      )
+      if (signal.aborted) abort()
+      else signal.addEventListener('abort', abort, { once: true })
+    })
+
+  /** Notes `call`, which is capped, as not answered yet under `key`, together with the calls noted before it, until it is. */
+  const track = (pending: Map<string, Promise<void>>, key: string, call: Promise<void>) => {
+    const answered = Promise.all([pending.get(key), call.catch(() => {})]).then(() => {})
     pending.set(key, answered)
     void answered.then(() => {
       if (pending.get(key) === answered) pending.delete(key)
@@ -103,18 +124,20 @@ export function createBuilds(clock: Clock = realClock): Builds {
 
   return {
     stop(key, cancel) {
-      track(stopping, key, within(starting.get(key)).then(() => cancel()))
+      // Sent once the starts are answered, or past waiting for; from then on the stop has its own STOP_WAIT_MS.
+      track(stopping, key, (starting.get(key) ?? Promise.resolve()).then(() => capped(cancel())))
     },
 
     async wait(key, calls, view, signal) {
       const started = clock.now()
       let shown = false
-      // What the server says to a call about the build. A call that fails for a moment (a gateway error, a dropped connection) is
-      // tried again; one that keeps failing is a failure of the build as far as the user can tell.
+      // What the server says to a call about the build, or null once the wait is aborted: not waited for, whatever the call is at. A call
+      // that fails for a moment (a gateway error, a dropped connection) is tried again; one that keeps failing is a failure of the build
+      // as far as the user can tell.
       const ask = async (call: () => Promise<IndexStatus>): Promise<IndexStatus | null> => {
         for (let retries = 0; ; retries++) {
           try {
-            return await call()
+            return await unlessAborted(signal, call())
           } catch (e) {
             if (signal.aborted) return null
             if (!transient(e)) throw e
@@ -127,20 +150,25 @@ export function createBuilds(clock: Clock = realClock): Builds {
       const check = () => ask(() => calls.poll(signal))
       // The server has heard of a stop before it hears of the build after it, or the stop (on its way still) would take that one down.
       const begin = async (): Promise<IndexStatus | null> => {
-        await within(stopping.get(key), signal)
+        await unlessAborted(signal, stopping.get(key) ?? Promise.resolve())
         if (signal.aborted) return null
         return ask(() => {
           const start = calls.start()
-          track(starting, key, start)
+          track(starting, key, capped(start))
           return start
         })
       }
       // Whether the user wants to try again, once they have seen why not.
       const retry = (message: string) =>
         new Promise<boolean>((resolve) => {
-          signal.addEventListener('abort', () => resolve(false), { once: true })
+          const end = (again: boolean) => {
+            signal.removeEventListener('abort', close)
+            resolve(again)
+          }
+          const close = () => end(false)
+          signal.addEventListener('abort', close, { once: true })
           shown = true
-          view.failed(message, () => resolve(true), () => resolve(false))
+          view.failed(message, () => end(true), close)
         })
 
       let status = await begin()

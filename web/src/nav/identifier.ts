@@ -73,11 +73,16 @@ const KEYWORDS: Record<string, ReadonlySet<string> | undefined> = {
 const PROPERTY_LANGUAGES = new Set(['javascript', 'typescript'])
 /** What can stand before the name of a member on its line: modifiers, and the star of a generator. */
 const MEMBER_PREFIX = /^\s*(?:(?:static|async|public|private|protected|readonly|abstract|override|declare|get|set|accessor)\s+)*\*?\s*$/
-/** What follows the name of a property (`default: 1`, `delete?: boolean`, `static new = create()`), and of a method (`delete(key) {`, `delete<T>()`). */
-const PROPERTY_AFTER = /^\s*\??\s*(?::|=(?![=>]))/
+/**
+ * What follows the name of a property (`default: 1`, `delete?: boolean`, `static new = create()`), and of a method (`delete(key) {`, `delete<T>()`).
+ * A `:` after a space is a ternary's (`null :`), not a property's.
+ */
+const PROPERTY_AFTER = /^(?:\??:|\s*\??\s*=(?![=>]))/
 const METHOD_AFTER = /^\??[(<]/
 /** Words that start a statement or an expression and are followed right away by a parenthesis as often as a method is: `if(ok)`, `super(props)`. */
 const CALL_WORDS = words('if for while switch return throw typeof void new function class await yield with import super')
+/** What `async` alone before a word is: the word may begin an async function, `async function(req) {`, and not be the name of a method. */
+const ASYNC_ONLY = /^\s*async\s*$/
 
 /** How far from the position a name is looked for; a longer one is no name worth a lookup (a minified line, a blob of letters). */
 const REACH = 300
@@ -123,7 +128,7 @@ function afterDot(text: string, at: number): boolean {
  * Whether the keyword at `word` is the name of a member where the member is declared: `delete(key: string): boolean {`, `async catch(fail) {`,
  * `{ default: foo }`, `static new = create()`, `import: string`. As after a dot, a lookup of it is wanted. Judged from the line alone: before
  * the word there is nothing but modifiers, as a member begins, and after it come the parameters of a method, or the `:` or `=` of a property.
- * `} catch (e) {`, `if(ok)` and `super(props)` are not that.
+ * `} catch (e) {`, `if(ok)`, `super(props)`, `async function(req) {` and the `null :` of a ternary are not that.
  */
 function declaresMember(text: string, word: Span): boolean {
   const before = text.slice(0, word.start)
@@ -131,8 +136,11 @@ function declaresMember(text: string, word: Span): boolean {
   if (!MEMBER_PREFIX.test(prefix)) return false
   const after = text.slice(word.end)
   if (PROPERTY_AFTER.test(after)) return true
-  // Where nothing but the word begins the member, one that opens a statement or an expression is that: `if(ok)`, `super(props)`.
-  return METHOD_AFTER.test(after) && (/\S/.test(prefix) || !CALL_WORDS.has(text.slice(word.start, word.end)))
+  // Where nothing but the word begins the member, one that opens a statement or an expression is that: `if(ok)`, `super(props)`; and
+  // `function` after `async` alone: `it('works', async function() {`.
+  const name = text.slice(word.start, word.end)
+  const opens = CALL_WORDS.has(name) && (!/\S/.test(prefix) || (name === 'function' && ASYNC_ONLY.test(prefix)))
+  return METHOD_AFTER.test(after) && !opens
 }
 
 /** The word that holds the offset `at` or ends there; null if there is none or it runs past what is looked at. */

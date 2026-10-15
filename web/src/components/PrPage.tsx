@@ -1136,7 +1136,7 @@ function PrView({ repo, data, search, entryId, refreshing, onRefresh }: ViewProp
         <span className="status-item">
           File {currentIndex >= 0 ? currentIndex + 1 : '–'}/{order.length}
         </span>
-        <LookingStatus looking={codeNav.looking} />
+        <LookingStatus looking={codeNav.looking} id={codeNav.lookId} />
         <span className="spacer" />
         <span className="hints">
           <span className="hint"><kbd>F7</kbd> next change</span>

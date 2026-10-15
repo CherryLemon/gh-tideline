@@ -484,6 +484,14 @@ export async function fileSymbols(r: RepoRef, oid: string, path: string, signal?
 const indexQuery = (head: string, side: NavSide) => `head=${seg(head)}&side=${side}`
 
 /**
+ * How long the browser waits for the server to answer the start of an index build, and the stop of one, before it gives the request up as
+ * a failure to reach the server (a start that fails so is tried again). Both are safe to send again; one that hangs holds on to one of the
+ * few connections a page has to the server, and the requests after it queue behind it.
+ */
+export const START_INDEX_TIMEOUT_MS = 30_000
+export const CANCEL_INDEX_TIMEOUT_MS = 10_000
+
+/**
  * Starts the build of the repository index of a commit (the PR's head or its merge base; `head` is the head the page
  * shows), or joins the one under way. A commit that is indexed already answers `ready` at once.
  */
@@ -492,6 +500,7 @@ export async function startIndex(r: RepoRef, n: number, head: string, side: NavS
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ head, side }),
+    signal: AbortSignal.timeout(START_INDEX_TIMEOUT_MS),
   })
   return (await res.json()) as IndexStatus
 }
@@ -503,7 +512,10 @@ export async function getIndex(r: RepoRef, n: number, head: string, side: NavSid
 
 /** Asks the build to stop; it reports `cancelling` until it has. */
 export async function cancelIndex(r: RepoRef, n: number, head: string, side: NavSide): Promise<IndexStatus> {
-  const res = await request(`${repoBase(r)}/pulls/${n}/index?${indexQuery(head, side)}`, { method: 'DELETE' })
+  const res = await request(`${repoBase(r)}/pulls/${n}/index?${indexQuery(head, side)}`, {
+    method: 'DELETE',
+    signal: AbortSignal.timeout(CANCEL_INDEX_TIMEOUT_MS),
+  })
   return (await res.json()) as IndexStatus
 }
 
