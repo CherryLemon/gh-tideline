@@ -765,10 +765,19 @@ impl Repo {
                 None,
             )
             .await?;
-        parse::parse_missing_objects(&out).map_err(|e| GitFailure {
+        let missing = parse::parse_missing_objects(&out).map_err(|e| GitFailure {
             command: "rev-list".into(),
             stderr: e,
-        })
+        })?;
+        // Git 2.43 dies on a commit the repo does not have ("fatal: bad object"); later versions print it as missing,
+        // `?<oid>`, and succeed. Both are the same error here.
+        if missing.contains(commit) {
+            return Err(GitFailure {
+                command: "rev-list".into(),
+                stderr: format!("bad object {commit}"),
+            });
+        }
+        Ok(missing)
     }
 
     /// Records the OIDs of a pull request's files (blob vs gitlink) for [`Repo::known_oid`].
