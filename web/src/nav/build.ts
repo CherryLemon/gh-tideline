@@ -8,8 +8,10 @@ export const GRACE_MS = 300
 export const POLL_MS = 300
 /** Times a look-up builds the index again: a job that vanished (the server restarted) or an index that went missing. */
 export const MAX_BUILDS = 3
-/** The waits before a status check that failed is tried again; once they are used up, the failure is shown. */
+/** The waits before a call that failed is tried again; once they are used up, the failure is shown. */
 export const RETRY_MS = [500, 1000, 2000]
+/** The longest a start waits for the stops of its build to be answered, and a stop for the starts of it: no call holds up another longer. */
+export const STOP_WAIT_MS = 3000
 
 export interface Clock {
   now(): number
@@ -49,7 +51,10 @@ export interface BuildView {
 }
 
 export interface Builds {
-  /** Asks the server, through `cancel`, to stop the build under `key`. The next build under `key` starts once the server has answered. */
+  /**
+   * Asks the server, through `cancel`, to stop the build under `key`: once it has answered the starts of that build that are on their
+   * way, or the stop would be overtaken by the start it is for. The next build under `key` starts once the server has answered the stop.
+   */
   stop(key: string, cancel: () => Promise<unknown>): void
   /**
    * Waits for the index under `key` to be built, starting its build if need be. True once it is there; false when the wait is to
@@ -58,39 +63,58 @@ export interface Builds {
   wait(key: string, calls: BuildCalls, view: BuildView, signal: AbortSignal): Promise<boolean>
 }
 
-/** Whether a failed call is worth another try: the server couldn't be reached or had a bad moment, rather than refusing the request. */
+/**
+ * Whether a failed call is worth another try: the server couldn't be reached or had a bad moment, rather than refusing the request
+ * (an index it says it can't use is no better a moment later).
+ */
 function transient(e: unknown): boolean {
-  if (e instanceof ApiError) return e.status === 0 || e.status >= 500 || e.status === 408 || e.status === 429
+  if (e instanceof ApiError) return e.code !== 'index_unavailable' && (e.status === 0 || e.status >= 500 || e.status === 408 || e.status === 429)
   return !(e instanceof DOMException && e.name === 'AbortError')
 }
 
 export function createBuilds(clock: Clock = realClock): Builds {
-  // The stops the server has not answered yet.
+  // The starts and the stops the server has not answered yet, by build.
+  const starting = new Map<string, Promise<void>>()
   const stopping = new Map<string, Promise<void>>()
+
+  /** Waits for `call`, if there is one, but for no longer than STOP_WAIT_MS, and not past an abort of `signal`. */
+  const within = async (call: Promise<unknown> | undefined, signal?: AbortSignal): Promise<void> => {
+    if (!call) return
+    const timeout = new AbortController()
+    const end = () => timeout.abort()
+    if (signal?.aborted) end()
+    signal?.addEventListener('abort', end, { once: true })
+    try {
+      await Promise.race([call, clock.sleep(STOP_WAIT_MS, timeout.signal)])
+    } finally {
+      signal?.removeEventListener('abort', end)
+      end()
+    }
+  }
+
+  /** Notes `call` as not answered yet under `key`, together with the calls noted before it, until the server answers it (or STOP_WAIT_MS are over). */
+  const track = (pending: Map<string, Promise<void>>, key: string, call: Promise<unknown>) => {
+    const answered = within(Promise.all([pending.get(key), call.catch(() => {})]))
+    pending.set(key, answered)
+    void answered.then(() => {
+      if (pending.get(key) === answered) pending.delete(key)
+    })
+  }
 
   return {
     stop(key, cancel) {
-      const pending = Promise.all([stopping.get(key), cancel().catch(() => {})]).then(() => {})
-      stopping.set(key, pending)
-      void pending.then(() => {
-        if (stopping.get(key) === pending) stopping.delete(key)
-      })
+      track(stopping, key, within(starting.get(key)).then(() => cancel()))
     },
 
     async wait(key, calls, view, signal) {
       const started = clock.now()
       let shown = false
-      // The server has heard of a stop before it hears of the build after it, or the stop (on its way still) would take that one down.
-      const begin = async (): Promise<IndexStatus | null> => {
-        await stopping.get(key)
-        return signal.aborted ? null : calls.start()
-      }
-      // The status of the build. A check that fails for a moment (a gateway error, a dropped connection) is tried again; one that
-      // keeps failing is a failure of the build as far as the user can tell.
-      const check = async (): Promise<IndexStatus | null> => {
+      // What the server says to a call about the build. A call that fails for a moment (a gateway error, a dropped connection) is
+      // tried again; one that keeps failing is a failure of the build as far as the user can tell.
+      const ask = async (call: () => Promise<IndexStatus>): Promise<IndexStatus | null> => {
         for (let retries = 0; ; retries++) {
           try {
-            return await calls.poll(signal)
+            return await call()
           } catch (e) {
             if (signal.aborted) return null
             if (!transient(e)) throw e
@@ -99,6 +123,17 @@ export function createBuilds(clock: Clock = realClock): Builds {
             if (signal.aborted) return null
           }
         }
+      }
+      const check = () => ask(() => calls.poll(signal))
+      // The server has heard of a stop before it hears of the build after it, or the stop (on its way still) would take that one down.
+      const begin = async (): Promise<IndexStatus | null> => {
+        await within(stopping.get(key), signal)
+        if (signal.aborted) return null
+        return ask(() => {
+          const start = calls.start()
+          track(starting, key, start)
+          return start
+        })
       }
       // Whether the user wants to try again, once they have seen why not.
       const retry = (message: string) =>
@@ -116,6 +151,8 @@ export function createBuilds(clock: Clock = realClock): Builds {
           case 'failed':
             // Until the user decides: the look-up is still theirs to go on with.
             if (!(await retry(status.message ?? 'Indexing failed'))) return false
+            // The dialog goes back to the progress, and its Cancel, at once: not when the server has answered the start.
+            view.progress({ phase: null, done: 0, total: 0 })
             status = await begin()
             continue
           case 'cancelled':

@@ -392,6 +392,11 @@ function snippetOf(line: string, column: number): { snippet: string; snippetColu
 
 const escapeRegExp = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 
+/** What the server (Rust's `char::is_control`) takes for a control character: the C1 ones too. */
+const CONTROL = /[\x00-\x1f\x7f-\x9f]/
+/** The whitespace but the space that the server (`char::is_whitespace`) knows, which, unlike JavaScript's `\s`, has no U+FEFF. */
+const OTHER_SPACE = /[\xa0\u{1680}\u{2000}-\u{200a}\u{2028}\u{2029}\u{202f}\u{205f}\u{3000}]/u
+
 /** The builds of the index of a pull request's commits, and the looking up of names in the commits that are built. */
 export class MockIndex {
   private readonly jobs = new Map<string, Job>()
@@ -525,10 +530,10 @@ export class MockIndex {
     const path = query.get('path') ?? ''
     const name = query.get('name') ?? ''
     if (sub !== 'index') {
-      if (!path || Buffer.byteLength(path) > 4096 || /[\x00-\x1f\x7f]/.test(path)) return failure(400, 'bad_request', 'invalid path')
+      if (!path || Buffer.byteLength(path) > 4096 || CONTROL.test(path)) return failure(400, 'bad_request', 'invalid path')
       // As the server: no whitespace but the single spaces of a C++ operator's name (`operator new[]`).
       const spaced = /^operator( [^ ]+)+$/.test(name)
-      if (!name || Buffer.byteLength(name) > 256 || /[\x00-\x1f\x7f]/.test(name) || /[^\S ]/.test(name) || (name.includes(' ') && !spaced)) {
+      if (!name || Buffer.byteLength(name) > 256 || CONTROL.test(name) || OTHER_SPACE.test(name) || (name.includes(' ') && !spaced)) {
         return failure(400, 'bad_request', 'invalid name')
       }
     }

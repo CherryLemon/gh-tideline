@@ -24,8 +24,12 @@ const GAP = 4
 const FLIP = 24
 /** Rows PageUp and PageDown move by. */
 const PAGE = 8
-/** A name further along its line than this many characters is brought into view: the row shows the line from its start, and the end of what is too long for it is cut off. */
-const NAME_REACH = 32
+/**
+ * A name further along its line than this many characters is brought into view: the row shows the line from its start, and the end of what
+ * is too long for it is cut off, with an ellipsis that takes a character or two. The snippet of a row keeps room for this, a name of 16
+ * characters and that ellipsis: 40 (`.nav-popup-snippet` in the styles).
+ */
+const NAME_REACH = 22
 /** What is kept in front of such a name. */
 const NAME_LEAD = 16
 

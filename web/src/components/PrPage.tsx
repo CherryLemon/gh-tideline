@@ -54,6 +54,7 @@ import { DiffPane, type ChangeInfo, type DiffPaneHandle, type PaneReview, type P
 import { FileTree, type ListingState, type TreeScope } from './FileTree'
 import { FileFinder } from './FileFinder'
 import { IndexDialog } from './IndexDialog'
+import { LookingStatus } from './LookingStatus'
 import { NavPopup } from './NavPopup'
 import { Toast, type ToastMessage } from './Toast'
 import { ThreadActionsContext, ThreadCard, anchorLines, type ThreadActions } from './ThreadCard'
@@ -1135,11 +1136,7 @@ function PrView({ repo, data, search, entryId, refreshing, onRefresh }: ViewProp
         <span className="status-item">
           File {currentIndex >= 0 ? currentIndex + 1 : '–'}/{order.length}
         </span>
-        {codeNav.looking && (
-          <span className="status-item status-looking" role="status">
-            Looking up…
-          </span>
-        )}
+        <LookingStatus looking={codeNav.looking} />
         <span className="spacer" />
         <span className="hints">
           <span className="hint"><kbd>F7</kbd> next change</span>

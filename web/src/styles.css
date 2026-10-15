@@ -425,9 +425,9 @@ kbd {
   color: var(--fg);
 }
 
-.status-looking {
-  /* Not shown for a look-up that is quick. */
-  animation: fade-in 0s 300ms both;
+/* The live region for a look-up is in the page all along; with no text it takes no room, and the bar's gap is not added for it. */
+.status-looking:empty {
+  position: absolute;
 }
 
 /* The shortcuts that don't fit are left out whole, the last first: each line is as high as the bar, so those that wrap are out of sight. */
@@ -1843,9 +1843,10 @@ kbd {
   font-size: 12px;
 }
 
+/* The directory gives way to the snippet, which keeps room for the name that NAME_REACH leaves in place: 40 characters, or half the row. */
 .nav-popup-snippet {
   flex: 1 1 0;
-  min-width: 16ch;
+  min-width: min(40ch, 50%);
   margin-left: 6px;
   overflow: hidden;
   text-overflow: ellipsis;

@@ -201,6 +201,97 @@ describe('identifierAt', () => {
       expect(at('self.None', 7, 'python')).toBeNull()
       expect(at('Foo.class', 6, 'java')).toBeNull()
     })
+
+    describe('as the name of a member, in JavaScript and TypeScript', () => {
+      /** The name in the middle of the first `word` of `text`. */
+      const named = (text: string, word: string, language = 'typescript') => at(text, text.indexOf(word) + 2, language)?.split('@')[0] ?? null
+
+      it.each([
+        ['a method of a class', '  delete(key: string): boolean {', 'delete'],
+        ['an async method', '  async delete(id) {', 'delete'],
+        ['a method named after the clause of a promise', '  catch(onRejected) {', 'catch'],
+        ['a method named finally', '  finally(onFinally) {', 'finally'],
+        ['a generator method', '  *delete() {', 'delete'],
+        ['an async generator method', '  public static async *delete() {', 'delete'],
+        ['a getter', '  get default() {', 'default'],
+        ['a setter', '  set import(value) {', 'import'],
+        ['a static method named after a statement', '  static new(config) {', 'new'],
+        ['an async method named after a statement', '  async return(value) {', 'return'],
+        ['an optional method of an interface', '  delete?(): void', 'delete'],
+        ['a generic method', '  delete<T>(x: T): void', 'delete'],
+        ['a method of a class on one line', 'class Cache { delete(key) { return 1 } }', 'delete'],
+        ['a method of an object', 'const store = { delete(key) {}, export() {} }', 'export'],
+        ['a property of an interface', '  import: string', 'import'],
+        ['an optional property', '  default?: string', 'default'],
+        ['a property with a modifier', '  readonly delete: boolean', 'delete'],
+        ['a static property', '  static default = 1', 'default'],
+        ['a property with a function for its value', '  delete = (key: string) => {}', 'delete'],
+        ['a property that is set', '  private static readonly new = create()', 'new'],
+        ['a key of an object', '{ default: foo }', 'default'],
+        ['a key of an object after a comma', 'const ops = { delete: remove, new: create }', 'new'],
+        ['the first key of an object', 'const ops = { delete: remove, new: create }', 'delete'],
+        ['a key of an object in a call', 'foo({ class: kind })', 'class'],
+        ['a key that is looked for in a destructuring', 'const { default: load } = await import(path)', 'default'],
+        ['a member of an enum', 'enum Op { delete = 1, new = 2 }', 'delete'],
+        ['a parameter property of a constructor', '  private readonly delete: boolean,', 'delete'],
+      ])('%s', (_what, text, word) => {
+        expect(named(text, word)).toBe(word)
+        expect(named(text, word, 'javascript')).toBe(word)
+      })
+
+      it('are found at either end of the word, as a caret has it', () => {
+        expect(at('  delete(key) {', 3)).toBe('delete@3-9')
+        expect(at('  delete(key) {', 9)).toBe('delete@3-9')
+      })
+
+      it.each([
+        ['an if', '  if (ok) {', 'if'],
+        ['an if without a space', '  if(ok) {', 'if'],
+        ['a for', '  for(const x of xs) {', 'for'],
+        ['a while', '  while(ok) {', 'while'],
+        ['a switch', '  switch(kind) {', 'switch'],
+        ['a return', '  return(value)', 'return'],
+        ['a return of a value', '  return value', 'return'],
+        ['a return of an object', '  return { value }', 'return'],
+        ['a throw', '  throw(error)', 'throw'],
+        ['a call of super', '    super(props)', 'super'],
+        ['a function expression', '  function(a) {', 'function'],
+        ['a dynamic import', '  import(path).then(run)', 'import'],
+        ['a typeof', '  typeof(value)', 'typeof'],
+        ['a new', '  new(Foo)', 'new'],
+        ['a new with a space', '  new Foo()', 'new'],
+        ['the catch of a try', '  } catch (e) {', 'catch'],
+        ['the catch of a try without a space', '  } catch(e) {', 'catch'],
+        ['the catch of a try on one line', 'try { run() } catch(e) { fail(e) }', 'catch'],
+        ['the finally of a try', '  } finally {', 'finally'],
+        ['an export', 'export const total = 1', 'export'],
+        ['the default of an export', 'export default total', 'default'],
+        ['the default of an export of an object', 'export default { total }', 'default'],
+        ['an import', "import { total } from './total'", 'import'],
+        ['the null of a conditional', 'x = flag ? null : 1', 'null'],
+        ['the null after a conditional', 'x = flag ? 1 : null', 'null'],
+        ['the null of a conditional on its own line', '    ? null', 'null'],
+        ['a keyword in a comparison', '  if (kind === new) {', 'new'],
+        ['a keyword in a call', 'f(a, delete)', 'delete'],
+        ['the default of a case, after a label', "case 'a': default: break", 'default'],
+        ['the class of an element of JSX', '<div class="box">', 'class'],
+        ['a delete operator', '  delete cache[key]', 'delete'],
+        ['a delete operator after an if', '  if (ok) delete cache[key]', 'delete'],
+        ['a keyword as an argument', 'run(this, typeof x)', 'this'],
+        ['a this parameter', 'function run(this: Window) {}', 'this'],
+      ])('are no names: %s', (_what, text, word) => {
+        expect(named(text, word)).toBeNull()
+        expect(named(text, word, 'javascript')).toBeNull()
+      })
+
+      it('are no names in the other languages, where a keyword is one', () => {
+        expect(named('  delete(p)', 'delete', 'cpp')).toBeNull()
+        expect(named('  default: break;', 'default', 'java')).toBeNull()
+        expect(named('  type: u8,', 'type', 'rust')).toBeNull()
+        expect(named('  def: 1', 'def', 'python')).toBeNull()
+        expect(named('  default: 1', 'default', 'go')).toBeNull()
+      })
+    })
   })
 
   describe('with token kinds', () => {

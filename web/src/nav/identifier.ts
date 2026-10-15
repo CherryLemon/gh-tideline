@@ -69,8 +69,15 @@ const KEYWORDS: Record<string, ReadonlySet<string> | undefined> = {
     not not_eq nullptr or or_eq private protected public reinterpret_cast requires static_assert static_cast template this thread_local
     throw true try typeid typename using virtual wchar_t xor xor_eq`),
 }
-/** JavaScript and TypeScript let a property be called what a keyword is: `map.delete(key)`. */
+/** JavaScript and TypeScript let a property be called what a keyword is: `map.delete(key)`, `{ default: 1 }`. */
 const PROPERTY_LANGUAGES = new Set(['javascript', 'typescript'])
+/** What can stand before the name of a member on its line: modifiers, and the star of a generator. */
+const MEMBER_PREFIX = /^\s*(?:(?:static|async|public|private|protected|readonly|abstract|override|declare|get|set|accessor)\s+)*\*?\s*$/
+/** What follows the name of a property (`default: 1`, `delete?: boolean`, `static new = create()`), and of a method (`delete(key) {`, `delete<T>()`). */
+const PROPERTY_AFTER = /^\s*\??\s*(?::|=(?![=>]))/
+const METHOD_AFTER = /^\??[(<]/
+/** Words that start a statement or an expression and are followed right away by a parenthesis as often as a method is: `if(ok)`, `super(props)`. */
+const CALL_WORDS = words('if for while switch return throw typeof void new function class await yield with import super')
 
 /** How far from the position a name is looked for; a longer one is no name worth a lookup (a minified line, a blob of letters). */
 const REACH = 300
@@ -101,7 +108,7 @@ export function identifierAt(source: IdentifierSource, position: { lineNumber: n
   // `3.14`, `0xff`, `1_000`: the words of a number begin with a digit.
   if (/^\p{Nd}/u.test(name) || encoder.encode(name).length > MAX_NAME_BYTES) return null
   // A raw identifier is the way to name what the keyword is, and a property of an object can be called one.
-  if (!raw && KEYWORDS[language]?.has(name) && !(PROPERTY_LANGUAGES.has(language) && afterDot(text, word.start))) return null
+  if (!raw && KEYWORDS[language]?.has(name) && !(PROPERTY_LANGUAGES.has(language) && (afterDot(text, word.start) || declaresMember(text, word)))) return null
   const kind = source.tokenKindAt?.(position.lineNumber, (raw?.name.start ?? word.start) + 1) ?? 'code'
   if (kind !== 'code') return null
   return { name, line: position.lineNumber, column: covered.start + 1, endColumn: covered.end + 1, nameColumn: (raw?.name.start ?? word.start) + 1 }
@@ -110,6 +117,22 @@ export function identifierAt(source: IdentifierSource, position: { lineNumber: n
 /** Whether the offset follows a single dot (`a.b`, `a?.b`): not the three of a spread, in `...this`. */
 function afterDot(text: string, at: number): boolean {
   return text[at - 1] === '.' && text[at - 2] !== '.'
+}
+
+/**
+ * Whether the keyword at `word` is the name of a member where the member is declared: `delete(key: string): boolean {`, `async catch(fail) {`,
+ * `{ default: foo }`, `static new = create()`, `import: string`. As after a dot, a lookup of it is wanted. Judged from the line alone: before
+ * the word there is nothing but modifiers, as a member begins, and after it come the parameters of a method, or the `:` or `=` of a property.
+ * `} catch (e) {`, `if(ok)` and `super(props)` are not that.
+ */
+function declaresMember(text: string, word: Span): boolean {
+  const before = text.slice(0, word.start)
+  const prefix = before.slice(Math.max(before.lastIndexOf('{'), before.lastIndexOf(','), before.lastIndexOf(';')) + 1)
+  if (!MEMBER_PREFIX.test(prefix)) return false
+  const after = text.slice(word.end)
+  if (PROPERTY_AFTER.test(after)) return true
+  // Where nothing but the word begins the member, one that opens a statement or an expression is that: `if(ok)`, `super(props)`.
+  return METHOD_AFTER.test(after) && (/\S/.test(prefix) || !CALL_WORDS.has(text.slice(word.start, word.end)))
 }
 
 /** The word that holds the offset `at` or ends there; null if there is none or it runs past what is looked at. */

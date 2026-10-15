@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiError, type IndexStatus } from '../api'
-import { GRACE_MS, MAX_BUILDS, POLL_MS, RETRY_MS, createBuilds, sleep, withIndex, type BuildCalls, type BuildView, type Clock } from './build'
+import { GRACE_MS, MAX_BUILDS, POLL_MS, RETRY_MS, STOP_WAIT_MS, createBuilds, sleep, withIndex, type BuildCalls, type BuildView, type Clock } from './build'
 
 const clock: Clock = { now: () => Date.now(), sleep }
 
@@ -74,6 +74,24 @@ function settle<T>(promise: Promise<T>) {
 }
 
 const tick = (ms = 0) => vi.advanceTimersByTimeAsync(ms)
+
+/** A call the server never answers. */
+const never = () => new Promise<never>(() => {})
+
+/** A server whose starts wait for the test to answer them (`answer`, the oldest first); a check finds the index ready. */
+function held() {
+  const log: string[] = []
+  const pending: Array<{ resolve(s: IndexStatus): void; reject(e: Error): void }> = []
+  const calls: BuildCalls = {
+    start: () =>
+      new Promise((resolve, reject) => {
+        log.push(`start@${Date.now()}`)
+        pending.push({ resolve, reject })
+      }),
+    poll: async () => status('ready'),
+  }
+  return { calls, log, answer: (s: IndexStatus) => pending.shift()!.resolve(s), fail: (e: Error) => pending.shift()!.reject(e) }
+}
 
 describe('wait', () => {
   it('is over at once for an index that is built, and shows nothing', async () => {
@@ -178,6 +196,18 @@ describe('wait', () => {
       expect(vi.getTimerCount()).toBe(0)
     })
 
+    it('is over at once, between the retries of a start', async () => {
+      const abort = new AbortController()
+      const srv = server([apiError(502)])
+      const out = settle(createBuilds(clock).wait('k', srv.calls, screen().view, abort.signal))
+      await tick(100)
+      abort.abort()
+      await tick()
+      expect(out).toMatchObject({ state: 'resolved', value: false })
+      expect(srv.log).toEqual(['start@0'])
+      expect(vi.getTimerCount()).toBe(0)
+    })
+
     it('shows nothing after the abort', async () => {
       const abort = new AbortController()
       const srv = server([status('queued')], [status('building')])
@@ -206,16 +236,39 @@ describe('wait', () => {
       expect(srv.log).toEqual(['start@0', `start@${5 * POLL_MS}`])
     })
 
-    it('shows the progress at once after a retry: the dialog is up already', async () => {
-      const srv = server([status('failed', { message: 'boom' }), status('queued')], [status('ready')])
+    it('shows the progress at once after a retry: the dialog is up already, before the server has answered the start', async () => {
+      const srv = held()
       const scr = screen()
       const out = settle(createBuilds(clock).wait('k', srv.calls, scr.view, new AbortController().signal))
       await tick()
+      srv.answer(status('failed', { message: 'boom' }))
+      await tick()
+      expect(scr.events).toEqual(['failed boom'])
       scr.ways[0].retry()
       await tick()
+      expect(srv.log).toHaveLength(2)
       expect(scr.events).toEqual(['failed boom', 'progress - 0/0'])
+      srv.answer(status('queued'))
       await tick(POLL_MS)
+      expect(scr.events).toEqual(['failed boom', 'progress - 0/0', 'progress - 0/0'])
       expect(out).toMatchObject({ state: 'resolved', value: true })
+    })
+
+    it('ends the wait when the dialog is cancelled right after a retry, with the start still on its way', async () => {
+      const abort = new AbortController()
+      const srv = held()
+      const scr = screen()
+      const out = settle(createBuilds(clock).wait('k', srv.calls, scr.view, abort.signal))
+      await tick()
+      srv.answer(status('failed', { message: 'boom' }))
+      await tick()
+      scr.ways[0].retry()
+      await tick()
+      abort.abort()
+      srv.answer(status('queued'))
+      await tick(10 * POLL_MS)
+      expect(out).toMatchObject({ state: 'resolved', value: false })
+      expect(scr.events).toEqual(['failed boom', 'progress - 0/0'])
     })
 
     it('is over when the user closes it', async () => {
@@ -238,7 +291,7 @@ describe('wait', () => {
       await tick()
       scr.ways[1].retry()
       await tick()
-      expect(scr.events).toEqual(['failed one', 'failed two'])
+      expect(scr.events).toEqual(['failed one', 'progress - 0/0', 'failed two', 'progress - 0/0'])
       expect(out).toMatchObject({ state: 'resolved', value: true })
     })
 
@@ -376,6 +429,88 @@ describe('wait', () => {
       expect(srv.log.filter((l) => l.startsWith('poll'))).toHaveLength(1)
       expect(scr.events).toEqual([])
     })
+
+    it('does not try again when the server says it cannot use the index at all', async () => {
+      const unusable = new ApiError(503, 'index_unavailable', 'the index database could not be opened')
+      const srv = server([status('queued')], [unusable, status('ready')])
+      const out = settle(createBuilds(clock).wait('k', srv.calls, screen().view, new AbortController().signal))
+      await tick(POLL_MS + 10 * RETRY_MS[2])
+      expect(out.state).toBe('rejected')
+      expect(out.error).toBe(unusable)
+      expect(srv.log.filter((l) => l.startsWith('poll'))).toHaveLength(1)
+    })
+  })
+
+  describe('when the start fails', () => {
+    it('tries it again after each of the waits of RETRY_MS, and goes on when it gets through', async () => {
+      const srv = server([apiError(502), apiError(0, 'network'), apiError(503), status('ready')])
+      const scr = screen()
+      const out = settle(createBuilds(clock).wait('k', srv.calls, scr.view, new AbortController().signal))
+      const [first, second, third] = RETRY_MS
+      await tick(first - 1)
+      expect(srv.log).toEqual(['start@0'])
+      await tick(1)
+      expect(srv.log).toEqual(['start@0', `start@${first}`])
+      await tick(second + third)
+      expect(srv.log).toEqual(['start@0', `start@${first}`, `start@${first + second}`, `start@${first + second + third}`])
+      expect(out).toMatchObject({ state: 'resolved', value: true })
+      expect(scr.events).toEqual([])
+    })
+
+    it('tries again when the job is to be started anew, too', async () => {
+      const srv = server([status('missing'), apiError(502), status('ready')])
+      const out = settle(createBuilds(clock).wait('k', srv.calls, screen().view, new AbortController().signal))
+      await tick(RETRY_MS[0])
+      expect(out).toMatchObject({ state: 'resolved', value: true })
+      expect(srv.log).toEqual(['start@0', 'start@0', `start@${RETRY_MS[0]}`])
+    })
+
+    it('shows the failure when it keeps failing, and starts again on Retry', async () => {
+      const srv = server([apiError(502), apiError(502), apiError(502), apiError(502), status('ready')])
+      const scr = screen()
+      const out = settle(createBuilds(clock).wait('k', srv.calls, scr.view, new AbortController().signal))
+      await tick(RETRY_MS[0] + RETRY_MS[1] + RETRY_MS[2])
+      expect(srv.log).toHaveLength(RETRY_MS.length + 1)
+      expect(scr.events).toEqual(['failed Request failed (HTTP 502)'])
+      expect(out.state).toBe('pending')
+      scr.ways[0].retry()
+      await tick()
+      expect(out).toMatchObject({ state: 'resolved', value: true })
+      expect(srv.log).toHaveLength(RETRY_MS.length + 2)
+    })
+
+    it('is over when the user closes the failure', async () => {
+      const srv = server([apiError(0, 'network')])
+      const scr = screen()
+      const out = settle(createBuilds(clock).wait('k', srv.calls, scr.view, new AbortController().signal))
+      await tick(RETRY_MS[0] + RETRY_MS[1] + RETRY_MS[2])
+      expect(scr.events).toEqual(["failed Can't reach the Tideline server"])
+      scr.ways[0].close()
+      await tick()
+      expect(out).toMatchObject({ state: 'resolved', value: false })
+    })
+
+    it.each([400, 401, 403, 404, 409])('does not try again after a %i: the request is refused', async (code) => {
+      const refused = apiError(code, code === 409 ? 'stale_head' : undefined)
+      const srv = server([refused, status('ready')])
+      const scr = screen()
+      const out = settle(createBuilds(clock).wait('k', srv.calls, scr.view, new AbortController().signal))
+      await tick(10 * RETRY_MS[2])
+      expect(out.state).toBe('rejected')
+      expect(out.error).toBe(refused)
+      expect(srv.log).toEqual(['start@0'])
+      expect(scr.events).toEqual([])
+    })
+
+    it('does not try again when the server says it cannot use the index at all', async () => {
+      const unusable = new ApiError(503, 'index_unavailable', 'the index database could not be opened')
+      const srv = server([unusable, status('ready')])
+      const out = settle(createBuilds(clock).wait('k', srv.calls, screen().view, new AbortController().signal))
+      await tick(10 * RETRY_MS[2])
+      expect(out.state).toBe('rejected')
+      expect(out.error).toBe(unusable)
+      expect(srv.log).toEqual(['start@0'])
+    })
   })
 
   describe('after a stop', () => {
@@ -443,7 +578,7 @@ describe('wait', () => {
       expect(srv.log).toEqual(['start@300'])
     })
 
-    it('starts nothing for a wait that was aborted while it waited', async () => {
+    it('starts nothing for a wait that was aborted while it waited, and is over with it at once', async () => {
       const builds = createBuilds(clock)
       const abort = new AbortController()
       const srv = server([status('ready')])
@@ -451,9 +586,168 @@ describe('wait', () => {
       const out = settle(builds.wait('k', srv.calls, screen().view, abort.signal))
       await tick(100)
       abort.abort()
-      await tick(200)
+      await tick()
       expect(out).toMatchObject({ state: 'resolved', value: false })
+      await tick(200)
       expect(srv.log).toEqual([])
+    })
+
+    describe('that the server never answers', () => {
+      it(`is waited for no longer than ${STOP_WAIT_MS} ms`, async () => {
+        const builds = createBuilds(clock)
+        const srv = server([status('ready')])
+        builds.stop('k', never)
+        const out = settle(builds.wait('k', srv.calls, screen().view, new AbortController().signal))
+        await tick(STOP_WAIT_MS - 1)
+        expect(srv.log).toEqual([])
+        expect(out.state).toBe('pending')
+        await tick(1)
+        expect(srv.log).toEqual([`start@${STOP_WAIT_MS}`])
+        expect(out).toMatchObject({ state: 'resolved', value: true })
+        expect(vi.getTimerCount()).toBe(0)
+      })
+
+      it('holds up no build that comes after the wait is over', async () => {
+        const builds = createBuilds(clock)
+        builds.stop('k', never)
+        await tick(STOP_WAIT_MS)
+        const srv = server([status('ready')])
+        const out = settle(builds.wait('k', srv.calls, screen().view, new AbortController().signal))
+        await tick()
+        expect(srv.log).toEqual([`start@${STOP_WAIT_MS}`])
+        expect(out).toMatchObject({ state: 'resolved', value: true })
+      })
+
+      it('does not make a stop that comes after it wait any longer', async () => {
+        const builds = createBuilds(clock)
+        const srv = server([status('ready')])
+        builds.stop('k', never)
+        await tick(1000)
+        builds.stop('k', () => Promise.resolve(null))
+        settle(builds.wait('k', srv.calls, screen().view, new AbortController().signal))
+        await tick(STOP_WAIT_MS - 1000 - 1)
+        expect(srv.log).toEqual([])
+        await tick(1)
+        expect(srv.log).toEqual([`start@${STOP_WAIT_MS}`])
+      })
+
+      it('is not waited for past an abort: the wait is over at once', async () => {
+        const builds = createBuilds(clock)
+        const abort = new AbortController()
+        const srv = server([status('ready')])
+        builds.stop('k', never)
+        const out = settle(builds.wait('k', srv.calls, screen().view, abort.signal))
+        await tick(100)
+        expect(out.state).toBe('pending')
+        abort.abort()
+        await tick()
+        expect(out).toMatchObject({ state: 'resolved', value: false })
+        expect(srv.log).toEqual([])
+        // What is left is the stop's own limit.
+        expect(vi.getTimerCount()).toBe(1)
+        await tick(STOP_WAIT_MS)
+        expect(vi.getTimerCount()).toBe(0)
+        expect(srv.log).toEqual([])
+      })
+
+      it('is not waited for by a wait that was aborted before it began', async () => {
+        const builds = createBuilds(clock)
+        const abort = new AbortController()
+        abort.abort()
+        const srv = server([status('ready')])
+        builds.stop('k', never)
+        const out = settle(builds.wait('k', srv.calls, screen().view, abort.signal))
+        await tick()
+        expect(out).toMatchObject({ state: 'resolved', value: false })
+        expect(srv.log).toEqual([])
+      })
+    })
+  })
+
+  describe('after a start', () => {
+    /** A stop that notes when it is sent, in the log of the server. */
+    const stopNoting = (log: string[]) => async () => {
+      log.push(`stop@${Date.now()}`)
+      return null
+    }
+
+    it('sends the stop only once the server has answered the start that is on its way', async () => {
+      const builds = createBuilds(clock)
+      const abort = new AbortController()
+      const srv = held()
+      settle(builds.wait('k', srv.calls, screen().view, abort.signal))
+      await tick(50)
+      abort.abort()
+      builds.stop('k', stopNoting(srv.log))
+      await tick(100)
+      expect(srv.log).toEqual(['start@0'])
+      srv.answer(status('queued'))
+      await tick()
+      expect(srv.log).toEqual(['start@0', 'stop@150'])
+    })
+
+    it('sends it after a start that failed, too', async () => {
+      const builds = createBuilds(clock)
+      const abort = new AbortController()
+      const srv = held()
+      settle(builds.wait('k', srv.calls, screen().view, abort.signal))
+      await tick(50)
+      abort.abort()
+      builds.stop('k', stopNoting(srv.log))
+      srv.fail(apiError(404))
+      await tick()
+      expect(srv.log).toEqual(['start@0', 'stop@50'])
+    })
+
+    it('sends it at once when the server has answered every start', async () => {
+      const builds = createBuilds(clock)
+      const log: string[] = []
+      const srv = server([status('ready')])
+      settle(builds.wait('k', srv.calls, screen().view, new AbortController().signal))
+      await tick(50)
+      builds.stop('k', stopNoting(log))
+      await tick()
+      expect(log).toEqual(['stop@50'])
+    })
+
+    it('does not wait for the start of another build', async () => {
+      const builds = createBuilds(clock)
+      const srv = held()
+      const log: string[] = []
+      settle(builds.wait('other', srv.calls, screen().view, new AbortController().signal))
+      await tick(50)
+      builds.stop('k', stopNoting(log))
+      await tick()
+      expect(log).toEqual(['stop@50'])
+    })
+
+    it(`sends it without the answer to a start that never comes, ${STOP_WAIT_MS} ms after that start`, async () => {
+      const builds = createBuilds(clock)
+      const log: string[] = []
+      const calls: BuildCalls = { start: never, poll: async () => status('ready') }
+      settle(builds.wait('k', calls, screen().view, new AbortController().signal))
+      await tick(50)
+      builds.stop('k', stopNoting(log))
+      await tick(STOP_WAIT_MS - 51)
+      expect(log).toEqual([])
+      await tick(1)
+      expect(log).toEqual([`stop@${STOP_WAIT_MS}`])
+    })
+
+    it('keeps the next build waiting for the stop, and so for the start before it', async () => {
+      const builds = createBuilds(clock)
+      const abort = new AbortController()
+      const srv = held()
+      settle(builds.wait('k', srv.calls, screen().view, abort.signal))
+      await tick(50)
+      abort.abort()
+      builds.stop('k', stopNoting(srv.log))
+      settle(builds.wait('k', srv.calls, screen().view, new AbortController().signal))
+      await tick(100)
+      expect(srv.log).toEqual(['start@0'])
+      srv.answer(status('queued'))
+      await tick()
+      expect(srv.log).toEqual(['start@0', 'stop@150', 'start@150'])
     })
   })
 })

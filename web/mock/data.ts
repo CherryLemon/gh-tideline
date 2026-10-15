@@ -698,6 +698,25 @@ export function log(message: string): void {
 export function warn(message: string): void {
   console.warn('warning: ' + message)
 }
+
+/** Members that are named like keywords of the language: they are looked up all the same. */
+export class Muted {
+  private readonly names = new Set<string>()
+
+  static new(names: string[]): Muted {
+    const muted = new Muted()
+    names.forEach((name) => muted.names.add(name))
+    return muted
+  }
+
+  delete(name: string): boolean {
+    return this.names.delete(name)
+  }
+}
+
+export function unmute(muted: Muted, name: string): boolean {
+  return muted.delete(name)
+}
 `
 
 const legacyLogJs = `// The logger of the legacy client, kept until the client is gone.
