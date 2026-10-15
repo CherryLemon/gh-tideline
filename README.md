@@ -58,6 +58,10 @@ Tideline sits in between:
 - **Languages**: Rust, Go, Python, TypeScript/TSX, JavaScript, Java, C and C++ (a `.h` file is C++ when its content says so).
 - **Speed**: the first index of cli/cli takes about 4 s, and that of microsoft/vscode (15,000 source files) less than a minute. A lookup takes milliseconds.
 
+<p align="center">
+  <img src="docs/images/navigation.png" alt="Ctrl+click on HelperConfig in cli/cli#14673 lists its three declarations while the sticky header pins the enclosing function loginRun" width="900">
+</p>
+
 **JetBrains-style keyboard**
 - `F7` / `Shift+F7`: next/previous change. At the end of a file it continues into the next file.
 - `Alt+↓` / `Alt+↑`: next/previous file.
