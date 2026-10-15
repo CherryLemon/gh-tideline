@@ -79,7 +79,8 @@ function transient(e: unknown): boolean {
 }
 
 export function createBuilds(clock: Clock = realClock): Builds {
-  // The starts and the stops the server has not answered yet, by build; each is in there for no longer than STOP_WAIT_MS.
+  // The starts and the stops the server has not answered yet, by build. A start is in there for no longer than STOP_WAIT_MS, and a
+  // stop for no longer than twice that (the start before it, then its own DELETE).
   const starting = new Map<string, Promise<void>>()
   const stopping = new Map<string, Promise<void>>()
 
