@@ -2904,7 +2904,7 @@ pub fn twice() {
         let head = p.clone.head.clone();
         let files = stored_by_another_clone(&p, &sources).await;
         p.db.save_commit(&head, &files).unwrap();
-        let wait = Duration::from_millis(800);
+        let wait = Duration::from_secs(2);
         Arc::get_mut(&mut p.service).unwrap().snippet_fetch_wait = wait;
         let fetches = &p.service.snippet_fetches;
 
