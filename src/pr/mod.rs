@@ -161,11 +161,15 @@ pub struct PrService {
     index: Option<Indexer>,
     /// The files whose parse timed out lately, so that they are not parsed again at once (see [`PrService::symbols`]).
     slow_parses: nav::SlowParses,
-    /// The blobs that are being fetched for the lines of references, so that no other lookup asks for them, and those
-    /// whose fetch failed lately, so that none asks for them again at once (see [`PrService::references`]).
+    /// The blobs that are being fetched for the lines of references, so that no other lookup asks for them but waits for
+    /// that fetch, and those whose fetch failed lately, so that none asks for them again at once (see
+    /// [`PrService::references`]).
     snippet_fetches: nav::SnippetFetches,
-    /// How long a lookup waits for the blobs it fetches for those lines (see [`PrService::references`]).
+    /// How long a lookup waits for the blobs it fetches for those lines, or that another lookup fetches (see
+    /// [`PrService::references`]).
     snippet_fetch_wait: Duration,
+    /// How long the task of a lookup goes on asking for the blobs the remote does not refuse, once it has refused some.
+    snippet_fetch_budget: Duration,
     cache: Mutex<HashMap<PrKey, CacheSlot>>,
     /// Detached work after a response (see [`PrService::set_viewed`]), awaited on shutdown.
     bookkeeping: Mutex<tokio::task::JoinSet<()>>,
@@ -188,6 +192,7 @@ impl PrService {
             slow_parses: Default::default(),
             snippet_fetches: Default::default(),
             snippet_fetch_wait: nav::SNIPPET_FETCH_WAIT,
+            snippet_fetch_budget: nav::FETCH_RETRY_BUDGET,
             cache: Default::default(),
             bookkeeping: Default::default(),
             review_writes: Default::default(),

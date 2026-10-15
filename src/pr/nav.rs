@@ -2,11 +2,15 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
 
 use crate::error::AppError;
 use crate::git::parse::refused_oids;
@@ -119,9 +123,10 @@ const SLOW_PARSES_KEPT: usize = 256;
 /// When the parse of a blob under a grammar last timed out.
 pub(super) type SlowParses = Mutex<HashMap<(String, Grammar), Instant>>;
 
-/// How long a lookup waits for the blobs it fetches for the lines of its references. The fetch goes on in a task of its
-/// own after that, for a later lookup to find the blobs there, and the lookup answers without the lines it lacks: the
-/// repo lock, which a fetch needs, may be held for long by a build or a pull request that is loading.
+/// How long a lookup waits for the blobs it fetches for the lines of its references, or that the task of another lookup
+/// fetches. The fetch goes on in a task of its own after that, for a later lookup to find the blobs there, and the lookup
+/// answers without the lines it lacks: the repo lock, which a fetch needs, may be held for long by a build or a pull
+/// request that is loading.
 pub(super) const SNIPPET_FETCH_WAIT: Duration = Duration::from_secs(5);
 
 /// How long a blob whose fetch failed is not asked for again by a lookup. A remote that cannot be reached, or does not
@@ -131,28 +136,57 @@ const FETCH_FAILURE_TTL: Duration = Duration::from_secs(120);
 /// How many such blobs are remembered at most; the oldest are forgotten first.
 const FETCH_FAILURES_KEPT: usize = 4096;
 
-/// How many times the task of a lookup asks the remote when it refuses some of the blobs. A remote that speaks protocol
-/// v2 names the first blob it refuses and stops there, so the blobs it names are noted, and the others asked for again.
-const FETCH_ATTEMPTS: usize = 3;
+/// How long the task of a lookup goes on asking the remote for the blobs it does not refuse, once it has refused some. A
+/// remote names the first blob it refuses and stops there, so the blobs it names are noted and the others asked for
+/// again, and every ask costs a round trip while the task holds the repo lock. The task asks again as long as the last
+/// ask gave up a blob and this much time has not passed since the first; the blobs it has not asked for by then are
+/// given back, for a later lookup.
+pub(super) const FETCH_RETRY_BUDGET: Duration = Duration::from_secs(10);
 
 /// What the fetch of a blob for the lines of references has come to.
 enum Fetch {
-    /// A task fetches the blob, or waits for the repo lock to.
-    InFlight,
+    /// A task fetches the blob, or waits for the repo lock to. The lookups that want the blob wait for its flight.
+    InFlight(Arc<Flight>),
     /// The fetch failed at that time.
     Failed(Instant),
 }
 
+/// The fetch of a task, as the lookups that want its blobs see it: they wait for it to end, and take the blobs it fetched.
+struct Flight {
+    /// Holds the blobs the task fetched, once it has fetched them. The channel closes when the claim of the task ends,
+    /// which lets go of the lookups that wait when the task fetched nothing, whatever the reason.
+    done: watch::Receiver<Option<Vec<String>>>,
+}
+
+impl Flight {
+    /// Waits until the task tells which blobs it fetched, or its claim ends, and returns the blobs it fetched: none when
+    /// it fetched none. A lookup that comes after the task has told gets them at once, whether or not the claim has ended
+    /// since.
+    async fn fetched(&self) -> Vec<String> {
+        let mut done = self.done.clone();
+        match done.wait_for(Option::is_some).await {
+            Ok(fetched) => fetched.clone().unwrap_or_default(),
+            Err(_) => Vec::new(),
+        }
+    }
+}
+
 /// The blobs of the cache repos (by git dir) that tasks fetch for the lines of references, and those whose fetch failed
-/// lately. A blob is fetched by one task at a time, so lookups that want the same blobs do not queue a fetch each for the
-/// repo lock, which a build or a pull request that is loading may hold for long, ahead of the loads that come after.
-/// Shared with the tasks, which outlive the lookups that start them.
+/// lately. A blob is fetched by one task at a time: a lookup that wants a blob that a task has in flight waits for that
+/// fetch, and queues none of its own for the repo lock, which a build or a pull request that is loading may hold for
+/// long, ahead of the loads that come after. Shared with the tasks, which outlive the lookups that start them.
 #[derive(Clone, Default)]
 pub(super) struct SnippetFetches {
     blobs: Arc<Mutex<HashMap<(PathBuf, String), Fetch>>>,
     /// Set when the service shuts down (see [`PrService::drain`]): the tasks that have waited for the repo lock then
-    /// leave it without fetching.
+    /// leave it without fetching, and none starts.
     shut_down: Arc<AtomicBool>,
+    /// How many tasks lookups have spawned (tests tell by it whether a lookup queued a fetch).
+    #[cfg(test)]
+    spawned: Arc<AtomicUsize>,
+    /// How many fetches under way lookups have begun to wait for (tests tell by it that a lookup waits).
+    #[cfg(test)]
+    awaited: Arc<AtomicUsize>,
 }
 
 impl SnippetFetches {
@@ -163,8 +197,12 @@ impl SnippetFetches {
     }
 
     /// Claims the blobs among `oids` of the repo at `git_dir` for a task to fetch: those that no task fetches and whose
-    /// fetch did not fail less than `FETCH_FAILURE_TTL` before `now`.
+    /// fetch did not fail less than `FETCH_FAILURE_TTL` before `now`. The flights of the tasks that fetch the others are
+    /// left to the claim, once each, for the lookup to wait for.
     fn claim(&self, git_dir: &Path, oids: Vec<String>, now: Instant) -> Claim {
+        let (done, receiver) = watch::channel(None);
+        let flight = Arc::new(Flight { done: receiver });
+        let mut under_way: Vec<Arc<Flight>> = Vec::new();
         let mut blobs = self.lock();
         let oids = oids
             .into_iter()
@@ -172,13 +210,21 @@ impl SnippetFetches {
                 let key = (git_dir.to_path_buf(), oid.clone());
                 let free = match blobs.get(&key) {
                     None => true,
-                    Some(Fetch::InFlight) => false,
+                    Some(Fetch::InFlight(other)) => {
+                        // The claim does not wait for itself: a blob that is repeated is in flight with it after its
+                        // first occurrence.
+                        let seen = |known: &Arc<Flight>| Arc::ptr_eq(known, other);
+                        if !seen(&flight) && !under_way.iter().any(seen) {
+                            under_way.push(other.clone());
+                        }
+                        false
+                    }
                     Some(&Fetch::Failed(at)) => {
                         now.saturating_duration_since(at) >= FETCH_FAILURE_TTL
                     }
                 };
                 if free {
-                    blobs.insert(key, Fetch::InFlight);
+                    blobs.insert(key, Fetch::InFlight(flight.clone()));
                 }
                 free
             })
@@ -187,6 +233,9 @@ impl SnippetFetches {
             fetches: self.clone(),
             git_dir: git_dir.to_path_buf(),
             oids,
+            flight,
+            done,
+            under_way,
         }
     }
 
@@ -196,7 +245,7 @@ impl SnippetFetches {
     fn note(&self, git_dir: &Path, oids: &[String], now: Instant) {
         let mut blobs = self.lock();
         blobs.retain(|_, fetch| match fetch {
-            Fetch::InFlight => true,
+            Fetch::InFlight(_) => true,
             Fetch::Failed(at) => now.saturating_duration_since(*at) < FETCH_FAILURE_TTL,
         });
         for oid in oids {
@@ -211,7 +260,7 @@ impl SnippetFetches {
                 .iter()
                 .filter_map(|(key, fetch)| match fetch {
                     Fetch::Failed(at) => Some((*at, key.clone())),
-                    Fetch::InFlight => None,
+                    Fetch::InFlight(_) => None,
                 })
                 .collect();
             by_age.sort();
@@ -232,19 +281,37 @@ impl SnippetFetches {
 }
 
 /// The blobs that one task fetches. Dropping the claim, whichever way the task ends (a lookup that is dropped before
-/// it spawned the task, a panic, no repo lock to be had), gives back the ones it still holds.
+/// it spawned the task, a panic, no repo lock to be had), gives back the ones it still holds, and lets go of the lookups
+/// that wait for the task.
 struct Claim {
     fetches: SnippetFetches,
     git_dir: PathBuf,
     /// The blobs that the task has not given up.
     oids: Vec<String>,
+    /// The flight of the task, which the entries of its blobs hold.
+    flight: Arc<Flight>,
+    /// Tells the flight which blobs the task fetched.
+    done: watch::Sender<Option<Vec<String>>>,
+    /// The flights of the tasks that fetch the other blobs the lookup of the claim asked for, once each.
+    under_way: Vec<Arc<Flight>>,
 }
 
 impl Claim {
-    /// Gives up the blobs among `failed`, and notes that their fetch failed at `now`.
-    fn fail(&mut self, failed: &[String], now: Instant) {
-        self.oids.retain(|oid| !failed.contains(oid));
-        self.fetches.note(&self.git_dir, failed, now);
+    /// Gives up the blobs among `failed` that the claim holds, and notes that their fetch failed at `now`. Returns how
+    /// many it gave up.
+    fn fail(&mut self, failed: &[String], now: Instant) -> usize {
+        let (given_up, kept): (Vec<String>, Vec<String>) = std::mem::take(&mut self.oids)
+            .into_iter()
+            .partition(|oid| failed.contains(oid));
+        self.oids = kept;
+        self.fetches.note(&self.git_dir, &given_up, now);
+        given_up.len()
+    }
+
+    /// Tells the lookups that wait for the task that it has fetched the blobs it holds, and returns them.
+    fn finish(&self) -> Vec<String> {
+        self.done.send_replace(Some(self.oids.clone()));
+        self.oids.clone()
     }
 }
 
@@ -252,7 +319,15 @@ impl Drop for Claim {
     fn drop(&mut self) {
         let mut blobs = self.fetches.lock();
         for oid in &self.oids {
-            blobs.remove(&(self.git_dir.clone(), oid.clone()));
+            // What is no longer the claim's own stays: a note of a failed fetch, or the blob in flight with another task.
+            let key = (self.git_dir.clone(), oid.clone());
+            let own = match blobs.get(&key) {
+                Some(Fetch::InFlight(flight)) => Arc::ptr_eq(flight, &self.flight),
+                _ => false,
+            };
+            if own {
+                blobs.remove(&key);
+            }
         }
     }
 }
@@ -645,8 +720,8 @@ impl PrService {
         if !lacking.is_empty() {
             // A git fetch of blobs by their OIDs gives all it asks for or fails, so the blobs a task reports it fetched
             // are local and need no second listing of the objects the repo lacks (a build lists them again, since it goes
-            // on after a fetch of blobs that failed). The others stay missing: those no task fetched for this lookup,
-            // because another one has them in flight or their fetch failed lately, and those that did not come in time.
+            // on after a fetch of blobs that failed). The others stay missing: those whose fetch failed lately, and those
+            // that did not come in time, whether a task of this lookup or of another one fetches them.
             for oid in self.fetch_for_snippets(key, lacking).await {
                 missing.remove(&oid);
             }
@@ -712,21 +787,72 @@ impl PrService {
         Ok(hits)
     }
 
-    /// Fetches blobs the cache repo lacks, for the snippets of a lookup, and returns those it fetched in time. It is best
-    /// effort: a lookup without lines is better than none, so no token, a remote that cannot be reached or one that does
-    /// not give the blobs only costs the lines (and is told on stderr), and so does a blob whose fetch failed lately (see
-    /// `FETCH_FAILURE_TTL`) or that another lookup is fetching: one task fetches a blob at a time, and the lookups that
-    /// come meanwhile answer without its lines. The lookup waits `snippet_fetch_wait` at most: the fetch is made by a
-    /// task of its own, which goes on after that, so that a later lookup finds the blobs. It needs the repo lock, which a
-    /// build or a pull request that is loading may hold for long, and gives up on a transfer that stays under 1 kB/s for
-    /// `STALL_INDEX`.
+    /// Fetches blobs the cache repo lacks, for the snippets of a lookup, and returns those that came in time (the blobs
+    /// that the tasks it waited for fetched, which may include others than it asked for). It is best effort: a lookup
+    /// without lines is better than none, so no token, a remote that cannot be reached or one that does not give the
+    /// blobs only costs the lines (and is told on stderr), and so does a blob whose fetch failed lately (see
+    /// `FETCH_FAILURE_TTL`). One task fetches a blob at a time: a task of this lookup fetches the blobs that no task has
+    /// in flight, and for the others the lookup waits for the task that has them, which the client may have given up on
+    /// when it asked again. The lookup waits `snippet_fetch_wait` at most, for all the tasks together: they go on after
+    /// that, so that a later lookup finds the blobs. They need the repo lock, which a build or a pull request that is
+    /// loading may hold for long, and give up on a transfer that stays under 1 kB/s for `STALL_INDEX`.
+    ///
+    /// A window is left open: the entries of a task go when its claim ends, so a lookup that listed the blobs the repo
+    /// lacks just before the task fetched them claims them again, and its task finds them local. That costs one git fetch
+    /// queued for the repo lock that transfers nothing (git starts no upload-pack for objects it has), and ends with the
+    /// blobs reported as fetched, which they are.
     async fn fetch_for_snippets(&self, key: &PrKey, oids: Vec<String>) -> Vec<String> {
         let repo = self.repos.repo(&key.host, &key.owner, &key.repo);
-        let claim = self
+        let mut claim = self
             .snippet_fetches
             .claim(&repo.git_dir, oids, Instant::now());
+        let under_way = std::mem::take(&mut claim.under_way);
+        let task = self.spawn_fetch(key, repo, claim).await;
+        #[cfg(test)]
+        self.snippet_fetches
+            .awaited
+            .fetch_add(under_way.len(), Ordering::SeqCst);
+        let deadline = tokio::time::Instant::now() + self.snippet_fetch_wait;
+        let mut fetched = Vec::new();
+        let mut in_time = true;
+        if let Some(task) = task {
+            match tokio::time::timeout_at(deadline, task).await {
+                Ok(Ok(done)) => fetched = done,
+                Ok(Err(e)) => {
+                    eprintln!(
+                        "gh-tideline: the fetch of the blobs for the snippets of references failed: {e}"
+                    );
+                }
+                Err(_) => in_time = false,
+            }
+        }
+        // The tasks run on their own, so that waiting for them one after the other under one deadline takes as long as
+        // waiting for all of them at once.
+        for flight in under_way {
+            match tokio::time::timeout_at(deadline, flight.fetched()).await {
+                Ok(done) => fetched.extend(done),
+                Err(_) => in_time = false,
+            }
+        }
+        if !in_time {
+            eprintln!(
+                "gh-tideline: the blobs for the snippets of references did not come within {:?}; the lookup answers without their lines",
+                self.snippet_fetch_wait
+            );
+        }
+        fetched
+    }
+
+    /// Spawns the task that fetches the blobs of `claim`. None, with the claim given back, when it holds none, the
+    /// viewer has no token (told on stderr) or the service is shutting down.
+    async fn spawn_fetch(
+        &self,
+        key: &PrKey,
+        repo: Repo,
+        claim: Claim,
+    ) -> Option<JoinHandle<Vec<String>>> {
         if claim.oids.is_empty() {
-            return Vec::new();
+            return None;
         }
         let token = match self.tokens.get(&key.host).await {
             Ok(token) => token,
@@ -734,38 +860,40 @@ impl PrService {
                 eprintln!(
                     "gh-tideline: no token to fetch the blobs for the snippets of references: {e}"
                 );
-                return Vec::new();
+                return None;
             }
         };
+        // The task would find the service shutting down as well, once it had the repo lock (see `fetch_under_lock`).
+        if self.snippet_fetches.is_shut_down() {
+            return None;
+        }
         let auth = GitAuth {
             host: key.host.clone(),
             token,
         };
-        let task = tokio::spawn(fetch_under_lock(repo, auth, claim));
-        match tokio::time::timeout(self.snippet_fetch_wait, task).await {
-            Ok(Ok(fetched)) => fetched,
-            Ok(Err(e)) => {
-                eprintln!(
-                    "gh-tideline: the fetch of the blobs for the snippets of references failed: {e}"
-                );
-                Vec::new()
-            }
-            Err(_) => {
-                eprintln!(
-                    "gh-tideline: the blobs for the snippets of references did not come within {:?}; the lookup answers without their lines",
-                    self.snippet_fetch_wait
-                );
-                Vec::new()
-            }
-        }
+        #[cfg(test)]
+        self.snippet_fetches.spawned.fetch_add(1, Ordering::SeqCst);
+        Some(tokio::spawn(fetch_under_lock(
+            repo,
+            auth,
+            claim,
+            self.snippet_fetch_budget,
+        )))
     }
 }
 
 /// The task that fetches the blobs of a claim for `PrService::fetch_for_snippets`, and returns the ones it fetched. It
 /// owns the repo lock, so that a lookup that is dropped, or has stopped waiting, does not leave git running without it.
-/// When the fetch fails, the blobs that the remote names as refused are noted, and the others are asked for again; if it
-/// names none, they are all noted. The claim gives back the blobs that are not noted when the task ends.
-async fn fetch_under_lock(repo: Repo, auth: GitAuth, mut claim: Claim) -> Vec<String> {
+/// When the fetch fails, the blobs that the remote names as refused are noted, and the others are asked for again for as
+/// long as the last ask gave up a blob and `budget` has not passed since the first one (a remote names the first blob it
+/// refuses and stops there, so with several of them the others come last); if it names none, they are all noted. The
+/// claim gives back the blobs that are not noted when the task ends.
+async fn fetch_under_lock(
+    repo: Repo,
+    auth: GitAuth,
+    mut claim: Claim,
+    budget: Duration,
+) -> Vec<String> {
     let guard = match repo.lock().await {
         Ok(guard) => guard,
         Err(e) => {
@@ -775,38 +903,33 @@ async fn fetch_under_lock(repo: Repo, auth: GitAuth, mut claim: Claim) -> Vec<St
             return Vec::new();
         }
     };
-    // The lock may have been held for a long time, by a build or a pull request that was loading, and the service may
-    // be shutting down by now: like a chunk of a build (see `Build::fetch_chunk`), the task does not start git then.
-    if claim.fetches.is_shut_down() {
-        return Vec::new();
-    }
-    for _ in 0..FETCH_ATTEMPTS {
+    let began = Instant::now();
+    loop {
+        // The lock may have been held for a long time, by a build or a pull request that was loading, and the service
+        // may be shutting down by now: like a chunk of a build (see `Build::fetch_chunk`), the task does not start git
+        // then. It looks again before each ask that follows a refusal, of which there may be many.
+        if claim.fetches.is_shut_down() {
+            return Vec::new();
+        }
         let failure = match repo
             .fetch_blobs(&guard, &auth, &claim.oids, STALL_INDEX)
             .await
         {
-            Ok(()) => return claim.oids.clone(),
+            Ok(()) => return claim.finish(),
             Err(failure) => failure,
         };
         eprintln!(
             "gh-tideline: fetching the blobs for the snippets of references failed: {failure}"
         );
-        let refused: Vec<String> = refused_oids(&failure.stderr)
-            .into_iter()
-            .filter(|oid| claim.oids.contains(oid))
-            .collect();
-        // A remote that does not say which blobs it refuses gives no blob that is known to be fine.
-        let failed = if refused.is_empty() {
-            claim.oids.clone()
-        } else {
-            refused
-        };
-        claim.fail(&failed, Instant::now());
-        if claim.oids.is_empty() {
+        if claim.fail(&refused_oids(&failure.stderr), Instant::now()) == 0 {
+            // A remote that does not say which blobs it refuses gives no blob that is known to be fine.
+            let all = claim.oids.clone();
+            claim.fail(&all, Instant::now());
+        }
+        if claim.oids.is_empty() || began.elapsed() >= budget {
             return Vec::new();
         }
     }
-    Vec::new()
 }
 
 #[cfg(test)]
@@ -2251,9 +2374,41 @@ pub fn twice() {
         let blobs = fetches.lock();
         let in_flight = blobs
             .values()
-            .filter(|fetch| matches!(fetch, Fetch::InFlight))
+            .filter(|fetch| matches!(fetch, Fetch::InFlight(_)))
             .count();
         (in_flight, blobs.len() - in_flight)
+    }
+
+    /// How many tasks lookups have spawned to fetch blobs.
+    fn spawned(fetches: &SnippetFetches) -> usize {
+        fetches.spawned.load(Ordering::SeqCst)
+    }
+
+    /// How many fetches under way lookups have begun to wait for.
+    fn awaited(fetches: &SnippetFetches) -> usize {
+        fetches.awaited.load(Ordering::SeqCst)
+    }
+
+    /// Waits until `reached` holds. A test that never gets there fails, it does not hang.
+    async fn until(what: &str, reached: impl Fn() -> bool) {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while !reached() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{what} did not happen"));
+    }
+
+    /// Removes the blob `oid`, a loose object, from the source repo of `p`, which then refuses a fetch that asks for it.
+    /// Returns where the object was and its bytes, to put it back.
+    fn lose_blob(p: &Pull, oid: &str) -> (PathBuf, Vec<u8>) {
+        let loose = (p.clone.origin.join(".git/objects"))
+            .join(&oid[..2])
+            .join(&oid[2..]);
+        let lost = std::fs::read(&loose).unwrap();
+        std::fs::remove_file(&loose).unwrap();
+        (loose, lost)
     }
 
     #[tokio::test]
@@ -2376,7 +2531,7 @@ pub fn twice() {
         assert_eq!(fetches.claim(repo, vec![oid(3)], now).oids, [oid(3)]);
 
         // A blob the task gave up because its fetch failed is a note, and stays one when the claim ends.
-        first.fail(&[oid(1)], now);
+        assert_eq!(first.fail(&[oid(1)], now), 1);
         assert_eq!(first.oids, [oid(2)]);
         assert_eq!(in_flight_and_failed(&fetches), (2, 1));
         drop(first);
@@ -2423,6 +2578,138 @@ pub fn twice() {
         );
     }
 
+    #[test]
+    fn a_claim_leaves_the_flights_of_the_tasks_that_have_the_other_blobs_to_wait_for() {
+        let fetches = SnippetFetches::default();
+        let (repo, other) = (Path::new("/cache/a.git"), Path::new("/cache/b.git"));
+        let oid = |n: usize| format!("{n:040x}");
+        let now = Instant::now();
+
+        // A blob that is repeated is claimed once, and a claim does not wait for itself.
+        let first = fetches.claim(repo, vec![oid(1), oid(2), oid(1)], now);
+        assert_eq!(first.oids, [oid(1), oid(2)]);
+        assert!(first.under_way.is_empty());
+        // The task that has two of the blobs is waited for once.
+        let second = fetches.claim(repo, vec![oid(3), oid(1), oid(2), oid(3), oid(1)], now);
+        assert_eq!(second.oids, [oid(3)]);
+        assert_eq!(second.under_way.len(), 1);
+        assert!(Arc::ptr_eq(&second.under_way[0], &first.flight));
+        // So are the tasks that have the others, once each, in the order the blobs come.
+        let third = fetches.claim(repo, vec![oid(3), oid(2), oid(4), oid(3), oid(1)], now);
+        assert_eq!(third.oids, [oid(4)]);
+        assert_eq!(third.under_way.len(), 2);
+        assert!(Arc::ptr_eq(&third.under_way[0], &second.flight));
+        assert!(Arc::ptr_eq(&third.under_way[1], &first.flight));
+
+        // No task fetches a blob whose fetch failed, so there is nothing to wait for; and the same blob of another repo is
+        // another blob.
+        fetches.note(repo, &[oid(5)], now);
+        let failed = fetches.claim(repo, vec![oid(5)], now);
+        assert!(failed.oids.is_empty() && failed.under_way.is_empty());
+        let elsewhere = fetches.claim(other, vec![oid(1)], now);
+        assert_eq!(elsewhere.oids, [oid(1)]);
+        assert!(elsewhere.under_way.is_empty());
+    }
+
+    /// What the flight gives, if it ends within `wait`.
+    async fn fetched_within(
+        flight: Arc<Flight>,
+        wait: Duration,
+    ) -> Result<Vec<String>, tokio::time::error::Elapsed> {
+        tokio::time::timeout(wait, flight.fetched()).await
+    }
+
+    #[tokio::test]
+    async fn a_flight_ends_with_the_blobs_its_task_fetched_or_with_none() {
+        let fetches = SnippetFetches::default();
+        let repo = Path::new("/cache/a.git");
+        let oid = |n: usize| format!("{n:040x}");
+        let now = Instant::now();
+        let (patience, moment) = (Duration::from_secs(60), Duration::from_millis(50));
+
+        // The lookup that wants blob 2 gets the flight of the task that has blobs 1 and 2.
+        let task = fetches.claim(repo, vec![oid(1), oid(2)], now);
+        let flight = fetches.claim(repo, vec![oid(2)], now).under_way.remove(0);
+        // The task has not ended, and the lookup waits.
+        assert!(fetched_within(flight.clone(), moment).await.is_err());
+        let waiting = tokio::spawn(fetched_within(flight.clone(), patience));
+        tokio::task::yield_now().await;
+        // The lookup is woken when the task tells which blobs it fetched, and gets all of them, not only blob 2.
+        assert_eq!(task.finish(), [oid(1), oid(2)]);
+        assert_eq!(
+            waiting.await.unwrap().expect("the flight ended"),
+            [oid(1), oid(2)]
+        );
+        // The task is told for good: a lookup that finds the flight when the claim has ended gets the blobs at once.
+        drop(task);
+        assert_eq!(
+            fetched_within(flight, patience)
+                .await
+                .expect("the flight ended"),
+            [oid(1), oid(2)]
+        );
+
+        // A task that fetched nothing ends its claim without a word, which lets go of the lookups that wait for it.
+        let task = fetches.claim(repo, vec![oid(3)], now);
+        let flight = fetches.claim(repo, vec![oid(3)], now).under_way.remove(0);
+        let waiting = tokio::spawn(fetched_within(flight.clone(), patience));
+        tokio::task::yield_now().await;
+        drop(task);
+        assert!(waiting.await.unwrap().expect("the flight ended").is_empty());
+        assert!(
+            fetched_within(flight, patience)
+                .await
+                .expect("the flight ended")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_claim_that_gives_up_blobs_notes_only_those_it_holds() {
+        let fetches = SnippetFetches::default();
+        let repo = Path::new("/cache/a.git");
+        let oid = |n: usize| format!("{n:040x}");
+        let now = Instant::now();
+
+        let mut claim = fetches.claim(repo, vec![oid(1), oid(2), oid(3)], now);
+        // Blob 4 is none of the claim's, and blob 2 is named twice: one blob is given up, and it is the one noted.
+        assert_eq!(claim.fail(&[oid(2), oid(4), oid(2)], now), 1);
+        assert_eq!(claim.oids, [oid(1), oid(3)]);
+        assert_eq!(in_flight_and_failed(&fetches), (2, 1));
+        assert_eq!(fetches.claim(repo, vec![oid(4)], now).oids, [oid(4)]);
+        // A blob that is given up is not the claim's any more.
+        assert_eq!(claim.fail(&[oid(2), oid(4)], now), 0);
+        assert_eq!(in_flight_and_failed(&fetches), (2, 1));
+    }
+
+    #[test]
+    fn a_claim_that_ends_leaves_the_entries_that_are_no_longer_its_own() {
+        let fetches = SnippetFetches::default();
+        let repo = Path::new("/cache/a.git");
+        let oid = |n: usize| format!("{n:040x}");
+        let now = Instant::now();
+
+        // The note of a failed fetch stays when the claim that held the blob ends.
+        let claim = fetches.claim(repo, vec![oid(1), oid(2)], now);
+        fetches.note(repo, &[oid(1)], now);
+        drop(claim);
+        assert_eq!(in_flight_and_failed(&fetches), (0, 1));
+
+        // So does the blob that another task has in flight, when the note has expired and that task claimed it.
+        let later = now + FETCH_FAILURE_TTL;
+        let old = fetches.claim(repo, vec![oid(3)], now);
+        fetches.note(repo, &[oid(3)], now);
+        let new = fetches.claim(repo, vec![oid(3)], later);
+        assert_eq!(new.oids, [oid(3)]);
+        drop(old);
+        assert_eq!(in_flight_and_failed(&fetches), (1, 1));
+        let waiting = fetches.claim(repo, vec![oid(3)], later);
+        assert!(waiting.oids.is_empty());
+        assert!(Arc::ptr_eq(&waiting.under_way[0], &new.flight));
+        drop(new);
+        assert_eq!(in_flight_and_failed(&fetches), (0, 1));
+    }
+
     #[tokio::test]
     async fn a_lookup_does_not_wait_longer_than_a_moment_for_the_blobs_it_fetches() {
         let sources = TARGET_SOURCES;
@@ -2467,32 +2754,33 @@ pub fn twice() {
         let files = stored_by_another_clone(&p, &sources).await;
         p.db.save_commit(&head, &files).unwrap();
         Arc::get_mut(&mut p.service).unwrap().snippet_fetch_wait = Duration::from_millis(100);
-        let tasks = || {
-            tokio::runtime::Handle::current()
-                .metrics()
-                .num_alive_tasks()
-        };
         let fetches = &p.service.snippet_fetches;
 
         // A pull request that is loading holds the repo, and the fetch of the first lookup waits for it. The lookup
         // stops waiting for it: the task that fetches is alive and queued for the lock.
         let repo = p.service.repos.repo("github.com", "o", "r");
         let guard = repo.lock().await.unwrap();
-        let idle = tasks();
         let got = p.references(Side::Head, "a.rs", "target").await.unwrap();
         assert_eq!(got.hits, target_hits(false));
-        assert_eq!(tasks(), idle + 1);
+        assert_eq!(spawned(fetches), 1);
+        assert_eq!(awaited(fetches), 0);
         assert_eq!(in_flight_and_failed(fetches), (2, 0));
 
-        // The lookups that come meanwhile find the blobs in flight, and answer without their lines at once. They queue
-        // no fetch of their own, which would wait for the same lock ahead of the loads that come after.
-        let (second, third) = tokio::join!(
-            p.references(Side::Head, "a.rs", "target"),
-            p.references(Side::Head, "a.rs", "target"),
-        );
+        // The lookups that come meanwhile find the blobs in flight, and wait for that fetch for as long as they can,
+        // which is not until the repo is free. They queue no fetch of their own, which would wait for the same lock ahead
+        // of the loads that come after.
+        let (second, third) = tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::join!(
+                p.references(Side::Head, "a.rs", "target"),
+                p.references(Side::Head, "a.rs", "target"),
+            )
+        })
+        .await
+        .expect("the lookups waited for the repo");
         assert_eq!(second.unwrap().hits, target_hits(false));
         assert_eq!(third.unwrap().hits, target_hits(false));
-        assert_eq!(tasks(), idle + 1);
+        assert_eq!(spawned(fetches), 1);
+        assert_eq!(awaited(fetches), 2);
         assert_eq!(in_flight_and_failed(fetches), (2, 0));
 
         // The one fetch gets both blobs when the repo is free, and the blobs are not in flight any more.
@@ -2500,10 +2788,200 @@ pub fn twice() {
         drop(repo.lock().await.unwrap());
         let after = p.clone.repo.missing_objects(&head).await.unwrap();
         assert!(files.iter().all(|(_, oid, _)| !after.contains(oid)));
-        assert_eq!(tasks(), idle);
+        assert_eq!(spawned(fetches), 1);
         assert_eq!(in_flight_and_failed(fetches), (0, 0));
         let got = p.references(Side::Head, "a.rs", "target").await.unwrap();
         assert_eq!(got.hits, target_hits(true));
+        assert_eq!(spawned(fetches), 1);
+    }
+
+    #[tokio::test]
+    async fn a_lookup_waits_for_the_fetch_of_a_lookup_that_the_client_gave_up_on() {
+        let sources = TARGET_SOURCES;
+        let p = Pull::with_files(
+            "nav-fetch-awaited",
+            &[("old.rs", "fn old() {}\n")],
+            &sources,
+        )
+        .await;
+        let head = p.clone.head.clone();
+        let files = stored_by_another_clone(&p, &sources).await;
+        p.db.save_commit(&head, &files).unwrap();
+        let fetches = &p.service.snippet_fetches;
+
+        // A pull request that is loading holds the repo, and the fetch of the first lookup waits for it. The client
+        // asks again, which makes it give up on the first request: the lookup is dropped, and its task goes on.
+        let repo = p.service.repos.repo("github.com", "o", "r");
+        let guard = repo.lock().await.unwrap();
+        {
+            let mut first = Box::pin(p.references(Side::Head, "a.rs", "target"));
+            tokio::select! {
+                _ = &mut first => panic!("the first lookup ended before its fetch was queued"),
+                _ = until("the fetch of the first lookup", || spawned(fetches) == 1) => {}
+            }
+        }
+        assert_eq!(in_flight_and_failed(fetches), (2, 0));
+
+        // The second lookup finds the blobs in flight, and waits for that fetch: it queues none of its own, and has the
+        // lines when the repo is free and the task has fetched the blobs.
+        let second = p.references(Side::Head, "a.rs", "target");
+        let release = async {
+            until("the second lookup waiting for the fetch", || {
+                awaited(fetches) == 1
+            })
+            .await;
+            drop(guard);
+        };
+        let (got, ()) = tokio::join!(second, release);
+        assert_eq!(got.unwrap().hits, target_hits(true));
+        assert_eq!(spawned(fetches), 1);
+        drop(repo.lock().await.unwrap());
+        assert_eq!(in_flight_and_failed(fetches), (0, 0));
+        let after = p.clone.repo.missing_objects(&head).await.unwrap();
+        assert!(files.iter().all(|(_, oid, _)| !after.contains(oid)));
+    }
+
+    #[tokio::test]
+    async fn a_lookup_takes_the_blobs_of_its_own_task_and_of_the_task_it_waits_for() {
+        let sources = TARGET_SOURCES;
+        let p = Pull::with_files("nav-fetch-union", &[("old.rs", "fn old() {}\n")], &sources).await;
+        let head = p.clone.head.clone();
+        let files = stored_by_another_clone(&p, &sources).await;
+        p.db.save_commit(&head, &files).unwrap();
+        let fetches = &p.service.snippet_fetches;
+
+        // A pull request that is loading holds the repo. The first lookup finds the blob of a.rs in flight with a claim
+        // that ends later, and its task fetches the blob of b.rs. The client gives up on the lookup, and the task goes on.
+        let repo = p.service.repos.repo("github.com", "o", "r");
+        let guard = repo.lock().await.unwrap();
+        let other = fetches.claim(
+            &p.clone.repo.git_dir,
+            vec![files[0].1.clone()],
+            Instant::now(),
+        );
+        {
+            let mut first = Box::pin(p.references(Side::Head, "a.rs", "target"));
+            tokio::select! {
+                _ = &mut first => panic!("the first lookup ended before its fetch was queued"),
+                _ = until("the fetch of the first lookup", || spawned(fetches) == 1) => {}
+            }
+        }
+        drop(other);
+        assert_eq!(in_flight_and_failed(fetches), (1, 0));
+
+        // The second lookup fetches the blob of a.rs in a task of its own, and waits for the task of the first one, which
+        // has the blob of b.rs: it has the lines of both when the repo is free.
+        let second = p.references(Side::Head, "a.rs", "target");
+        let release = async {
+            until("the second lookup waiting for the fetch", || {
+                awaited(fetches) == 2
+            })
+            .await;
+            drop(guard);
+        };
+        let (got, ()) = tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::join!(second, release)
+        })
+        .await
+        .expect("the second lookup got the blobs");
+        assert_eq!(got.unwrap().hits, target_hits(true));
+        assert_eq!(spawned(fetches), 2);
+        drop(repo.lock().await.unwrap());
+        assert_eq!(in_flight_and_failed(fetches), (0, 0));
+        let after = p.clone.repo.missing_objects(&head).await.unwrap();
+        assert!(files.iter().all(|(_, oid, _)| !after.contains(oid)));
+    }
+
+    #[tokio::test]
+    async fn a_lookup_waits_for_all_the_fetches_it_needs_no_longer_than_the_wait() {
+        let sources = TARGET_SOURCES;
+        let mut p = Pull::with_files(
+            "nav-fetch-one-deadline",
+            &[("old.rs", "fn old() {}\n")],
+            &sources,
+        )
+        .await;
+        let head = p.clone.head.clone();
+        let files = stored_by_another_clone(&p, &sources).await;
+        p.db.save_commit(&head, &files).unwrap();
+        let wait = Duration::from_millis(800);
+        Arc::get_mut(&mut p.service).unwrap().snippet_fetch_wait = wait;
+        let fetches = &p.service.snippet_fetches;
+
+        // The blob of b.rs is in flight with a task that does not end, and the repo is held, so the task of the lookup
+        // does not get the blob of a.rs either.
+        let other = fetches.claim(
+            &p.clone.repo.git_dir,
+            vec![files[1].1.clone()],
+            Instant::now(),
+        );
+        let repo = p.service.repos.repo("github.com", "o", "r");
+        let guard = repo.lock().await.unwrap();
+        let began = Instant::now();
+        let got = p.references(Side::Head, "a.rs", "target").await.unwrap();
+        let took = began.elapsed();
+        assert_eq!(got.hits, target_hits(false));
+        assert_eq!((spawned(fetches), awaited(fetches)), (1, 1));
+        // It waited for the one, and then the other had no wait left: a wait for each would take twice as long.
+        assert!(took >= wait, "the lookup waited {took:?} only");
+        assert!(took < 2 * wait, "the lookup waited {took:?}");
+
+        drop(other);
+        drop(guard);
+        drop(repo.lock().await.unwrap());
+        assert_eq!(in_flight_and_failed(fetches), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn a_lookup_that_waits_for_a_fetch_that_fails_answers_without_lines_at_once() {
+        let sources = TARGET_SOURCES;
+        let p = Pull::with_files(
+            "nav-fetch-awaited-fails",
+            &[("old.rs", "fn old() {}\n")],
+            &sources,
+        )
+        .await;
+        let head = p.clone.head.clone();
+        let files = stored_by_another_clone(&p, &sources).await;
+        p.db.save_commit(&head, &files).unwrap();
+        let before = p.clone.repo.missing_objects(&head).await.unwrap();
+        let fetches = &p.service.snippet_fetches;
+        let gone = format!("file://{}", p.clone.dir.join("gone").display());
+        git_in(
+            &p.clone.repo.git_dir,
+            &["config", "remote.origin.url", &gone],
+        )
+        .await;
+
+        let repo = p.service.repos.repo("github.com", "o", "r");
+        let guard = repo.lock().await.unwrap();
+        {
+            let mut first = Box::pin(p.references(Side::Head, "a.rs", "target"));
+            tokio::select! {
+                _ = &mut first => panic!("the first lookup ended before its fetch was queued"),
+                _ = until("the fetch of the first lookup", || spawned(fetches) == 1) => {}
+            }
+        }
+
+        // The remote cannot be reached, and the second lookup does not wait for the 60 s it could: the task ends, and the
+        // lookup is let go.
+        let second = p.references(Side::Head, "a.rs", "target");
+        let release = async {
+            until("the second lookup waiting for the fetch", || {
+                awaited(fetches) == 1
+            })
+            .await;
+            drop(guard);
+        };
+        let (got, ()) = tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::join!(second, release)
+        })
+        .await
+        .expect("the lookup was let go when the fetch failed");
+        assert_eq!(got.unwrap().hits, target_hits(false));
+        assert_eq!(spawned(fetches), 1);
+        assert_eq!(p.clone.repo.missing_objects(&head).await.unwrap(), before);
+        assert_eq!(in_flight_and_failed(fetches), (0, 2));
     }
 
     #[tokio::test]
@@ -2523,11 +3001,7 @@ pub fn twice() {
         let git_dir = &p.clone.repo.git_dir;
 
         // The source repo lost the blob of a.rs, a loose object, and says so when a fetch asks for it.
-        let loose = (p.clone.origin.join(".git/objects"))
-            .join(&a_rs[..2])
-            .join(&a_rs[2..]);
-        let lost = std::fs::read(&loose).unwrap();
-        std::fs::remove_file(&loose).unwrap();
+        let (loose, lost) = lose_blob(&p, &a_rs);
 
         // Only b.rs has its line: the fetch for both blobs fails, and the lookup does not give up on the other blob,
         // which it asks for again.
@@ -2555,6 +3029,141 @@ pub fn twice() {
         fetches.lock().clear();
         let got = p.references(Side::Head, "a.rs", "target").await.unwrap();
         assert_eq!(got.hits, target_hits(true));
+        assert_eq!(in_flight_and_failed(fetches), (0, 0));
+    }
+
+    /// Files whose head has `target` defined in the first and used in all of them. Their blobs differ.
+    const MANY_SOURCES: [(&str, &str); 5] = [
+        TARGET_SOURCES[0],
+        TARGET_SOURCES[1],
+        ("c.rs", "fn third() {\n    target();\n}\n"),
+        ("d.rs", "fn fourth() {\n    target();\n}\n"),
+        ("e.rs", "fn fifth() {\n    target();\n}\n"),
+    ];
+
+    /// The references to `target` in the files of `MANY_SOURCES`, with the line of each in the files `with_lines` and
+    /// without in the others.
+    fn many_hits(with_lines: &[&str]) -> Vec<NavHit> {
+        MANY_SOURCES
+            .iter()
+            .map(|&(path, _)| {
+                let (at, tier) = if path == "a.rs" {
+                    ((4, 5), "file")
+                } else {
+                    ((2, 5), "dir")
+                };
+                let line = if with_lines.contains(&path) {
+                    ("target();", 1)
+                } else {
+                    ("", 0)
+                };
+                hit("target", path, at, "call", line, tier)
+            })
+            .collect()
+    }
+
+    /// A pull request over `MANY_SOURCES` whose index holds the files, as a build in another clone left it, and whose
+    /// source repo has lost the blobs of a.rs, c.rs and e.rs: a fetch that asks for them is refused. Returns the OIDs
+    /// of the files, and of those blobs.
+    async fn pull_that_lost_three_blobs(name: &str) -> (Pull, Vec<String>, [String; 3]) {
+        let p = Pull::with_files(name, &[("old.rs", "fn old() {}\n")], &MANY_SOURCES).await;
+        let head = p.clone.head.clone();
+        let files = stored_by_another_clone(&p, &MANY_SOURCES).await;
+        p.db.save_commit(&head, &files).unwrap();
+        let oids: Vec<String> = files.into_iter().map(|(_, oid, _)| oid).collect();
+        let lost = [0, 2, 4].map(|n| oids[n].clone());
+        for oid in &lost {
+            lose_blob(&p, oid);
+        }
+        (p, oids, lost)
+    }
+
+    #[tokio::test]
+    async fn blobs_the_remote_refuses_one_after_the_other_do_not_keep_the_others_from_coming() {
+        let (p, _, lost) = pull_that_lost_three_blobs("nav-fetch-many-refused").await;
+        let head = p.clone.head.clone();
+        let fetches = &p.service.snippet_fetches;
+
+        // The remote names the first blob it refuses and stops there, so it takes a fourth ask, after three that gave up
+        // a blob each, to get the two blobs that it has.
+        let got = p.references(Side::Head, "a.rs", "target").await.unwrap();
+        assert_eq!(got.hits, many_hits(&["b.rs", "d.rs"]));
+        let after = p.clone.repo.missing_objects(&head).await.unwrap();
+        assert_eq!(after, HashSet::from(lost));
+        // The three blobs that were refused are noted, and no other.
+        assert_eq!(in_flight_and_failed(fetches), (0, 3));
+    }
+
+    #[tokio::test]
+    async fn a_task_that_has_no_time_to_ask_again_gives_back_the_blobs_it_did_not_ask_for() {
+        let (mut p, oids, _) = pull_that_lost_three_blobs("nav-fetch-out-of-time").await;
+        let head = p.clone.head.clone();
+        let before = p.clone.repo.missing_objects(&head).await.unwrap();
+        Arc::get_mut(&mut p.service).unwrap().snippet_fetch_budget = Duration::ZERO;
+        let fetches = &p.service.snippet_fetches;
+
+        // The first ask gave up a blob, and the time for a second one is up: no blob came.
+        let got = p.references(Side::Head, "a.rs", "target").await.unwrap();
+        assert_eq!(got.hits, many_hits(&[]));
+        assert_eq!(p.clone.repo.missing_objects(&head).await.unwrap(), before);
+        // Only the blob that the remote named is noted; the other four are free for a later lookup.
+        assert_eq!(in_flight_and_failed(fetches), (0, 1));
+        let claim = fetches.claim(&p.clone.repo.git_dir, oids, Instant::now());
+        assert_eq!(claim.oids.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn a_fetch_does_not_ask_again_once_the_service_shuts_down() {
+        let sources = TARGET_SOURCES;
+        let p = Pull::with_files(
+            "nav-fetch-shutdown-asking",
+            &[("old.rs", "fn old() {}\n")],
+            &sources,
+        )
+        .await;
+        let head = p.clone.head.clone();
+        let files = stored_by_another_clone(&p, &sources).await;
+        p.db.save_commit(&head, &files).unwrap();
+        // The first ask is refused for a.rs, and a second one would get b.rs.
+        lose_blob(&p, &files[0].1);
+        let before = p.clone.repo.missing_objects(&head).await.unwrap();
+        let gate = Gate::install(&p.clone).await;
+        let fetches = &p.service.snippet_fetches;
+
+        // The service shuts down while the first ask is under way.
+        let lookup = p.references(Side::Head, "a.rs", "target");
+        let shut_down = async {
+            gate.begun().await;
+            fetches.shut_down();
+            gate.open();
+        };
+        let (got, ()) = tokio::join!(lookup, shut_down);
+        assert_eq!(got.unwrap().hits, target_hits(false));
+        // The blob that was refused is noted. The task did not ask for the other, and gave it back.
+        assert_eq!(p.clone.repo.missing_objects(&head).await.unwrap(), before);
+        assert_eq!(in_flight_and_failed(fetches), (0, 1));
+    }
+
+    #[tokio::test]
+    async fn a_lookup_that_comes_after_the_service_shut_down_spawns_no_fetch() {
+        let sources = TARGET_SOURCES;
+        let p = Pull::with_files(
+            "nav-fetch-after-shutdown",
+            &[("old.rs", "fn old() {}\n")],
+            &sources,
+        )
+        .await;
+        let head = p.clone.head.clone();
+        let files = stored_by_another_clone(&p, &sources).await;
+        p.db.save_commit(&head, &files).unwrap();
+        let before = p.clone.repo.missing_objects(&head).await.unwrap();
+        let fetches = &p.service.snippet_fetches;
+
+        fetches.shut_down();
+        let got = p.references(Side::Head, "a.rs", "target").await.unwrap();
+        assert_eq!(got.hits, target_hits(false));
+        assert_eq!(spawned(fetches), 0);
+        assert_eq!(p.clone.repo.missing_objects(&head).await.unwrap(), before);
         assert_eq!(in_flight_and_failed(fetches), (0, 0));
     }
 

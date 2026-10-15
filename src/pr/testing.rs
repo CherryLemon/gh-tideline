@@ -106,8 +106,10 @@ impl Pull {
         let db = IndexDb::open(&clone.dir.join("index.sqlite")).unwrap();
         let mut service =
             PrService::new(Repos::new(clone.dir.join("repos")), None, Some(db.clone()));
-        // A fetch of a lookup takes what a loaded machine gives it; the test that watches the wait shortens it.
+        // A fetch of a lookup takes what a loaded machine gives it, and so does each ask of its task when the remote
+        // refuses blobs; the tests that watch the wait and the budget shorten them.
         service.snippet_fetch_wait = Duration::from_secs(60);
+        service.snippet_fetch_budget = Duration::from_secs(60);
         service.tokens.insert("github.com", "unused");
         let service = Arc::new(service);
         let key = PrKey {

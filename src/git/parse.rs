@@ -283,8 +283,13 @@ pub fn is_unfetched_object_error(stderr: &str) -> bool {
 }
 
 /// The objects that the stderr of a failed `git fetch` says the remote refuses to give, in the order it names them and
-/// without repeats: `fatal: remote error: upload-pack: not our ref <oid>` (protocol v2, which stops at the first object
-/// it refuses) or `error: Server does not allow request for unadvertised object <oid>` (protocol v0, a line for each).
+/// without repeats. Two messages name them. `fatal: remote error: upload-pack: not our ref <oid>` comes from a server
+/// that allows a request for an object that is no tip of its refs, which it does not have (protocol v2, or v0 against a
+/// server that allows any SHA-1 in a want, as GitHub's does): it stops at the first object it does not have, so the
+/// objects after that one in the request are neither refused nor known to be fine. `error: Server does not allow
+/// request for unadvertised object <oid>` comes from the client, against a v0 server that allows no request for an
+/// object that is no tip: a line for every object of the request, those the server has included, so that all are named,
+/// and none of them can be had from such a server.
 pub fn refused_oids(stderr: &str) -> Vec<String> {
     const MARKERS: [&str; 2] = [
         "not our ref ",
