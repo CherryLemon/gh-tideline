@@ -16,13 +16,13 @@ use crate::pr::review::{
 };
 use crate::state::PrKey;
 
-type PrPath = Path<(String, String, String, String)>;
+pub(super) type PrPath = Path<(String, String, String, String)>;
 /// A PR path plus a thread id.
 type ThreadPath = Path<(String, String, String, String, String)>;
 /// A PR path plus a thread id and one of its comments' ids.
 type CommentPath = Path<(String, String, String, String, String, String)>;
 
-fn pr_key(
+pub(super) fn pr_key(
     state: &Inner,
     (host, owner, repo, n): (String, String, String, String),
 ) -> Result<PrKey, AppError> {
@@ -60,7 +60,7 @@ pub(super) async fn markdown(
     Ok(Json(json!({ "html": html })).into_response())
 }
 
-fn parse_body<T: DeserializeOwned>(body: &Bytes) -> Result<T, AppError> {
+pub(super) fn parse_body<T: DeserializeOwned>(body: &Bytes) -> Result<T, AppError> {
     serde_json::from_slice(body)
         .map_err(|e| AppError::bad_request(format!("invalid request body: {e}")))
 }

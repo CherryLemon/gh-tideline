@@ -1,7 +1,7 @@
 # Tideline Design Document
 
-- Status: draft
-- Date: 2026-10-13
+- Status: draft, current through M3 (v0.4.0)
+- Date: 2026-10-15
 
 ## 1. Background and goals
 
@@ -28,16 +28,16 @@ The server handles git operations, GitHub API calls and building the symbol inde
 | **M0 read diffs** | After you enter a PR link: changed-files tree; full-file diff (side-by-side / unified); collapsed unchanged regions; syntax highlighting; word-level highlighting; ignore leading/trailing whitespace; F7 jumps to the next change, across files; generated files collapsed by default; side-by-side image comparison |
 | **M1 review context** | Viewed state synced both ways with GitHub; the full project tree |
 | **M2 review threads and writing** | Existing review threads in the diff (moved here from M1); comments on lines, line ranges and whole files, as a pending review or a single comment; replies, resolve / unresolve, editing and deleting your own comments; submitting a review (Comment / Approve / Request changes) with a summary; Markdown preview |
-| **M3 code navigation** | tree-sitter symbol index; go to definition (Ctrl+B / Ctrl+click); find usages by symbol name (Alt+F7); sticky header showing the current function or class; file outline; back / forward through visited locations (Ctrl+Alt+← / Ctrl+Alt+→), as in JetBrains |
+| **M3 code navigation** | tree-sitter symbol index, built on the first jump; go to definition (Ctrl+B / Ctrl+click); usages of a name from the name of a definition (the same keys, no hotkey of their own); sticky header showing the enclosing functions and classes; back / forward through visited locations (Ctrl+Alt+← / Ctrl+Alt+→), as in JetBrains |
 | **Later** | View a single commit or a commit range; "what changed since the last review" (handles rebases). Both were planned for M1 |
 
-Each milestone ships as a minor release: M0 is v0.1.0, M1 v0.2.0, M2 v0.3.0, and M3 is planned as v0.4.0.
+Each milestone ships as a minor release: M0 is v0.1.0, M1 v0.2.0, M2 v0.3.0 and M3 v0.4.0.
 
 ### Out of scope (through M3)
 
 - No writes beyond reviews: suggested changes (suggestion blocks), requesting reviewers, conversation comments outside a review, reactions, merging. Do these on the GitHub website.
 - No JetBrains-style curved connector bands. Monaco aligns the two sides by inserting blank lines. We accept that for this phase.
-- No LSP, and no three-way merge view.
+- No LSP, and no three-way merge view. Code navigation matches names; it does not resolve types.
 - Only GitHub and GitHub Enterprise; no other platforms. But all GitHub calls live in one module, so adding platforms later won't be too hard.
 - No AI summaries.
 
@@ -90,6 +90,8 @@ gh tideline                                          # opens the home page: rece
 - A toggle at the top switches to the full project tree: every file at the head, with the changed files (and deleted ones, at their old path) in place and marked by status.
   Only folders leading to changes start open. Clicking an unchanged file shows its head content read-only.
 
+**Status bar.** On the left, the position (Change i/n and File i/n); next to it "Looking up…" while a lookup of a name waits (M3, see 5.8). On the right, the shortcuts. Those that do not fit the width are left out whole, the last first, so that none is cut in half.
+
 **Only one file is shown at a time.** This matches JetBrains and differs from GitHub, which puts all files into one long page.
 The benefit: the editor needs only one instance, which mostly removes the performance problems of big PRs.
 
@@ -106,18 +108,19 @@ The defaults stay as close to JetBrains as possible, and they are configurable.
 | Ctrl+F | Search in the current file (built into Monaco) |
 | c (M2) | Comment on the current line, or on the selected lines. A selection that ends at column 1 leaves out its last line |
 | Ctrl+Enter (M2) | In a comment box: its main button (Start a review, Add review comment, Update comment). In the review dialog: Submit review |
-| Esc (M2) | In a comment box: close it, asking first if it holds unsent changes. In the review dialog: close it; the summary is kept |
-| Ctrl+B / Ctrl+click (M3) | Go to definition |
-| Alt+F7 (M3) | Find usages. On Linux, GNOME and KDE grab this key (to move windows), so Ctrl+Alt+F7 is also provided |
+| Esc (M2, M3) | In a comment box: close it, asking first if it holds unsent changes. In the review dialog: close it; the summary is kept. In the dialog that shows the index being built (M3): cancel the build and drop the jump. In a list of declarations or usages (M3): close it and give the focus back to the editor |
+| Ctrl+B / Ctrl+click (M3) | Go to definition of the name at the caret / under the pointer (Cmd instead of Ctrl on macOS). On the name of a definition itself it lists the places that use the name instead, and several definitions are listed to choose from (see 5.8). There is no key of its own for usages |
 | Ctrl+Alt+← / Ctrl+Alt+→ (M3) | Back / forward through visited locations, like JetBrains' Navigate Back / Forward |
 
 **Notes:**
 - Shortcuts that the browser itself reserves can't be intercepted, such as Ctrl+T, Ctrl+W, Ctrl+N and Ctrl+Shift+N.
   So JetBrains' Ctrl+Shift+N (find file by name) becomes double Shift or Ctrl+P.
-- **Back and forward (M3):** Ctrl+Alt+← / Ctrl+Alt+→ go back and forward through the locations visited (file and line: files opened, F7 jumps, jumps to a definition).
-  File switches already call `pushState`, so the browser's own Alt+← / Alt+→ go back to the previous file today; M3 adds positions within a file.
-  Some Linux desktops take Ctrl+Alt+← / → to switch workspaces (GNOME does by default), so the browser's keys remain the fallback there.
-- **In comment boxes, keys are text:** the other shortcuts (`v`, `c`, double Shift, F7, Alt+↓) are off there, on the box's buttons and tabs too. Ctrl+P still opens the file finder, and the box keeps its draft. While a dialog is open (the file finder, the review dialog), none of them work.
+- **Back and forward (M3):** Ctrl+Alt+← / Ctrl+Alt+→ go back and forward through the locations visited: files opened (from the tree, the file finder or Alt+↓ / Alt+↑), F7 jumps into another file, jumps to a definition and usages picked from a list.
+  Each of these is a browser history entry (`pushState`). It carries the place in `history.state`, so the browser's own Back / Forward (Alt+← / Alt+→, the mouse buttons) work too, and return to the caret.
+  The caret is recorded when the user leaves the entry, and again once it has rested for a second, so that a reload also returns to it.
+  One step per key press: holding the keys does not repeat. Back stops at the first entry the app made and never leaves the app; only the browser's own button does.
+  Some Linux desktops take Ctrl+Alt+← / → to switch workspaces (GNOME does by default, and KDE may), so the browser's keys remain the fallback there. There is no alternative for macOS yet.
+- **In comment boxes, keys are text:** the other shortcuts (`v`, `c`, double Shift, F7, Alt+↓, Ctrl+B, Ctrl+Alt+← / →) are off there, on the box's buttons and tabs too. Ctrl+P still opens the file finder, and the box keeps its draft. While a dialog is open (the file finder, the review dialog, the dialog of an index being built, a list of declarations or usages), none of them work.
 
 ## 4. Architecture
 
@@ -127,8 +130,8 @@ The defaults stay as close to JetBrains as possible, and they are configurable.
  gh tideline <pr>  ──start / reuse──▶  local server (Rust, 127.0.0.1:PORT)
                                 ├─ git layer ──── runs git commands ──▶ cache repo (bare + partial + shallow)
                                 ├─ GitHub layer ─ GraphQL / REST ──▶ api.github.com / GHE
-                                ├─ index layer (M3) ─ tree-sitter-tags ──▶ SQLite
-                                └─ HTTP: /api/*, /api/events (SSE), static assets (embedded in the binary)
+                                ├─ index layer (M3) ─ tree-sitter, our own tags queries ──▶ SQLite
+                                └─ HTTP: /api/*, static assets (embedded in the binary)
                                           ▲
  browser single-page app (TS + React) ────┘
    changed-files tree | Monaco DiffEditor (single instance) | comment view zones | status bar
@@ -145,12 +148,12 @@ The defaults stay as close to JetBrains as possible, and they are configurable.
 | Embedded frontend | rust-embed | The result is a single binary |
 | Cache directory | directories | Follows the XDG spec |
 | Opening the browser | webbrowser | |
-| Index (M3) | tree-sitter + tree-sitter-tags + per-language grammar crates; stored with rusqlite | tags.scm is exactly what GitHub's "search-based code navigation" uses |
+| Index (M3) | tree-sitter + per-language grammar crates, with our own tags queries and our own runner for them (not the `tree-sitter-tags` crate); stored with rusqlite | Tags queries (the `tags.scm` format) are what GitHub's "search-based code navigation" uses. Ours start from the queries the grammars ship and add what they lack (see 5.8). The `tree-sitter-tags` crate can neither be cancelled nor given a time limit, and some files (deeply nested code, long runs of comments) take it tens of seconds or more |
 | Frontend | Vite + React + TS | |
-| Editor | monaco-editor (bundled into the frontend, not loaded from a CDN) + @monaco-editor/react | Built-in side-by-side / unified views, collapsing of unchanged regions, word-level highlighting and view zones. It also lets us register a definition provider |
-| Highlighting | shiki + @shikijs/monaco | Uses TextMate grammars, so highlighting quality matches VS Code and beats Monaco's built-in Monarch |
+| Editor | monaco-editor (bundled into the frontend, not loaded from a CDN) + @monaco-editor/react | Built-in side-by-side / unified views, collapsing of unchanged regions, word-level highlighting and view zones. Ctrl+click and Ctrl+B are handled by the app itself, not through a Monaco definition provider. A `DocumentSymbolProvider` on the `dr` scheme gives the breadcrumbs of collapsed regions |
+| Highlighting | Monaco's built-in Monarch tokenizers | Built into Monaco. The rows of the sticky header are colored through `monaco.editor.colorize` |
 | Lists | @tanstack/react-virtual | The file tree must handle 3000 files |
-| Request cache | @tanstack/react-query | |
+| Requests | `fetch`, in the wrappers of `web/src/api.ts`, with React state | Small purpose-built caches where needed: the Monaco models and the symbols of files are kept in LRUs |
 
 **Required git version: at least 2.40**, because we need `merge-tree --merge-base` and `check-attr --source`.
 This machine has 2.43. The program checks the version at startup. If it is too old, it exits with an error and a hint.
@@ -162,11 +165,11 @@ Start with a single crate; each item below is one module. Split it into a worksp
 ```
 src/
   main.rs        CLI: parse input, start / reuse the server, open the browser
-  server/        axum routes, security middleware, static assets, SSE
+  server/        axum routes, security middleware, static assets
   git/           cache repo management, fetch, diff, cat-file process pool, one lock per repo
   github/        token lookup, GraphQL / REST client, ETag cache
   pr/            ties git and GitHub together: open a PR, file list, review threads and review writing
-  index/  (M3)   symbol extraction with tree-sitter-tags, SQLite, definition and usage lookup
+  index/  (M3)   symbol extraction with tree-sitter tags queries, SQLite, index build jobs, definition and usage lookup
   config.rs      config file ~/.config/tideline/config.toml
 web/             frontend project; rust-embed embeds its build output
 ```
@@ -178,7 +181,7 @@ $XDG_CACHE_HOME/tideline/
   server.json                          running server: pid, port, version
   repos/<host>/<owner>/<repo>.git      bare repo, partial clone + shallow
   state.sqlite                         local state: recently opened PRs, the head last viewed in this tool for each PR
-  index.sqlite             (M3)        symbol index, keyed by blob OID
+  index.sqlite             (M3)        symbol index, keyed by blob OID, plus the file listing of each indexed commit
 ```
 
 **Maintaining the cache repos:**
@@ -229,8 +232,8 @@ $XDG_CACHE_HOME/tideline/
 9. Return the PR info and the file list; the frontend renders the file tree and opens the first file
 ```
 
-- **UX goal:** as soon as step 5 finishes, push the file tree to the frontend so it shows up first. Line counts come from GraphQL at first.
-  After steps 6–8 finish, push the completed renames, line counts and generated-file flags over SSE.
+- **One load, nothing pushed:** steps 1–8 run as one load, and `GET /pulls/{n}` and `/files` answer from its result: the file tree appears when it is done. A result is reused for 30 seconds, and concurrent requests share one load.
+  Line counts come from step 7 (`numstat`); GitHub's counts from step 2 stand in for a file that `numstat` has none for.
 - **Why .gitattributes goes into step 6:** when `check-attr --source` finds a .gitattributes file missing, it fetches it in a separate round trip.
 - **Fetches into the same repo must run serially.** Concurrent fetches into one repo conflict on `shallow.lock`, so each repo has one tokio Mutex.
 - **PRs from forks need no special handling.** The head commit is also reachable under `refs/pull/N/head` in the base repo, so fetching by SHA works the same way.
@@ -380,37 +383,91 @@ Drafts live on GitHub, not in Tideline: a review started here can be finished on
 
 ### 5.8 Symbol index and code navigation (M3)
 
-**When to build the index:** when the user first requests go to definition, or after the user turns on "Build index automatically" in settings. The index builds in the background, and the server pushes progress to the frontend over SSE.
+**What a lookup is.** Names are matched as text, not resolved by type. The index holds the definitions, and the references (calls and uses of a type), that tree-sitter queries find in the source files of a commit. A lookup returns those with the same name in files of the same language family, nearest to the file of the click first. Wherever usages are listed, the UI says "matched by name".
 
-**Steps to build the index:**
-1. `git ls-tree -r -z --long <head>` lists all files in the head version.
-2. Filter by extension to the supported languages, and keep only files of 1 MB or less.
-3. Batch-fetch these blobs in one go, with the method from step 6 of 5.1.
-4. Read them one by one through `cat-file --batch`, and extract symbols with tree-sitter-tags.
+**When the index is built.** On the first jump, not when a pull request is opened. There is no setting for it, and nothing is pushed to the page.
+- A lookup asks the server for definitions. When the index of that commit is not complete, the answer is 409 `index_missing`: the page starts a build (`POST .../index`), polls it (`GET`, every 300 ms) and asks again once it is ready. A commit that is indexed answers at once.
+- A modal dialog shows the phase (listing, downloading, parsing, saving) and a count, `done / total`. It appears only after the page has waited 300 ms for the build, so an index that is nearly there flashes nothing. The page behind it is inert.
+- Cancel (the button, or Esc) sends `DELETE` and drops the jump. Like any other end of the lookup (see below), it ends the wait at once, even if the request that starts the build is still unanswered; that request goes on, and is not followed or sent again. The `DELETE` goes out once that request is answered or has failed, or 3 seconds after it was sent, so that it does not overtake the start it is for. The next build of that commit waits for the server to answer the `DELETE`, so that the cancel does not reach the server after the new build has started, and take it down. It waits 3 seconds at most, counted from when the `DELETE` is sent; with a start and a `DELETE` that the server never answers, that makes 6 seconds. A build that failed shows its message, with Close and Retry, and so does a call that keeps failing, the start of the build or a check of its status. A call that fails for a moment (no connection, a 408, a 429 or a 5xx) is tried again first, after 0.5, 1 and 2 seconds. So that a request the server never answers does not hold a connection of the page for good, the browser gives up on a start after 30 seconds, which counts as no connection, and on a `DELETE` after 10 seconds, which is dropped without a word. A refusal (any other 4xx) is not tried again, and neither is the 503 `index_unavailable` (the server cannot use its index, and a moment does not change that): both end the lookup with a toast, which offers Refresh when the refusal is a 409 `stale_head`. After Retry the dialog is back at the progress, with its Cancel, at once, without waiting for the server to answer the new start. A build that someone else cancelled, say from another window, ends the lookup with a toast. A job the server no longer knows (it restarted) is started again, twice at most while the dialog waits for it, and an index that went missing by the time of the lookup is built again, 3 times at most.
+- A lookup from the old side of a diff (`side=base`) indexes the merge base, on demand. It shares most blobs with the head, so what is left to do is small.
+- One lookup is under way at a time. Starting another, moving the caret, leaving the history entry, a new head, or opening something else over the page (the file finder, the review dialog, a comment box), or going to another text field, ends it. The build it was waiting for goes on; only Cancel stops that. An answer that arrives once the user is at a text field or in a dialog of the page is dropped, so that it does not take the focus from them. While a lookup waits and no dialog shows, the status bar says "Looking up…" (after 300 ms, as the dialog is).
+
+**Steps to build the index** (one build is one commit):
+1. `git ls-tree -r -z --full-tree <commit>` lists the files (trees are local in the blob-less clone). There is no `--long`: sizes are unknown there, and asking for them would read every blob. The OIDs listed are remembered, so `/blobs/{oid}` serves them from now on. (A commit that is complete is not listed again, so a request to build it notes none. That leaves no gap: the OIDs the page asks for come with the file list of the pull request and the tree of its head, which note theirs.)
+2. Keep regular files (modes 100644 and 100755) of a supported language, leaving out `node_modules` directories and `*.min.js`. A commit with more than 100,000 of them fails: "the commit has N source files; the index covers at most 100000".
+3. Ask the index which of these blobs it holds already. A blob noted `unreadable` is tried again, but only by builds of commits that are not complete yet.
+4. **Downloading files.** List the blobs the repo lacks with `git rev-list --objects --no-walk --missing=print --no-object-names <commit>` under `-c protocol.allow=never`, which never fetches by itself (S18). Fetch, in this order and in one phase with one count:
+   - the blobs to parse. A fetch that fails ends the build.
+   - the blobs the index already holds tags for. The lines of references are cut from the cache repo's copy, and a second clone of the repository, or one made anew, lacks the blobs the first one gave the index. This part is best effort: a failure is logged, the chunks after it are skipped and the build goes on.
+
+   Each list goes in chunks of clamp(n / 20, 500, 2000) blobs, and each chunk in a task that owns the repo lock for that chunk only, so pull requests opened meanwhile are not kept waiting. The fetch is the one of step 6 of 5.1, and it gives up on a transfer that stays under 1000 bytes a second for a minute (`http.lowSpeedLimit`, `http.lowSpeedTime`). A blob the remote does not give is noted `unreadable`.
+5. **Parsing.** The sizes of the blobs come from `cat-file --batch-check`, run only on blobs that are local (a size is not known before: a blob that turns out too large was fetched once, and is not again). A blob over 1 MiB is noted `too_large` and not parsed; one that cannot be sized is noted `unreadable`. The rest are read through `cat-file --batch` in groups of at most 16 MiB and parsed by min(cores, 4) threads. A file that takes more than 1.5 seconds to parse and match is given up on: it is noted `unreadable`, without symbols. A group is stored in the background while the next one is read and parsed.
+6. **Saving.** A `.h` file is C or C++ by its content (see Scope): where its blob is stored under both grammars, the content decides. Only blobs that are local, whose size the index knows and that are no larger than 1 MiB are read for this, in groups of at most 16 MiB. Then the listing of the commit (`tree_entries`) and the mark that it is complete are written in one transaction, so a lookup never sees a half-indexed commit.
+
+The phases only move forward, and the count is that of the phase: blobs fetched while fetching, blobs parsed while parsing. A phase with nothing to do is skipped.
+
+**Cancelling.** A cancel is looked for at the start, before each fetch chunk (and again once the repo lock is held), before each group of blobs is read, while a file is parsed and matched (tree-sitter calls back every few hundred steps, and the loop that follows looks again every 4096 tags) and before the last step. Git is never killed by a cancel: the fetch that has begun finishes, or is given up on by the low-speed guard, and the build stops after it. What was stored stays, so a retry does only what is left.
 
 **The index is keyed by blob OID, not by commit.** Files with the same content have the same OID.
 So when the same repo moves to another head or another PR, only the new blobs need processing, and the increment is small.
+A blob is stored once for each grammar that names one of its paths, however many commits and paths hold it.
+- `parsed`: it has its tags. `too_large`: over 1 MiB, no tags. `unreadable`: the remote did not give the blob, or it took too long to parse. The commit is listed meanwhile, with that file having no symbols; a later build tries it again, and a parse that succeeds replaces the note.
+- An insert leaves a stored blob alone (`ON CONFLICT (oid, grammar)`), except that it replaces an `unreadable` row by a better one. So two jobs, or two servers, storing the same blob do no harm.
+- A status this version does not know, written by a newer one, counts as `held`: the file is listed and not parsed again, but nothing is known of its tags, so a build neither fetches the blob for the lines of references nor reads it to place a `.h` file. A lookup that finds a reference in a held blob fetches it for the line like any other. A request for the symbols of a held file parses it each time, as the row is never replaced.
 
-**Schema:**
+**Jobs.** One commit is built at a time, and the others wait in a queue.
+- A request to build a commit that is complete already answers `ready` and runs no job. Otherwise it joins the job that builds the commit, unless that job failed, was cancelled or is being cancelled: a new job takes its place, and it waits for the turn the old one gives up. A job that gets its turn and finds the commit complete (another job finished it) ends `ready` at once.
+- A job is `missing` (no job, and no complete index), `queued`, `building`, `ready`, `failed` or `cancelled`. Jobs that are ready are forgotten (the database tells). Failed and cancelled ones are forgotten oldest first once there are more than 64. A build whose task stops without an answer is marked failed ("the indexing task stopped").
+- When the server exits, it cancels every job first, and tells the fetches for the lines of references to stop (see Looking names up). A job in the queue leaves it, and one that starts afterwards fails with "indexing is shutting down". It waits up to 30 seconds for the tasks (the fetch that has begun is waited for, not killed), and at that deadline aborts what is left.
+
+**Storage.** `index.sqlite` in the cache directory, with mode 0600, in WAL mode (`synchronous=NORMAL`), migrated with `PRAGMA user_version`. One connection writes, one answers the lookups, and a third answers a build's question of which blobs are stored, a long read that would keep the lookups waiting. Nothing is evicted. A lookup refreshes the `used_at` of its commit when it is more than an hour old, for a future cleanup. If the file cannot be opened, the server says "code navigation index is disabled" on stderr, the index endpoints answer 503 `index_unavailable`, and symbols are still parsed on demand, without being kept.
+
 ```sql
-tags(blob_oid, name, kind, is_definition, start_line, start_col, end_line, end_col)
-tree_entries(commit_oid, path, blob_oid)
+CREATE TABLE blobs (id INTEGER PRIMARY KEY, oid TEXT NOT NULL, grammar TEXT NOT NULL, status TEXT NOT NULL, size INTEGER NOT NULL, UNIQUE (oid, grammar));
+CREATE TABLE names (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
+CREATE TABLE tags (blob_id INTEGER NOT NULL, name_id INTEGER NOT NULL, kind TEXT NOT NULL, is_def INTEGER NOT NULL,
+                   line INTEGER NOT NULL, col INTEGER NOT NULL, end_col INTEGER NOT NULL,
+                   scope_start INTEGER NOT NULL, scope_end INTEGER NOT NULL, snippet TEXT NOT NULL, snippet_col INTEGER NOT NULL);
+CREATE INDEX tags_name ON tags (name_id, is_def, blob_id);
+CREATE INDEX tags_blob ON tags (blob_id) WHERE is_def = 1 OR kind = 'implementation';
+CREATE TABLE commits (id INTEGER PRIMARY KEY, oid TEXT NOT NULL UNIQUE, complete INTEGER NOT NULL, files INTEGER NOT NULL, used_at INTEGER NOT NULL);
+CREATE TABLE tree_entries (commit_id INTEGER NOT NULL, path TEXT NOT NULL, blob_id INTEGER NOT NULL, family TEXT NOT NULL,
+                           PRIMARY KEY (commit_id, path)) WITHOUT ROWID;
+CREATE INDEX tree_entries_blob ON tree_entries (commit_id, blob_id, family);
 ```
+
+Names are stored once (`names`). Lines are 1-based and columns are 1-based UTF-16 code units, which is what Monaco counts: tree-sitter reports byte offsets, so they are converted. A line ends at `\n`, which covers LF and CRLF files; a lone `\r` is not a line break, and a byte order mark is ignored. A definition (and a Rust `impl` block) keeps the trimmed text of its line, at most 200 UTF-16 units, as its `snippet`; the line of any other reference is cut at lookup time (below).
+
+**Looking names up.** The endpoints are in section 6. They take the head the page shows, which must be the pull request's current head (409 `stale_head` otherwise), and `side`: `head`, or `base` for the merge base. `path` is the file of the click as that commit has it (on the base side, a renamed file has its old path), and its extension names the language family. They never start a build: a commit whose index is not complete gets 409 `index_missing`, and a file of a language the index does not cover gets `language: null` and no hits.
+- **Definitions** with the name, in files of the family of `path`. Constructors are left out (they remain symbols of their file): they have the name of their class, so the class would otherwise never be the only definition of `new Foo()`. Order: the same file, then the same directory, then the other files, by how many leading directories they share with the file of the click, then by path and position. Only the nearest 200 are returned, and `truncated` says that there were more. A definition's line is stored in the index, so a lookup of definitions asks the index only and never fetches.
+- **References** with the name: calls, type uses and, in Rust, `impl` blocks. Order: the same file, then the same directory, then the rest by path and line; the first 1000 are returned, with `truncated` as above. A plain property read such as `this.groupCount` is not a reference.
+- **The lines of references** are cut from the blobs of the cache repo, in groups of at most 16 MiB by the sizes the index noted. The index may hold a commit that another clone of the repository built, so the cache repo may lack some of these blobs. The lookup tells which with one listing (the one of step 4 of the build, which takes no lock) and fetches those of its hits, best effort, in tasks of their own:
+  - One task at a time fetches a blob. The task owns the repo lock for its fetch (the fetch of step 6 of 5.1, with the same guard against a stalled transfer), and goes on if the lookup that started it is dropped or has stopped waiting, so that git is never left running without the lock. A lookup that wants a blob that a task has in flight waits for that task, and queues no fetch of its own for the lock, which a build or a pull request that is loading may hold for long.
+  - A lookup waits at most 5 seconds for all the tasks it depends on together. After that it answers without the lines it lacks (an empty `snippet`), and the tasks go on, so that a later lookup finds the blobs.
+  - When a fetch fails, the remote tells which blobs it refuses (one that stops at the first it refuses names only that one). Those are not asked for again for 2 minutes (per repository and blob; at most 4096 are remembered, the oldest forgotten first). The task asks again for the others for as long as the last ask gave up a blob and 10 seconds have not passed since it got the lock; the blobs left then are given back, for a later lookup. When the remote names none of the blobs asked for, all are noted.
+  - Without a GitHub token the lookup answers without the lines of the blobs the repo lacks, and when the listing fails, without any line; either is told on stderr. When the server exits, the tasks that still wait for the repo lock leave without fetching, and no new one starts.
+- **Symbols of a file** (`/blobs/{oid}/symbols`) are parsed on demand, by blob, and kept in the index, where a build finds them too. A file over 1 MiB is answered with `tooLarge: true` and no symbols. So is one that takes more than 1.5 seconds to parse, which is not stored (taking long says something about that run, and a build tries again), but remembered in the server for 10 minutes (at most 256 files), so that repeated requests do not each take a thread for that long.
 
 **Where it is used:**
 
 | Feature | Approach |
 |---|---|
-| File outline / sticky current function at the top | Convert the definition tags of the file into a Monaco `DocumentSymbolProvider` |
-| Go to definition | Register a Monaco `DefinitionProvider` that asks the server for definitions by `name` and language. Ranking: same file > same directory > others. If the target file is in this PR, open its diff and go to the line. If not, open the head version in a read-only plain editor |
-| Find usages | Query the tags with the same name and `is_definition = false` (`@reference.*` in tags.scm), and list them in the sidebar. The results are approximate, so the UI must say "Matched by name" |
+| Go to definition | Ctrl+B with the caret on a name, or Ctrl+click on one (Cmd instead of Ctrl on macOS): our own code, not a Monaco `DefinitionProvider`. The click is a press and a release on the same name, so dragging a selection with Ctrl held asks for nothing. While Ctrl is held, the name under the pointer is underlined. A name is an identifier in code: not a keyword of the language (each language has its own list), not a number, and not in a comment, a string or a regular expression; it is at most 256 bytes. Words that are keywords only where they stand (`type`, `from`, `get`, `match`, `union`, `operator`) are names. A keyword can still be a name where the language lets it be one: a Rust raw identifier (`r#type`), and in JavaScript and TypeScript a reserved word that names a member, after a dot (`map.delete(key)`) or where the member is declared (`delete(key) {`, `static new = create()`, `{ default: 1 }`, `import: string`). A declaration is told from its line alone: between the word and the last `{`, `,` or `;` before it (or the start of the line) there are only modifiers (`static`, `async`, `get`, `readonly` and the like), and what follows the word is a `(` or `<` right after it (a method), a `:` or `?:` right after it (a property; after a space, as in `null :`, the colon is taken for a ternary's) or an `=` (a property with a value). A word that starts a statement or an expression (`if`, `return`, `new`, `super`, `import` and the like) is taken for a method only with a modifier before it (`static new(config) {`), except `function` after `async` alone: `async function(req) {` is a function. A keyword in any other use (`if(ok)`, `} catch (e) {`, `return`, `new X`) is not underlined, and clicking on it asks for nothing. A caret on no name, and a file type the index does not cover, each give a toast that says so. The page asks for the definitions (building the index first, see above), and then: none gives a toast; one is gone to; several with exactly one in the file of the click go to that one; otherwise a list "Choose declaration of X (N)" opens, nearest first |
+| Usages | There is no key of its own. Ctrl+click or Ctrl+B on the name of a definition itself (the file's symbols say it is one, or the definition lookup has a hit exactly there) is no place to jump to, so it lists the places that use the name, asked under the name the definition has, which may be longer than the word clicked (the `operator` of `operator==`): "Usages of X · matched by name (N)". Each row shows the file, the line number and the line with the name marked; a hit whose line could not be had (see above) shows the file and the number only. The results are approximate, and the list says so: they are matched by name. A list that is cut says so (see The lists), and so does an empty one: "No usages found", with a note that usages are matched by name in the files of the language |
+| The lists | A popup anchored at the click or the caret (above it where there is no room below). The first row is active and has the focus. ↑ ↓ Home End PageUp PageDown move, Enter or a click opens the place, Esc or a press outside closes it and the focus goes back to the editor. A name far along its line (more than 22 characters in) is shown from 16 characters before it, with a "…" in front. In a row the directory gives way to the line of code, which keeps at least 40 characters or half the row, whichever is less. The lists that the server cut short (200 declarations, 1000 usages) count "200+" or "1000+" and say under the rows "Only the first 200 declarations are listed", or the same of usages. Everything shown comes from the repository, so it is put on the page as text |
+| Where a hit opens | A file the pull request changes opens its diff at the line, on the side of the commit searched: a hit in the base commit opens the old file, and a renamed file's old path is on its base side. A copy does not stand for the file it was copied from. An unchanged file opens read-only from the head tree (it reads the same on both sides). Any other path gives a toast that says it is not one of the pull request's files. A jump is a history entry, so Back returns to where it was left (see 3.3) |
+| Sticky header | Our own overlay at the top of each visible editor: both sides in split view, the one editor in unified view. Monaco's sticky scroll is switched off in the diff editor, and under `hideUnchangedRegions` it is force-disabled (S20). The rows are the scopes around the first line in view, outermost first, at most 4 (the innermost are kept), from the symbols of the file; constants, fields, variables and properties are skipped. A row is the line of the scope's name, from column 1, with its line number. Clicking it reveals that line and focuses the editor; the wheel scrolls the code beneath. Rows are chosen for the line that is under them, so a scope leaves the header as its end reaches it, as in JetBrains and VS Code; a row is drawn only while its line is above the line just under the header, so no row shows that line again, nor one that is not reached yet. The rows stay clear of the bars of collapsed unchanged lines, wherever in the file they are, since rows over a bar would hide its controls: as many rows as fit between the top of the view and the next bar, none while a bar is at the top (the bar above the first change is, until the code is scrolled away from it), and all four when no bar is in view. An editor too short for four rows keeps fewer, the innermost scopes. A caret moved by keyboard is scrolled out from under the header, so is one on the line of a row that was clicked, and comment cards revealed top-first land below it. The top bar's "Sticky" toggle (on by default, kept in `localStorage`) turns it off; it has no key. A request for symbols that fails is tried again after 2 and 8 seconds |
+| Colors of the header | The rows show plain text first. Colors follow from `monaco.editor.colorize`, which is asynchronous (S20); the HTML it returns is parsed with `DOMParser` into an inert document, of which only the text and the `mtk` token classes are kept, and the rows are built from text nodes (see section 8). A line over 1000 characters is cut and stays plain |
+| Outline and breadcrumbs | There is no file outline popup, and Monaco's quick outline (Ctrl+Shift+O) is unbound. The breadcrumbs of collapsed unchanged regions come from a `DocumentSymbolProvider` registered for the `dr` scheme, which nests the symbols of the file by scope |
 
 **Scope:**
 - By default, index only the head version. When the user requests a jump on the old file (left side), index the merge-base version on demand.
-- First supported languages: Rust, Go, Python, TypeScript/TSX, JavaScript, Java, C, C++. All eight grammars include a tags.scm, and their Rust crates all export `TAGS_QUERY`.
-  - The TypeScript tags.scm covers only TS-specific syntax. It must be combined with the JavaScript tags.scm.
-  - The C and C++ tags.scm files have only definitions, no references. Find usages needs our own reference queries. Until then, it returns nothing for C/C++.
-- tree-sitter reports columns as byte offsets, but Monaco expects UTF-16 columns, so they need conversion.
+- Languages: Rust (`.rs`), Go (`.go`), Python (`.py`, `.pyi`), TypeScript (`.ts`, `.mts`, `.cts`), TSX (`.tsx`), JavaScript (`.js`, `.mjs`, `.cjs`, `.jsx`), Java (`.java`), C (`.c`, `.h`) and C++ (`.cc`, `.cpp`, `.cxx`, `.c++`, `.hpp`, `.hh`, `.hxx`, `.h++`, `.h`). Extensions are matched as written, in lower case.
+- **Families.** Names are matched within a family: TypeScript, TSX and JavaScript are one, and so are C and C++. Rust, Go, Python and Java stand alone.
+- **`.h` files** are C++ when their content has `::`, `public:` or one of the words `class`, `namespace` and `template`, and C otherwise. A header is looked up as C or C++ by the grammar the index holds it under. When the index holds its blob under both, the row that says the most about the tags wins (`parsed`, then `too_large` or a status this version does not know, then `unreadable`; C before C++ among equals), so that a row without tags, such as a stale `unreadable`, does not take a header from the grammar it was parsed under. Only where both grammars have tags does the content decide.
+- **The queries are ours.** They live in `src/index/queries/*.scm`. Rust, Go, Python and Java start from the tags query that the grammar's crate ships. C and C++ replace it: functions are tagged on the whole definition (so a scope spans the function and not just its signature), and calls and type uses are references. JavaScript is a base (the upstream query of `tree-sitter-javascript` 0.25.0, minus the `(comment)* @doc .` prefix, whose matching time is quadratic in a run of comments: 10,000 comment lines take a second) plus additions of ours: module-level variables, constructors, `new ns.Foo()` and `class A extends B` as references, class fields holding functions and JSX components. TypeScript and TSX combine that base with the upstream TypeScript query and additions of ours (type aliases, enums, namespaces, references to types). Where several patterns tag the same name, the first one written wins, and a reference that sits on the name of a definition is dropped.
+- **The runner is ours too**, over tree-sitter's `QueryCursor` instead of the `tree-sitter-tags` crate (S17). Its wall-clock limit is 1.5 seconds for one file, parsing and matching together, and the cancellation flag is looked at while parsing and matching. Tags nested deeper than 60,000 levels are left out. A tag is kept only if its name is an identifier: names longer than 256 bytes (generated junk), and names with whitespace, control characters, or the separators `.` `,` `;` `:`, brackets, quotes, `\` and `<` `>` in them (the upstream queries also capture things like `ns.Thing` and `make<int>`) are dropped. The one exception is the name of a C++ operator (`operator==`, `operator()`, `operator new[]`, `operator co_await`). It is kept without the whitespace that does not separate two words, so `operator ()` and `operator()` are one name, and `operator new[]` and `operator co_await` keep the one space they need.
+- **Tag kinds.** Definitions are `function`, `method`, `constructor`, `class`, `interface`, `enum`, `type`, `constant`, `variable`, `module`, `namespace` or `macro`. References are `call`, `type`, `class` or `implementation` (a Rust `impl` block, which has no name of its own; it is also a scope in the symbols of its file).
 
 ## 6. HTTP API
 
@@ -433,14 +490,20 @@ All endpoints start with `/api/{host}/{owner}/{repo}`. The table below omits thi
 | POST | `/pulls/{n}/review` | `{head, reviewId, event: COMMENT \| APPROVE \| REQUEST_CHANGES, body}`: submit the pending review `reviewId`, or (null) a review of just the summary | M2 |
 | DELETE | `/pulls/{n}/review` | `{reviewId}`: discard the pending review | M2 |
 | POST | `/markdown` | `{text}` → `{html}`: the text as GitHub renders a comment in the repo, for previews | M2 |
-| GET | `/revs/{sha}/symbols?path=` | Symbols of one file | M3 |
-| GET | `/revs/{sha}/definitions?name=&lang=` | Find definitions | M3 |
-| GET | `/revs/{sha}/references?name=&lang=` | Find usages | M3 |
-| GET | `/api/events` | SSE push: fetch progress, index progress, file list completion | M0 |
+| GET | `/blobs/{oid}/symbols?path=` | `{language, tooLarge, symbols: [{name, kind, line, column, endColumn, startLine, endLine}]}`: the definitions of one file (and a Rust file's `impl` blocks, kind `implementation`), ordered by `startLine`. `path` names the language. `language` is null for a file type the index does not cover. `tooLarge` is true, with no symbols, for a file that is over 1 MiB or took too long to parse. The blob is served where `/blobs/{oid}` serves it. `Cache-Control: no-store` | M3 |
+| POST | `/pulls/{n}/index` | `{head, side: head \| base}` → `IndexStatus`, as the next row has it. Starts building the index of the head, or of the merge base; joins the build that is running; or answers `ready` at once. The build goes on without the request. `no-store` | M3 |
+| GET | `/pulls/{n}/index?head=&side=` | `IndexStatus`: `{commit, state: missing \| queued \| building \| ready \| failed \| cancelled, phase: listing \| fetching \| parsing \| saving \| null, done, total, cancelling, message}`. `done` and `total` count what the phase works on. `message` says why a build failed | M3 |
+| DELETE | `/pulls/{n}/index?head=&side=` | Asks the build to stop. The answer is its `IndexStatus`, which says `cancelling` until it has | M3 |
+| GET | `/pulls/{n}/definitions?head=&side=&path=&name=` | `{language, commit, name, hits: [{path, line, column, endColumn, kind, snippet, snippetColumn, tier: file \| dir \| other}], truncated}`: where `name` is defined in files of the language family of `path`, nearest first, at most 200. Asks the index only, and never builds it. `no-store` | M3 |
+| GET | `/pulls/{n}/references?head=&side=&path=&name=` | The same shape, for the places that use `name`: at most 1000. It never builds the index, but it may fetch blobs for the lines, and waits at most 5 seconds for them (see 5.8). A hit's `snippet` is its line, cut from the blob; it is empty when the blob did not come in time or could not be had or read | M3 |
 
 Errors are `{"error": {"code", "message"}}`. For writes: 400 `bad_request`; 404 `not_found` (the thread or comment is gone); 409 `stale_head`, `pending_review_exists` or `review_changed`;
 422 `rejected` (GitHub refused, with its message); 502 `github_error` (the write may or may not have landed: the client looks before sending again).
 A request body over 512 KiB gets a plain-text 413.
+
+For code navigation: 400 `bad_request` for a malformed `head` (a full lowercase commit OID), `side`, `path` (1 to 4096 bytes, no control characters) or `name` (1 to 256 bytes, no control characters and no whitespace, but for single spaces in the name of a C++ operator, such as `operator new[]`);
+409 `stale_head` when `head` is not the current head of the pull request, and `index_missing` when the commit is not indexed (completely) yet, which is the cue to build it;
+503 `index_unavailable` when the index database could not be opened or failed.
 
 ```ts
 interface ChangedFile {
@@ -464,6 +527,7 @@ interface ChangedFile {
 **Routes:**
 - `/`: recently viewed PRs, plus an input box.
 - `/{host}/{owner}/{repo}/pull/{n}?file=`: view a PR (`&from=&to=` later, with the commit and range views).
+- **History entries (M3).** The app writes `history.state = {id, depth, pos?}` into every entry it makes, with its own small router (`web/src/router.ts`, `web/src/nav/history.ts`). `id` is random and tells entries apart, also those with the same URL; `depth` counts the entries pushed since the app first saw the tab's history, and Back stays inside the app while it is above 0; `pos` is `{path, side, line, column}`: the place the caret was when the user left the entry (and, once it has rested for a second, while in it), or the place a jump lands on. A jump is a push, so the browser's Back and Forward return to where the user was, and so do Ctrl+Alt+←/→ (3.3). An entry the app did not make gets a state when it is first looked at.
 
 **DiffEditor options:**
 
@@ -490,7 +554,7 @@ interface ChangedFile {
 - After `onDidUpdateDiff`, read `getLineChanges()` and implement the jump ourselves.
 - When already at the last change, open the next file, wait for its diff to finish, then go to its first change.
 
-**State management:** React Query caches server data. UI state (current file, view mode, ignore whitespace) lives in the URL and in localStorage.
+**State management:** server data is fetched with plain `fetch`, in the wrappers of `web/src/api.ts`, and held in React state; there is no query library, and the few caches are purpose-built (4.2). UI state lives in the URL (the current file) and in `localStorage` under `dr.` keys: side by side or unified, ignoring whitespace changes, the width of the tree, its scope (changed files or all) and the "Sticky" toggle. Open comment boxes and what is typed in them are kept in `sessionStorage`, per pull request.
 
 ## 8. Security
 
@@ -529,6 +593,13 @@ The local server holds a GitHub token and has write endpoints: viewed marks and,
   - only absolute `https:` URLs; links open in a new tab with `rel="noopener noreferrer"`; task-list checkboxes are disabled.
 
   This is the only place the app sets `innerHTML`.
+- **Lines of the repository, in code navigation, are put on the page as text.**
+  - The sticky header shows lines of source, colored by Monaco. `monaco.editor.colorize` returns HTML, which is never handed to `innerHTML`: it is parsed with `DOMParser` into an inert document (nothing in it runs or loads), and only its text and Monaco's token classes are kept (`mtk` and a number, or `mtki`, `mtkb`, `mtku`, `mtks`, checked against a pattern). The rows are built from text nodes.
+  - The lists of definitions and usages show paths and lines as React text. The name in a line is marked with `<mark>` around a text node.
+- **The index follows the rules above and adds few of its own:**
+  - Its endpoints sit under `/api/*`, so every check above applies to them: starting or stopping a build is a non-GET request (Origin and `X-DR`), and a lookup is a GET that needs the same-origin signal, though a lookup of usages may make the server fetch blobs (see 5.8). Those are only blobs that the index lists for the references it found, never an OID that the request names. A task fetches them, with the token, and goes on after the request has ended; a blob whose fetch failed is not asked for again for 2 minutes.
+  - The client never names the commit to index. It names the head it shows, which must be the pull request's current head (409 `stale_head` otherwise), and `side`; the server indexes the head or the merge base it knows. The token stays on the server, as for any fetch.
+  - `index.sqlite` holds names, paths and the line of each definition, so like the repos it is private: the file is created with mode 0600 (its `-wal` and `-shm` files get the same mode), in the cache directory, which is 0700.
 - **The app page has a Content-Security-Policy and `Referrer-Policy: no-referrer`**, so a sanitizer miss still can't run script, post a form or load code from elsewhere, and links and images don't leak the local URL:
 
   `default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; font-src 'self' data:; worker-src 'self' blob:; connect-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'`
@@ -554,6 +625,11 @@ These are all preliminary numbers. We will measure them during the spikes.
 | Scrolling the file tree of a 3000-file PR | Smooth, no dropped frames |
 | Resident memory of the server (excluding the index) | Under 100 MB |
 
+**Measured for M3** (a release build against real pull requests, cold cache, read-only):
+- cli/cli#14673 (Go): the first jump built the index of the head in 4.0 s (945 blobs fetched, 955 parsed). `index.sqlite` took 13.6 MB. A definitions lookup took 0.4 ms, a references lookup 9 ms. The index of the merge base (the old side) took 0.3 s more, since it shares most blobs with the head.
+- microsoft/vscode#341600 (TypeScript): a cold build of the head was cancelled 8 s in, in the middle of the fetch (3,024 of 15,129 blobs), and stopped 2.2 s later, when the chunk in flight had finished. The restart fetched only the remaining 11,349 blobs, and the index was ready 43 s later (fetch 37 s, parsing 15,127 files about 5 s). `index.sqlite` took 181 MB, 222 MB with the rest of the cache. Definitions and references took 0.3 ms each. The merge base was ready in 0.3 s.
+- A property read such as `this.groupCount` is no reference, so the `groupCount` getter of vscode has no usages. Usages are the calls and type uses that the queries find.
+
 ## 10. Risks and spike list
 
 Before writing M0, run a minimal spike for each item, one at a time.
@@ -571,7 +647,7 @@ During review, the following points were already tested on the cli/cli repo:
 | S3 | With a single Monaco instance and a model LRU, how much memory does a 1000-file PR take and how long does switching files take; how well does `hideUnchangedRegions` work | Build a prototype page and measure | Tune the LRU size, or switch to the CodeMirror 6 merge view |
 | S4 | Confirmed: it works, with a single batched prefetch. No further checks needed | — | — |
 | S5 | For a 3000-file PR, how much rate limit does GraphQL pagination (30 pages) consume | Read the rateLimit field in the responses | Use conditional requests with ETags, and cache the results |
-| S6 (M3) | Does sticky scroll in DiffEditor use our custom DocumentSymbolProvider | Build a prototype and test | Draw our own bar at the top that shows the function or class name |
+| S6 | Answered by S20 (M3): no. Sticky scroll is force-disabled in the DiffEditor while `hideUnchangedRegions` is on, so the fallback was taken | — | Our own bar at the top that shows the function or class name |
 | S7 | Confirmed (M1 phase 0): GraphQL, like REST, returns at most 250 commits, namely the latest 250 that end at head. `totalCount` is the real total | — | Show a notice in the UI when the limit is exceeded |
 | S8 | Confirmed (M1 phase 0, Monaco 0.57): view zones align on both sides automatically; only `setSelections` on the new-file editor reliably expands collapsed regions; in unified mode, zones can't be placed on the original-file side; cards stay put when the code scrolls horizontally only if they use a view zone plus an overlay widget; the production build works under the CSP response header | — | Approaches already in place |
 | S10 | Confirmed (M1 phase 0): gh's OAuth token (`repo` scope) can call `markFileAsViewed` / `unmarkFileAsViewed`. A path that is not in the PR returns `UNPROCESSABLE`. After a push, viewed files that the push changed become DISMISSED. Fine-grained PATs are untested | — | Writes GitHub refuses (`UNPROCESSABLE`, `FORBIDDEN`) become 422 `rejected` with GitHub's message (M2); the UI rolls back and shows it |
@@ -580,11 +656,16 @@ During review, the following points were already tested on the cli/cli repo:
 | S14 | Confirmed (M2 phase 0): the viewer's pending comments are in `reviewThreads` with `state: PENDING`; `reviews(states:[PENDING], first:1)` returns the viewer's pending review | — | The app reads 5 and keeps the one with `viewerDidAuthor` |
 | S15 | Confirmed (M2 phase 0): approving or requesting changes on your own PR fails with `UNPROCESSABLE` and keeps the pending review. Closed PRs still take reviews and replies | — | — |
 | S16 | Confirmed (M2): a textarea in an overlay widget over a view zone takes typing, IME and paste, as long as key, input, composition and clipboard events stop at the card | — | — |
+| S17 | Confirmed (M3 phase 0): the crates are tree-sitter 0.27.1 with tree-sitter-rust 0.24.2, -go 0.25.0, -python 0.25.0, -typescript 0.23.2, -javascript 0.25.0, -java 0.23.5, -c 0.24.2 and -cpp 0.23.4, with rusqlite 0.40.2 (bundled SQLite). The `tree-sitter-tags` crate was dropped for our own runner over `QueryCursor`: it can be neither cancelled nor given a time limit, and some files took it tens of seconds | — | — |
+| S18 | Confirmed (M3 phase 0): `git rev-list --objects --no-walk --missing=print` lists the blobs a blob-less clone lacks without fetching any: 63 ms on microsoft/vscode. `cat-file --batch-check` would fetch the missing objects one at a time on git 2.43. Fetching all of vscode's blobs takes about 34 s in chunks of 2000 | — | — |
+| S19 | Confirmed (M3 phase 0): parsing runs at about 1000 files a second per core. On microsoft/vscode, 2.2 million tags took 7.8 s with 4 workers and made a 150 MB `index.sqlite`; a references lookup took 18 ms at the 95th percentile, and a definitions lookup of `dispose` 5.7 ms | — | — |
+| S20 | Confirmed (M3 phase 0): Monaco's built-in sticky scroll is force-disabled in the diff editor while `hideUnchangedRegions` is on, so the sticky header is our own overlay (z-index 4, above the comment cards). `showOriginalLine` under-reveals on the original side. `getLineTokens` is internal, so the header colors its rows with `monaco.editor.colorize`, which is asynchronous: `colorizeModelLine` forced synchronous tokenization, about 45 ms for line 24,000 of a 25,000-line file. The HTML that comes back is parsed with `DOMParser` into an inert document, and only the text and a whitelist of `mtk` classes are kept. A `DocumentSymbolProvider` on the scheme `dr` gives the breadcrumbs of collapsed regions. Answers S6 | — | — |
+| S21 | Confirmed (M3 phase 0): Ctrl+Alt+←/→ reach the page in Chromium. GNOME and KDE may grab them for switching workspaces | — | The browser's own Back and Forward (Alt+←/→, the mouse buttons) do the same, as every jump is a history entry |
 
 ## 11. Open questions
 
 - **Binary name:** tentatively `gh-tideline`. That way it can run as a gh extension via `gh tideline`, and also standalone.
 - **Default port:** browser extensions and bookmarks need a fixed port. Tentatively a fixed, configurable port, such as 7457.
 - **How the server runs:** exit automatically after N idle minutes, or run all the time as a systemd user service? The former costs less. The latter keeps the browser extension usable at any time.
-- **Cache eviction:** provide a `gh tideline gc` command that evicts the least recently used entries based on cache size. But "the head at the last review" must be kept.
+- **Cache eviction:** provide a `gh tideline gc` command that evicts the least recently used entries based on cache size. But "the head at the last review" must be kept. The code index (`index.sqlite`) is never evicted yet, and it grows with the repositories used (181 MB for microsoft/vscode); each commit in it carries a `used_at` for such a cleanup.
 - **Curved connector bands:** after M3, should we draw our own layer on top of Monaco to get JetBrains-style curved connector bands?

@@ -425,6 +425,66 @@ function hostileSvg(fill: string): Buffer {
   return Buffer.from('\ufeff' + text, 'utf16le')
 }
 
+/**
+ * A changed file whose first hunk is deep inside a method (`drain`): the diff editor hides the unchanged lines above it from line 1,
+ * so a collapsed-region bar sits at the very top of the file, over code that is inside a class and a method.
+ */
+const workerOld = `// Jobs run one after another by a worker, each retried a few times.
+import { log } from './app/util/log'
+
+export interface Job {
+  id: string
+  attempts: number
+  run(): Promise<void>
+}
+
+export class Worker {
+  private readonly queue: Job[] = []
+  private readonly failed: Job[] = []
+
+  constructor(private readonly name: string) {
+    log('worker ' + name + ' started')
+  }
+
+  push(job: Job): void {
+    this.queue.push(job)
+  }
+
+  async drain(): Promise<number> {
+    let done = 0
+${Array.from({ length: 30 }, (_, i) => `    this.warm(${i})\n`).join('')}    while (this.queue.length > 0) {
+      const job = this.queue.shift()!
+      try {
+        await job.run()
+        done += 1
+      } catch (err) {
+        job.attempts += 1
+        if (job.attempts < 3) {
+          this.queue.push(job)
+        } else {
+          this.failed.push(job)
+        }
+      }
+    }
+    return done
+  }
+
+  private warm(step: number): void {
+    log('warm ' + step)
+  }
+
+  report(): string {
+    return this.name + ': ' + this.failed.length + ' failed'
+  }
+}
+`
+const workerNew = workerOld
+  .replace(
+    'if (job.attempts < 3) {\n          this.queue.push(job)',
+    "if (job.attempts < 5) {\n          log('retry ' + job.id)\n          this.queue.push(job)",
+  )
+  .replace("' failed'\n", "' failed, ' + this.queue.length + ' waiting'\n")
+
 const specs: Spec[] = [
   { path: 'src/app/main.ts', status: 'M', old: mainOld, new: mainNew },
   { path: 'src/app/util/strings.ts', status: 'A', new: strings },
@@ -459,6 +519,7 @@ const specs: Spec[] = [
   { path: 'pnpm-lock.yaml', status: 'M', old: lockfile('2.0.0', 300), new: lockfile('2.1.0', 305), generated: true },
   { path: 'Cargo.lock', status: 'M', old: cargoLock('0.3.0'), new: cargoLock('0.4.0'), generated: true },
   { path: 'dist/app.min.js', status: 'A', new: minified(9), generated: true },
+  { path: 'worker.ts', status: 'M', old: workerOld, new: workerNew },
 ]
 
 function buildFiles(): MockChangedFile[] {
@@ -515,6 +576,181 @@ function bigSql(): string {
   return rows.join('\n') + '\n'
 }
 
+const registryChecks = Array.from({ length: 14 }, (_, i) => `  if (bands.low > ${i * 3}) {\n    lines.push('more than ${i * 3} low entries')\n  }\n`).join('')
+const registryDefaults = Array.from({ length: 48 }, (_, i) => `  { id: 'entry-${i}', weight: ${(i * 7) % 100} },\n`).join('')
+
+/** A source file with nested scopes (class, method, nested function), a long function and data after the last scope, for the sticky header. */
+const registryTs = `// The registry of named entries, kept in weight order. Unchanged in this pull request.
+import { log } from './log'
+
+export interface Entry {
+  id: string
+  weight: number
+  label?: string
+}
+
+export type Filter = (entry: Entry) => boolean
+
+export const LIMITS = {
+  maxEntries: 64,
+  maxLabel: 40,
+  minWeight: 0,
+  maxWeight: 100,
+  warnAt: 48,
+}
+
+export class Registry {
+  private readonly entries = new Map<string, Entry>()
+
+  constructor(private readonly name: string) {
+    log('registry ' + name + ' opened')
+  }
+
+  get size(): number {
+    return this.entries.size
+  }
+
+  add(entry: Entry): void {
+    this.check(entry)
+    this.entries.set(entry.id, entry)
+    if (this.entries.size > LIMITS.warnAt) {
+      log('registry ' + this.name + ' is almost full')
+    }
+  }
+
+  find(id: string): Entry | undefined {
+    return this.entries.get(id)
+  }
+
+  list(filter?: Filter): Entry[] {
+    function byWeight(a: Entry, b: Entry): number {
+      if (a.weight !== b.weight) {
+        return b.weight - a.weight
+      }
+      // Equal weights are ordered by label.
+      const left = a.label ?? a.id
+      const right = b.label ?? b.id
+      return left < right ? -1 : left > right ? 1 : 0
+    }
+    const all = Array.from(this.entries.values())
+    const kept = filter ? all.filter(filter) : all
+    return kept.sort(byWeight)
+  }
+
+  render(html = '<img src=x onerror=alert(1)>'): string {
+    const items = this.list().map((entry) => '<li>' + (entry.label ?? entry.id) + '</li>')
+    return html + '<ul>' + items.join('') + '</ul>'
+  }
+
+  private check(entry: Entry): void {
+    if (entry.weight < LIMITS.minWeight || entry.weight > LIMITS.maxWeight) {
+      throw new Error('weight out of range: ' + entry.weight)
+    }
+    if (entry.label && entry.label.length > LIMITS.maxLabel) {
+      throw new Error('label too long: ' + entry.label)
+    }
+    if (this.entries.size >= LIMITS.maxEntries) {
+      throw new Error('registry ' + this.name + ' is full')
+    }
+  }
+}
+
+/** One line per entry with its weight band, then a line per count that matters. */
+export function summarize(registry: Registry): string[] {
+  const lines: string[] = []
+  const bands: Record<string, number> = { low: 0, mid: 0, high: 0 }
+  for (const entry of registry.list()) {
+    const band = entry.weight < 33 ? 'low' : entry.weight < 66 ? 'mid' : 'high'
+    bands[band] += 1
+    lines.push(band + ': ' + (entry.label ?? entry.id) + ' (' + entry.weight + ')')
+  }
+  lines.push('')
+${registryChecks}  lines.push('total: ' + registry.size)
+  return lines
+}
+
+export const DEFAULTS: Entry[] = [
+${registryDefaults}]
+`
+
+/** A 25,000-line source file under the highlighting limit (1 MiB): what a jump far down a file costs the sticky header. */
+function longSource(): string {
+  const out: string[] = ['// A long file of small functions. Unchanged in this pull request.', '']
+  for (let i = 0; out.length < 25_000; i++) {
+    out.push(`export function field${i}(input: string, limit = ${i % 50}): string {`)
+    out.push(`  const parts = input.split(',').map((part) => part.trim())`)
+    out.push('  if (parts.length > limit) {')
+    out.push(`    return parts.slice(0, limit).join(';') // keep ${i}`)
+    out.push('  }')
+    out.push("  return parts.join(';')")
+    out.push('}')
+    out.push('')
+  }
+  return out.join('\n') + '\n'
+}
+
+/** What the look-ups of the code navigation find: `log` is defined twice (a choice), `slugify` is used in several files, `ping` in more than a list shows. */
+const logTs = `/** Writes a line to the log. */
+export function log(message: string): void {
+  console.log(message)
+}
+
+export function warn(message: string): void {
+  console.warn('warning: ' + message)
+}
+
+/** Members that are named like keywords of the language: they are looked up all the same. */
+export class Muted {
+  private readonly names = new Set<string>()
+
+  static new(names: string[]): Muted {
+    const muted = new Muted()
+    names.forEach((name) => muted.names.add(name))
+    return muted
+  }
+
+  delete(name: string): boolean {
+    return this.names.delete(name)
+  }
+}
+
+export function unmute(muted: Muted, name: string): boolean {
+  return muted.delete(name)
+}
+`
+
+const legacyLogJs = `// The logger of the legacy client, kept until the client is gone.
+function log(message) {
+  console.log('[legacy] ' + message)
+}
+
+module.exports = { log: log }
+`
+
+const titlesTs = `import { slugify, truncate } from './strings'
+
+export function pageSlug(title: string): string {
+  return slugify(truncate(title, 60))
+}
+
+export function feedSlugs(titles: string[]): string[] {
+  return titles.map((title) => slugify(title))
+}
+
+export function anchorFor(heading: string): string {
+  return '#' + slugify(heading)
+}
+`
+
+const pingsTs = `// Generated: one call of ping per line.
+export function ping(n: number): number {
+  return n + 1
+}
+
+export const pings = [
+${Array.from({ length: 1100 }, (_, i) => `  ping(${i}),\n`).join('')}]
+`
+
 /** Files the PR doesn't touch: content (blob) or a commit (gitlink). */
 function unchangedSpecs(): Array<{ path: string; content?: string | Buffer; commit?: string; mode?: string }> {
   const out: Array<{ path: string; content?: string | Buffer; commit?: string; mode?: string }> = []
@@ -535,6 +771,12 @@ function unchangedSpecs(): Array<{ path: string; content?: string | Buffer; comm
   out.push({ path: 'data/archive/events.sql', content: bigSql() })
   out.push({ path: 'data/archive/snapshot.bin', content: fakeBinary(5_400_000, 11) })
   out.push({ path: 'scripts/deploy.sh', content: '#!/bin/sh\nset -eu\necho deploy\n', mode: '100755' })
+  out.push({ path: 'src/app/util/registry.ts', content: registryTs })
+  out.push({ path: 'src/app/util/schema.ts', content: longSource() })
+  out.push({ path: 'src/app/util/log.ts', content: logTs })
+  out.push({ path: 'src/legacy/log.js', content: legacyLogJs })
+  out.push({ path: 'src/app/util/titles.ts', content: titlesTs })
+  out.push({ path: 'src/gen/pings.ts', content: pingsTs })
   return out
 }
 
@@ -550,6 +792,15 @@ function buildTree(): MockTreeEntry[] {
 }
 
 export const tree: MockTreeEntry[] = buildTree()
+
+/** `git ls-tree -r` of the merge base: the changed files as they were, and the unchanged ones. */
+function buildBaseTree(): MockTreeEntry[] {
+  const changed = new Set(files.map((f) => f.path))
+  const before = files.filter((f) => f.oldOid !== null).map((f) => ({ path: f.oldPath ?? f.path, mode: f.oldMode, oid: f.oldOid! }))
+  return [...before, ...tree.filter((e) => !changed.has(e.path))].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
+}
+
+export const baseTree: MockTreeEntry[] = buildBaseTree()
 
 /** Paths whose PUT /viewed fails: a GitHub error, and a head that moved meanwhile (409). */
 export const VIEWED_FAILS = 'data/big.csv'

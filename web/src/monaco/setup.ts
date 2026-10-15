@@ -19,13 +19,15 @@ monaco.editor.defineTheme(SANDY_BEACH_THEME, sandyBeachTheme)
 monaco.editor.setTheme(SANDY_BEACH_THEME)
 
 // Monaco binds F7 / Shift+F7 to the accessible diff viewer; we implement our own
-// cross-file navigation (see useKeybindings), so drop those defaults.
+// cross-file navigation (see useKeybindings), so drop those defaults. Ctrl+Shift+O opens
+// its symbol outline popup, which this app doesn't offer.
 monaco.editor.addKeybindingRules([
   { keybinding: monaco.KeyCode.F7, command: '-editor.action.accessibleDiffViewer.next' },
   {
     keybinding: monaco.KeyMod.Shift | monaco.KeyCode.F7,
     command: '-editor.action.accessibleDiffViewer.prev',
   },
+  { keybinding: monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.KeyO, command: '-editor.action.quickOutline' },
 ])
 
 loader.config({ monaco })

@@ -1,7 +1,10 @@
 //! Opening a PR: GitHub metadata + cache-repo fetch + diff, with a short in-memory cache.
 
+pub mod nav;
 pub mod review;
 pub mod target;
+#[cfg(test)]
+pub(crate) mod testing;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -12,9 +15,12 @@ use serde::Serialize;
 use crate::error::AppError;
 use crate::git::parse::GITLINK_MODE;
 use crate::git::{
-    ChangedFile, GitAuth, GitFailure, ObjectLookup, Repo, RepoGuard, Repos, TreeEntry,
+    ChangedFile, GitAuth, GitFailure, ObjectLookup, Repo, RepoGuard, Repos, STALL_PR, TreeEntry,
 };
 use crate::github::{Github, Tokens, ViewedState};
+use crate::index::Indexer;
+use crate::index::build::Limits;
+use crate::index::db::IndexDb;
 use crate::state::{PrKey, StateDb};
 
 const CACHE_TTL: Duration = Duration::from_secs(30);
@@ -150,6 +156,20 @@ pub struct PrService {
     tokens: Tokens,
     /// None if the state database could not be opened; viewed marks still work.
     state: Option<StateDb>,
+    /// None if the index database could not be opened; a file's symbols are then parsed on demand,
+    /// without a cache, and nothing else of code navigation works.
+    index: Option<Indexer>,
+    /// The files whose parse timed out lately, so that they are not parsed again at once (see [`PrService::symbols`]).
+    slow_parses: nav::SlowParses,
+    /// The blobs that are being fetched for the lines of references, so that no other lookup asks for them but waits for
+    /// that fetch, and those whose fetch failed lately, so that none asks for them again at once (see
+    /// [`PrService::references`]).
+    snippet_fetches: nav::SnippetFetches,
+    /// How long a lookup waits for the blobs it fetches for those lines, or that another lookup fetches (see
+    /// [`PrService::references`]).
+    snippet_fetch_wait: Duration,
+    /// How long the task of a lookup goes on asking for the blobs the remote does not refuse, once it has refused some.
+    snippet_fetch_budget: Duration,
     cache: Mutex<HashMap<PrKey, CacheSlot>>,
     /// Detached work after a response (see [`PrService::set_viewed`]), awaited on shutdown.
     bookkeeping: Mutex<tokio::task::JoinSet<()>>,
@@ -162,12 +182,17 @@ fn git_err(e: GitFailure) -> AppError {
 }
 
 impl PrService {
-    pub fn new(repos: Repos, state: Option<StateDb>) -> Self {
+    pub fn new(repos: Repos, state: Option<StateDb>, index: Option<IndexDb>) -> Self {
         PrService {
             repos,
             github: Github::new(),
             tokens: Tokens::default(),
             state,
+            index: index.map(|db| Indexer::new(db, Limits::default())),
+            slow_parses: Default::default(),
+            snippet_fetches: Default::default(),
+            snippet_fetch_wait: nav::SNIPPET_FETCH_WAIT,
+            snippet_fetch_budget: nav::FETCH_RETRY_BUDGET,
             cache: Default::default(),
             bookkeeping: Default::default(),
             review_writes: Default::default(),
@@ -548,11 +573,17 @@ impl PrService {
         }
     }
 
-    /// Waits for detached bookkeeping, then for in-flight git work (see [`Repos::drain`]).
-    /// Bookkeeping still running at the deadline is cancelled first, so it cannot start git
-    /// work that the repo drain no longer waits for.
+    /// Tells the index builds and the fetches for the lines of references to stop, waits for detached
+    /// bookkeeping, then for the builds, then for in-flight git work (see [`Repos::drain`]). They are
+    /// told first: a build or a fetch that waits for the repo lock that bookkeeping holds should not
+    /// start fetching when it gets it. Bookkeeping still running at the deadline is cancelled, so it
+    /// cannot start git work that the repo drain no longer waits for.
     pub async fn drain(&self, timeout: Duration) {
         let deadline = tokio::time::Instant::now() + timeout;
+        self.snippet_fetches.shut_down();
+        if let Some(index) = &self.index {
+            index.shut_down();
+        }
         let mut tasks =
             std::mem::take(&mut *self.bookkeeping.lock().expect("bookkeeping poisoned"));
         let _ = tokio::time::timeout_at(deadline, async {
@@ -560,6 +591,11 @@ impl PrService {
         })
         .await;
         tasks.shutdown().await;
+        if let Some(index) = &self.index {
+            index
+                .drain(deadline.saturating_duration_since(tokio::time::Instant::now()))
+                .await;
+        }
         self.repos
             .drain(deadline.saturating_duration_since(tokio::time::Instant::now()))
             .await;
@@ -601,7 +637,7 @@ async fn range_files(
         oids.extend(repo.gitattributes_oids(to, &paths).await.map_err(git_err)?);
         oids.sort();
         oids.dedup();
-        repo.fetch_blobs(guard, auth, &oids)
+        repo.fetch_blobs(guard, auth, &oids, STALL_PR)
             .await
             .map_err(git_err)?;
         guard.state.blobs_fetched.insert(pair);
@@ -852,7 +888,7 @@ mod tests {
     async fn open_at_serves_a_snapshot_of_that_head_past_its_ttl() {
         // Never touched: a cache hit reads neither the repo nor GitHub.
         let root = std::env::temp_dir().join("tideline-open-at-unused");
-        let service = Arc::new(PrService::new(Repos::new(root), None));
+        let service = Arc::new(PrService::new(Repos::new(root), None, None));
         let key = PrKey {
             host: "github.com".to_string(),
             owner: "o".to_string(),

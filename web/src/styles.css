@@ -411,7 +411,7 @@ kbd {
 .statusbar {
   display: flex;
   align-items: center;
-  gap: 14px;
+  gap: 12px;
   padding: 0 10px;
   background: var(--second-bg);
   border-top: 1px solid var(--line);
@@ -425,10 +425,31 @@ kbd {
   color: var(--fg);
 }
 
+/* The live region for a look-up is in the page all along; with no text it takes no room, and the bar's gap is not added for it. */
+.status-looking:empty {
+  position: absolute;
+}
+
+/* The shortcuts that don't fit are left out whole, the last first: each line is as high as the bar, so those that wrap are out of sight. */
+.hints {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  align-content: flex-start;
+  gap: 0 12px;
+  min-width: 0;
+  height: 100%;
+  overflow: hidden;
+}
+
 .hint {
   display: inline-flex;
   align-items: center;
   gap: 3px;
+}
+
+.hints > .hint {
+  height: 100%;
 }
 
 /* Tree ------------------------------------------------------------------------- */
@@ -1316,6 +1337,47 @@ kbd {
   background: var(--syn-functions);
 }
 
+/* The sticky header: the scopes around an editor's first visible line, over its top lines (`monaco/sticky.ts`). */
+.monaco-editor .tl-sticky {
+  z-index: 4;
+  overflow: hidden;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg);
+  box-shadow: 0 3px 4px -3px rgb(93 74 47 / 25%);
+  color: var(--fg);
+  cursor: default;
+  user-select: none;
+}
+
+.tl-sticky-row {
+  position: relative;
+  height: var(--tl-sticky-line);
+  overflow: hidden;
+  white-space: pre;
+  cursor: pointer;
+}
+
+.tl-sticky-row:hover {
+  background: var(--highlight);
+}
+
+.tl-sticky-num {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: var(--tl-sticky-num);
+  color: var(--disabled);
+  text-align: right;
+}
+
+.tl-sticky-text {
+  position: absolute;
+  top: 0;
+  right: 0;
+  left: var(--tl-sticky-text);
+  overflow: hidden;
+}
+
 /* Comments without a line in the diff, above it. */
 .pane-threads {
   display: flex;
@@ -1660,6 +1722,155 @@ kbd {
 
 .monaco-editor .diff-hidden-lines .center {
   font-family: var(--ui-font);
+  font-size: 12px;
+}
+
+/* Going to a definition ------------------------------------------------------------- */
+
+/* The name under the pointer while Ctrl (Cmd) is held (`monaco/links.ts`). */
+.monaco-editor .tl-nav-link {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+.index-dialog .index-phase {
+  font-size: 12px;
+}
+
+.index-progress {
+  flex: none;
+}
+
+.progress-bar.is-indeterminate {
+  width: 30%;
+  animation: index-sweep 1.1s ease-in-out infinite alternate;
+}
+
+@keyframes index-sweep {
+  from {
+    margin-left: 0;
+  }
+  to {
+    margin-left: 70%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .progress-bar.is-indeterminate {
+    animation: none;
+  }
+}
+
+/* The list of places to choose from (`NavPopup`), over the sticky headers. */
+.nav-popup {
+  position: fixed;
+  z-index: 150;
+  display: flex;
+  flex-direction: column;
+  width: min(640px, calc(100vw - 16px));
+  max-height: min(320px, 50vh);
+  border: 1px solid var(--selection-bg);
+  border-radius: 6px;
+  background: var(--bg);
+  box-shadow: 0 8px 28px #8a6d4033;
+  overflow: hidden;
+}
+
+.nav-popup:focus,
+.nav-popup-list:focus {
+  outline: none;
+}
+
+.nav-popup-title {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  flex: none;
+  padding: 6px 10px;
+  background: var(--second-bg);
+  border-bottom: 1px solid var(--line);
+  color: var(--fg);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.nav-popup-title > :first-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.nav-popup-title .muted {
+  flex: none;
+  font-weight: normal;
+}
+
+.nav-popup-list {
+  overflow: auto;
+  padding: 2px 0;
+}
+
+.nav-popup-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 24px;
+  padding: 0 10px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.nav-popup-item.is-active {
+  background: var(--tree);
+}
+
+.nav-popup-file,
+.nav-popup-line {
+  flex: none;
+}
+
+.nav-popup-dir {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 12px;
+}
+
+.nav-popup-line {
+  font-size: 12px;
+}
+
+/* The directory gives way to the snippet, which keeps room for the name that NAME_REACH leaves in place: 40 characters, or half the row. */
+.nav-popup-snippet {
+  flex: 1 1 0;
+  min-width: min(40ch, 50%);
+  margin-left: 6px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--syn-variables);
+  font: 12px var(--code-font);
+}
+
+.nav-popup mark {
+  background: none;
+  color: inherit;
+  font-weight: 700;
+  text-decoration: underline;
+  text-decoration-color: var(--syn-attributes);
+  text-underline-offset: 2px;
+}
+
+.nav-popup-empty {
+  padding: 8px 12px;
+}
+
+.nav-popup-note {
+  flex: none;
+  padding: 4px 10px;
+  border-top: 1px solid var(--line);
   font-size: 12px;
 }
 

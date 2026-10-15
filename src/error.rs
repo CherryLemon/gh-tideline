@@ -3,7 +3,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
 
-/// Error codes from the M0–M2 contracts; each maps to a fixed HTTP status.
+/// Error codes from the M0–M3 contracts; each maps to a fixed HTTP status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorCode {
     Unauthorized,
@@ -17,6 +17,8 @@ pub enum ErrorCode {
     Rejected,
     PendingReviewExists,
     ReviewChanged,
+    IndexUnavailable,
+    IndexMissing,
 }
 
 impl ErrorCode {
@@ -33,6 +35,8 @@ impl ErrorCode {
             ErrorCode::Rejected => "rejected",
             ErrorCode::PendingReviewExists => "pending_review_exists",
             ErrorCode::ReviewChanged => "review_changed",
+            ErrorCode::IndexUnavailable => "index_unavailable",
+            ErrorCode::IndexMissing => "index_missing",
         }
     }
 
@@ -49,6 +53,8 @@ impl ErrorCode {
             ErrorCode::Rejected => StatusCode::UNPROCESSABLE_ENTITY,
             ErrorCode::PendingReviewExists => StatusCode::CONFLICT,
             ErrorCode::ReviewChanged => StatusCode::CONFLICT,
+            ErrorCode::IndexUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            ErrorCode::IndexMissing => StatusCode::CONFLICT,
         }
     }
 }
@@ -102,6 +108,14 @@ impl AppError {
     /// discarded or started elsewhere).
     pub fn review_changed(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::ReviewChanged, message)
+    }
+    /// Code navigation cannot answer: its index database could not be opened or failed.
+    pub fn index_unavailable(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::IndexUnavailable, message)
+    }
+    /// A lookup in a commit whose index is not complete: it has to be built first.
+    pub fn index_missing(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::IndexMissing, message)
     }
 }
 

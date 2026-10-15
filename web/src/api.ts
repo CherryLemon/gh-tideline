@@ -207,6 +207,67 @@ export interface RepoRef {
   repo: string
 }
 
+/** Which version of a file: the PR's head (the new file) or its base (the old file). */
+export type NavSide = 'head' | 'base'
+
+/** A position in the app, for history entries and for revealing a place in the diff. */
+export interface NavPos {
+  /** The PR file path as in `?file=` (for a renamed file, its new path even on the base side). */
+  path: string
+  /** 'base' is the original (left) editor; 'head' the modified (right) editor, or the single editor of an unchanged file. */
+  side: NavSide
+  line: number
+  column: number
+}
+
+export interface SymbolInfo {
+  name: string
+  kind: string
+  line: number
+  column: number
+  endColumn: number
+  startLine: number
+  endLine: number
+}
+
+export interface FileSymbols {
+  /** null when the file's language has no grammar. */
+  language: string | null
+  tooLarge: boolean
+  symbols: SymbolInfo[]
+}
+
+export type IndexState = 'missing' | 'queued' | 'building' | 'ready' | 'failed' | 'cancelled'
+
+export interface IndexStatus {
+  commit: string
+  state: IndexState
+  phase: 'listing' | 'fetching' | 'parsing' | 'saving' | null
+  done: number
+  total: number
+  cancelling: boolean
+  message: string | null
+}
+
+export interface NavHit {
+  path: string
+  line: number
+  column: number
+  endColumn: number
+  kind: string
+  snippet: string
+  snippetColumn: number
+  tier: 'file' | 'dir' | 'other'
+}
+
+export interface NavResult {
+  language: string | null
+  commit: string
+  name: string
+  hits: NavHit[]
+  truncated: boolean
+}
+
 export const UNAUTHORIZED_MESSAGE = 'Run `gh-tideline` in a terminal to authorize this browser'
 export const STALE_HEAD_MESSAGE = 'The pull request has been updated; refresh to load the new version'
 
@@ -219,6 +280,8 @@ const CODE_MESSAGES: Record<string, string> = {
   git_error: 'Git operation failed',
   bad_request: 'Invalid request',
   stale_head: STALE_HEAD_MESSAGE,
+  index_missing: 'The repository has not been indexed yet',
+  index_unavailable: "The repository index can't be used",
   rejected: 'GitHub refused the change',
   pending_review_exists: 'You have a pending review: add the comment to it, or submit or discard the review first',
   review_changed: 'Your pending review changed on GitHub; refresh to see it',
@@ -227,7 +290,7 @@ const CODE_MESSAGES: Record<string, string> = {
 }
 
 /** Codes whose fixed text says it all (the server's detail would repeat it). */
-const FIXED_MESSAGES = new Set(['unauthorized', 'stale_head', 'pending_review_exists', 'review_changed', 'http_413'])
+const FIXED_MESSAGES = new Set(['unauthorized', 'stale_head', 'index_missing', 'pending_review_exists', 'review_changed', 'http_413'])
 
 export class ApiError extends Error {
   readonly status: number
@@ -410,6 +473,73 @@ export async function renderMarkdown(r: RepoRef, text: string): Promise<string> 
 /** Raw blob response; the caller decides whether to read the body (see Content-Length checks). */
 export function getBlob(r: RepoRef, oid: string, signal?: AbortSignal): Promise<Response> {
   return request(`${repoBase(r)}/blobs/${oid}`, { signal })
+}
+
+/** The definitions and scopes of one file version, by blob oid (`path` picks the grammar). */
+export async function fileSymbols(r: RepoRef, oid: string, path: string, signal?: AbortSignal): Promise<FileSymbols> {
+  const res = await request(`${repoBase(r)}/blobs/${seg(oid)}/symbols?path=${seg(path)}`, { signal })
+  return (await res.json()) as FileSymbols
+}
+
+const indexQuery = (head: string, side: NavSide) => `head=${seg(head)}&side=${side}`
+
+/**
+ * How long the browser waits for the server to answer the start of an index build, and the stop of one, before it gives the request up as
+ * a failure to reach the server (a start that fails so is tried again). Both are safe to send again; one that hangs holds on to one of the
+ * few connections a page has to the server, and the requests after it queue behind it.
+ */
+export const START_INDEX_TIMEOUT_MS = 30_000
+export const CANCEL_INDEX_TIMEOUT_MS = 10_000
+
+/**
+ * Starts the build of the repository index of a commit (the PR's head or its merge base; `head` is the head the page
+ * shows), or joins the one under way. A commit that is indexed already answers `ready` at once.
+ */
+export async function startIndex(r: RepoRef, n: number, head: string, side: NavSide): Promise<IndexStatus> {
+  const res = await request(`${repoBase(r)}/pulls/${n}/index`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ head, side }),
+    signal: AbortSignal.timeout(START_INDEX_TIMEOUT_MS),
+  })
+  return (await res.json()) as IndexStatus
+}
+
+export async function getIndex(r: RepoRef, n: number, head: string, side: NavSide, signal?: AbortSignal): Promise<IndexStatus> {
+  const res = await request(`${repoBase(r)}/pulls/${n}/index?${indexQuery(head, side)}`, { signal })
+  return (await res.json()) as IndexStatus
+}
+
+/** Asks the build to stop; it reports `cancelling` until it has. */
+export async function cancelIndex(r: RepoRef, n: number, head: string, side: NavSide): Promise<IndexStatus> {
+  const res = await request(`${repoBase(r)}/pulls/${n}/index?${indexQuery(head, side)}`, {
+    method: 'DELETE',
+    signal: AbortSignal.timeout(CANCEL_INDEX_TIMEOUT_MS),
+  })
+  return (await res.json()) as IndexStatus
+}
+
+/** What a lookup asks: the name clicked in `path` (the file as that side's commit has it). */
+export interface NavQuery {
+  head: string
+  side: NavSide
+  path: string
+  name: string
+}
+
+async function lookup(r: RepoRef, n: number, kind: 'definitions' | 'references', q: NavQuery, signal?: AbortSignal): Promise<NavResult> {
+  const res = await request(`${repoBase(r)}/pulls/${n}/${kind}?${indexQuery(q.head, q.side)}&path=${seg(q.path)}&name=${seg(q.name)}`, { signal })
+  return (await res.json()) as NavResult
+}
+
+/** The definitions of a name, nearest to `path` first. `index_missing` (409) until the commit's index is built. */
+export function getDefinitions(r: RepoRef, n: number, q: NavQuery, signal?: AbortSignal): Promise<NavResult> {
+  return lookup(r, n, 'definitions', q, signal)
+}
+
+/** The places that use a name, by name only: at most 1000, `truncated` when there are more. */
+export function getReferences(r: RepoRef, n: number, q: NavQuery, signal?: AbortSignal): Promise<NavResult> {
+  return lookup(r, n, 'references', q, signal)
 }
 
 export function errorMessage(e: unknown): string {
