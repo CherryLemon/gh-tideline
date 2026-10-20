@@ -3,7 +3,8 @@
 //! A blob (the content of a file, named by its git OID) is stored once per grammar with the tags parsed from it,
 //! however many commits contain it, and the names of the tags are interned. A commit is only a listing of the blobs
 //! at its paths. The listing is written in one transaction together with the mark that says it is complete, so a
-//! lookup never sees a commit that is half indexed. Nothing is evicted.
+//! lookup never sees a commit that is half indexed. Nothing is evicted, but the whole index is dropped when it was
+//! built by a version that tags differently (see `tags::TAGS_VERSION`), and builds again as commits are looked up.
 //!
 //! Every server and job shares the file: WAL mode, a busy timeout and an insert that leaves a stored blob alone make
 //! it harmless to write the same blob twice (only a blob that is `unreadable` is replaced, once, by one that is not).
@@ -23,7 +24,7 @@ use rusqlite::{
 
 use super::lang::{Family, Grammar};
 use super::rank::{self, Origin};
-use super::tags::Tag;
+use super::tags::{TAGS_VERSION, Tag};
 use crate::clock;
 
 /// How long a connection waits for the lock another one holds. The tests hold it on purpose, and a machine that runs
@@ -33,7 +34,8 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(if cfg!(test) { 60 } else { 5
 const TOUCH_AFTER_SECS: i64 = 3600;
 
 /// Schema migrations; `PRAGMA user_version` is the number already applied.
-const MIGRATIONS: &[&str] = &["
+const MIGRATIONS: &[&str] = &[
+    "
     CREATE TABLE blobs (
         id INTEGER PRIMARY KEY,
         oid TEXT NOT NULL,
@@ -76,10 +78,17 @@ const MIGRATIONS: &[&str] = &["
         PRIMARY KEY (commit_id, path)
     ) WITHOUT ROWID;
     CREATE INDEX tree_entries_blob ON tree_entries (commit_id, blob_id, family);
-"];
+",
+    "
+    CREATE TABLE meta (
+        key TEXT PRIMARY KEY,
+        value INTEGER NOT NULL
+    ) WITHOUT ROWID;
+",
+];
 
-/// The definitions and `implementation` tags of a blob. `tags_blob` holds only these rows (about one tag in eight),
-/// which keeps it small, and SQLite uses it only for a condition that implies the one the index was made with.
+/// The definitions and `implementation` tags of a blob. `tags_blob` holds only these rows (at most about one tag in
+/// eight), which keeps it small, and SQLite uses it only for a condition that implies the one the index was made with.
 const SYMBOLS_SQL: &str = "SELECT n.name, t.kind, t.is_def, t.line, t.col, t.end_col, t.scope_start, t.scope_end, t.snippet, t.snippet_col
      FROM tags t JOIN names n ON n.id = t.name_id
      WHERE t.blob_id = ?1 AND (t.is_def = 1 OR t.kind = 'implementation')
@@ -224,6 +233,7 @@ impl IndexDb {
             .pragma_update(None, "synchronous", "NORMAL")
             .map_err(|e| fail(&e))?;
         migrate(&mut writer, MIGRATIONS).map_err(|e| fail(&e))?;
+        drop_old_tags(&mut writer, TAGS_VERSION).map_err(|e| fail(&e))?;
         let reader = open_reader(path).map_err(|e| fail(&e))?;
         let bulk_reader = open_reader(path).map_err(|e| fail(&e))?;
         Ok(IndexDb {
@@ -718,6 +728,41 @@ fn migrate(conn: &mut Connection, migrations: &[&str]) -> rusqlite::Result<()> {
     tx.commit()
 }
 
+/// Empties the index if its tags are older than `version`, the `tags::TAGS_VERSION` of this program: they lack what
+/// the queries find now, and a blob is never parsed again once it is stored. The commits then build again, as they are
+/// looked up. An index whose tags are newer is left as it is, and so is one whose schema is newer (its program keeps
+/// its tags up to date). Like `migrate`, `BEGIN IMMEDIATE` makes concurrent servers do it once.
+///
+/// A server of an older version, still running or started later, adds the tags of its own queries, which stay until the
+/// version is raised again; it is not told.
+fn drop_old_tags(conn: &mut Connection, version: i64) -> rusqlite::Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let applied: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if applied != MIGRATIONS.len() as i64 {
+        return Ok(());
+    }
+    let stored: i64 = tx
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'tags_version'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    if stored >= version {
+        return Ok(());
+    }
+    tx.execute_batch(
+        "DELETE FROM tree_entries; DELETE FROM commits; DELETE FROM tags; DELETE FROM names; DELETE FROM blobs;",
+    )?;
+    tx.execute(
+        "INSERT INTO meta (key, value) VALUES ('tags_version', ?1)
+         ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+        [version],
+    )?;
+    tx.commit()
+}
+
 #[cfg(test)]
 mod tests {
     use std::ops::Deref;
@@ -862,6 +907,63 @@ mod tests {
             vec![def("f", 1, 4)]
         );
         assert_eq!(fx.count("PRAGMA user_version"), MIGRATIONS.len() as i64);
+    }
+
+    #[test]
+    fn tags_of_an_older_version_are_dropped_and_newer_ones_kept() {
+        let fx = TempDb::new("tags-version");
+        let tags_version = || fx.count("SELECT value FROM meta WHERE key = 'tags_version'");
+        assert_eq!(tags_version(), TAGS_VERSION);
+        let filled = |db: &IndexDb| {
+            rust_commit(db, &commit(1), vec![("a.rs", vec![def("f", 1, 4)])]);
+            assert!(db.commit_complete(&commit(1)).unwrap());
+        };
+        let emptied = || {
+            for table in ["tree_entries", "commits", "tags", "names", "blobs"] {
+                assert_eq!(
+                    fx.count(&format!("SELECT count(*) FROM {table}")),
+                    0,
+                    "{table}"
+                );
+            }
+        };
+        filled(&fx);
+
+        // A newer version leaves the index alone, and so does this one.
+        fx.side()
+            .execute("UPDATE meta SET value = ?1", [TAGS_VERSION + 1])
+            .unwrap();
+        let again = IndexDb::open(&fx.path).unwrap();
+        assert!(again.commit_complete(&commit(1)).unwrap());
+        assert_eq!(tags_version(), TAGS_VERSION + 1);
+
+        // Tags of an older version are dropped, with the commits that list them, which build again.
+        fx.side()
+            .execute("UPDATE meta SET value = ?1", [TAGS_VERSION - 1])
+            .unwrap();
+        let again = IndexDb::open(&fx.path).unwrap();
+        emptied();
+        assert!(!again.commit_complete(&commit(1)).unwrap());
+        assert_eq!(again.blob_symbols(&oid(1), Grammar::Rust).unwrap(), None);
+        assert_eq!(tags_version(), TAGS_VERSION);
+        filled(&again);
+        drop(IndexDb::open(&fx.path).unwrap());
+        assert!(again.commit_complete(&commit(1)).unwrap());
+
+        // An index from before the tags had a version has the oldest.
+        fx.side().execute("DELETE FROM meta", []).unwrap();
+        drop(IndexDb::open(&fx.path).unwrap());
+        emptied();
+        assert_eq!(tags_version(), TAGS_VERSION);
+
+        // A newer schema keeps its tags, whatever their version: its program keeps them up to date.
+        filled(&again);
+        fx.side()
+            .execute_batch("DELETE FROM meta; PRAGMA user_version = 99;")
+            .unwrap();
+        let newer = IndexDb::open(&fx.path).unwrap();
+        assert!(newer.commit_complete(&commit(1)).unwrap());
+        assert_eq!(fx.count("SELECT count(*) FROM meta"), 0);
     }
 
     #[test]

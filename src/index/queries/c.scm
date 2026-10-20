@@ -130,6 +130,49 @@
             (identifier) @name)
     ]) @reference.call
 
+; names used as values, like a function that is passed or kept: passed to a call (`qsort(v, n, size, compare)`),
+; returned, assigned (`handler_t h = on_exit;`) or held in an initializer (`{ .open = dev_open }`); a query cannot tell a
+; function from a variable, so variables are tagged too (`NULL` is no identifier)
+
+([
+    (argument_list
+        [
+            (identifier) @name
+            (field_expression
+                field: (field_identifier) @name)
+        ])
+    (return_statement
+        [
+            (identifier) @name
+            (field_expression
+                field: (field_identifier) @name)
+        ])
+    (init_declarator
+        value: [
+            (identifier) @name
+            (field_expression
+                field: (field_identifier) @name)
+        ])
+    (assignment_expression
+        right: [
+            (identifier) @name
+            (field_expression
+                field: (field_identifier) @name)
+        ])
+    (initializer_list
+        [
+            (identifier) @name
+            (field_expression
+                field: (field_identifier) @name)
+        ])
+    (initializer_pair
+        value: [
+            (identifier) @name
+            (field_expression
+                field: (field_identifier) @name)
+        ])
+]) @reference.value
+
 ; every type position (defined types are matched by the patterns above)
 
 (type_identifier) @name @reference.type

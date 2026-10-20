@@ -33,6 +33,30 @@
             property: (property_identifier) @name)
     ]) @reference.class
 
+; class fields and default parameters holding a name, like a function that is kept (`handler = this.onClick`,
+; `cb = noop`)
+
+([
+    (public_field_definition
+        value: [
+            (identifier) @name
+            (member_expression
+                property: (property_identifier) @name)
+        ])
+    (required_parameter
+        value: [
+            (identifier) @name
+            (member_expression
+                property: (property_identifier) @name)
+        ])
+    (optional_parameter
+        value: [
+            (identifier) @name
+            (member_expression
+                property: (property_identifier) @name)
+        ])
+]) @reference.value
+
 ; every other type position (`implements Foo`, generics, assertions, ...)
 
 (type_identifier) @name @reference.type

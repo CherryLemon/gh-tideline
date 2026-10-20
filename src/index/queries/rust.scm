@@ -134,6 +134,99 @@
     name: (identifier) @name) @reference.type
     (#match? @name "^[A-Z]"))
 
+; names used as values, like a function that is passed or kept: passed to a call (`.map(parse)`, `spawn(Self::run)`),
+; returned (also as the last expression of a function), assigned (`let f = parse;`) or held (`[a, b]`,
+; `Handler { run: parse }`, `Handler { parse }`); a query cannot tell a function from a variable, so variables are
+; tagged too, except `None`. Written after the capitalized path segments, which keep `Kind::B` a type.
+
+(([
+    (arguments
+        [
+            (identifier) @name
+            (field_expression
+                field: (field_identifier) @name)
+            (scoped_identifier
+                name: (identifier) @name)
+        ])
+    (return_expression
+        [
+            (identifier) @name
+            (field_expression
+                field: (field_identifier) @name)
+            (scoped_identifier
+                name: (identifier) @name)
+        ])
+    (function_item
+        body: (block
+            [
+                (identifier) @name
+                (field_expression
+                    field: (field_identifier) @name)
+                (scoped_identifier
+                    name: (identifier) @name)
+            ]
+            .))
+    (let_declaration
+        value: [
+            (identifier) @name
+            (field_expression
+                field: (field_identifier) @name)
+            (scoped_identifier
+                name: (identifier) @name)
+        ])
+    (assignment_expression
+        right: [
+            (identifier) @name
+            (field_expression
+                field: (field_identifier) @name)
+            (scoped_identifier
+                name: (identifier) @name)
+        ])
+    (const_item
+        value: [
+            (identifier) @name
+            (field_expression
+                field: (field_identifier) @name)
+            (scoped_identifier
+                name: (identifier) @name)
+        ])
+    (static_item
+        value: [
+            (identifier) @name
+            (field_expression
+                field: (field_identifier) @name)
+            (scoped_identifier
+                name: (identifier) @name)
+        ])
+    (field_initializer
+        value: [
+            (identifier) @name
+            (field_expression
+                field: (field_identifier) @name)
+            (scoped_identifier
+                name: (identifier) @name)
+        ])
+    (shorthand_field_initializer
+        (identifier) @name)
+    (array_expression
+        [
+            (identifier) @name
+            (field_expression
+                field: (field_identifier) @name)
+            (scoped_identifier
+                name: (identifier) @name)
+        ])
+    (tuple_expression
+        [
+            (identifier) @name
+            (field_expression
+                field: (field_identifier) @name)
+            (scoped_identifier
+                name: (identifier) @name)
+        ])
+]) @reference.value
+    (#not-eq? @name "None"))
+
 ; every other type position
 
 ((type_identifier) @name @reference.type

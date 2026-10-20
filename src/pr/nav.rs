@@ -1591,10 +1591,13 @@ pub fn twice() {
 ";
     const SCRIPT_PY: &str = "def parse(text):
     return parse(text)
+
+strict = wrap(parse)
 ";
 
     /// A pull request whose head defines `parse` in five Rust files and a Python one, and uses it in four Rust files
-    /// and the Python one; its merge base has a different file in the first directory and another `parse`.
+    /// and the Python one, which also wraps it; its merge base has a different file in the first directory and another
+    /// `parse`.
     async fn lookup_pull(name: &str) -> Pull {
         Pull::with_files(
             name,
@@ -1769,16 +1772,27 @@ pub fn twice() {
             .await
             .unwrap();
         assert_eq!(got.language, Some("python"));
+        // A function passed to another one is used too.
         assert_eq!(
             got.hits,
-            [hit(
-                "parse",
-                "src/a/script.py",
-                (2, 12),
-                "call",
-                ("return parse(text)", 8),
-                "file"
-            )]
+            [
+                hit(
+                    "parse",
+                    "src/a/script.py",
+                    (2, 12),
+                    "call",
+                    ("return parse(text)", 8),
+                    "file"
+                ),
+                hit(
+                    "parse",
+                    "src/a/script.py",
+                    (4, 15),
+                    "value",
+                    ("strict = wrap(parse)", 15),
+                    "file"
+                ),
+            ]
         );
 
         // A definition is not a reference to its name, and a name nobody uses has no hits.

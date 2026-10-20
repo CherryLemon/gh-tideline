@@ -2,8 +2,9 @@
 //!
 //! A query marks a name with `@name` and the node it belongs to with `@definition.<kind>` or `@reference.<kind>`. The
 //! queries in `queries/` are ours (most replace the ones shipped with the grammars, which tag little more than
-//! definitions): they also tag calls and type uses as references, and tag whole definitions so a scope spans the
-//! entire function or class. Where several patterns tag the same name node, the pattern written first wins.
+//! definitions): they also tag calls, type uses and names used as values (a function passed to a call) as references,
+//! and tag whole definitions so a scope spans the entire function or class. Where several patterns tag the same name
+//! node, the pattern written first wins.
 //!
 //! Running the queries is ours too, not the `tree-sitter-tags` crate's: tree-sitter's query cursor takes minutes on some
 //! files that are not code (see `parse`), and the crate cannot be told to give up on them.
@@ -37,6 +38,11 @@ const JAVASCRIPT_QUERY: &str = include_str!("queries/javascript.scm");
 const JSX_QUERY: &str = include_str!("queries/jsx.scm");
 const TYPESCRIPT_QUERY: &str = include_str!("queries/typescript.scm");
 
+/// The version of what `parse` finds. The index keeps the tags of a blob once it has parsed it, so it is raised with
+/// every change to a query, a grammar, or how tags are extracted, that changes the tags of some file: an index whose
+/// tags are older is emptied (see `IndexDb::open`). A test holds a hash of the queries and of the node types of the
+/// grammars, and fails until it is updated with them.
+pub const TAGS_VERSION: i64 = 1;
 /// A byte order mark, ignored like the editor ignores it.
 const BOM: &[u8] = b"\xEF\xBB\xBF";
 /// How long `parse` works on one file at most, parsing and matching together. Real code never comes near it (a file of
@@ -65,8 +71,9 @@ const MAX_NAME_BYTES: usize = 256;
 pub struct Tag {
     pub name: String,
     /// The capture suffix: for definitions `function`, `method`, `constructor`, `class`, `interface`, `enum`, `type`,
-    /// `constant`, `variable`, `module`, `namespace` or `macro`; for references `call`, `type`, `class` or
-    /// `implementation` (the `impl` blocks of Rust, which have no name of their own).
+    /// `constant`, `variable`, `module`, `namespace` or `macro`; for references `call`, `type`, `class`,
+    /// `implementation` (the `impl` blocks of Rust, which have no name of their own) or `value` (a name passed to a
+    /// call, returned, assigned or held in a literal, like a function that is wrapped or kept).
     pub kind: String,
     pub is_def: bool,
     /// 1-based line of the name.
@@ -808,6 +815,17 @@ def outer():
     def nested():
         pass
     return nested
+
+
+def deco(fn):
+    @functools.wraps(fn)
+    def wrapper(self, *args):
+        return fn(self, *args)
+    return wrapper
+
+
+wrapped = deco(outer)
+job = Thread(target=pool.start, args=(LIMIT,))
 "#;
 
     const JAVA: &str = r#"package a.b;
@@ -1119,6 +1137,10 @@ int helper() { ns::Widget w; w.draw(); return std::max(1, 2); }
                 "function fetch 23:11 23-25",
                 "function outer 28:5 28-31",
                 "function nested 29:9 29-30",
+                "function deco 34:5 34-38",
+                "function wrapper 36:9 36-37",
+                "constant wrapped 41:1 41-41",
+                "constant job 42:1 42-42",
             ]
         );
         let found = refs(Grammar::Python, PYTHON);
@@ -1138,9 +1160,30 @@ int helper() { ns::Widget w; w.draw(); return std::max(1, 2); }
                 "type Url 23:26",
                 "call get 24:22",
                 "call Item 25:12",
+                "call wraps 35:16",
+                "call fn 37:16",
+                "call deco 41:11",
             ],
         );
-        assert_lacks(&found, &["int", "str"]);
+        let values: Vec<&String> = found.iter().filter(|r| r.starts_with("value ")).collect();
+        assert_eq!(
+            values,
+            [
+                "value x 13:23",
+                "value x 13:42",
+                "value url 24:26",
+                "value r 25:17",
+                "value nested 31:12",
+                "value fn 35:22",
+                "value wrapper 38:12",
+                "value outer 41:16",
+                "value start 42:26",
+                "value LIMIT 42:39",
+            ]
+        );
+        // `self` is no name to look up; a splat, the name of a keyword argument and the object before a dot are not
+        // tagged.
+        assert_lacks(&found, &["int", "str", "self", "args", "target", "pool"]);
     }
 
     #[test]
@@ -1657,6 +1700,299 @@ Foo::Foo() {}
     }
 
     #[test]
+    fn names_passed_kept_or_returned_are_value_references() {
+        // A name, or the member after a dot or `::`, that is passed to a call, returned, assigned or initialized with,
+        // or held in a list or a literal. `self`, `None`, `NULL` and `&x` are not tagged, nor what is assigned to,
+        // except in a destructuring assignment of Rust.
+        let cases: [(Grammar, &str, &[&str]); 9] = [
+            (
+                Grammar::Rust,
+                r#"static HOOK: fn() = install;
+fn run(items: Vec<u8>) -> Option<u8> {
+    let f = parse;
+    items.iter().map(parse).for_each(log::emit);
+    let cb = Handler { on_done: finish, retry };
+    cb.next = [first, self.second];
+    spawn((one, Kind::Two), work());
+    None
+}
+fn pick() -> fn() {
+    chosen
+}
+fn early() -> fn() { return self.wrapper; }
+fn swap() { (a, b) = (b, a); }
+"#,
+                &[
+                    "install 1:21",
+                    "parse 3:13",
+                    "parse 4:22",
+                    "emit 4:43",
+                    "finish 5:33",
+                    "retry 5:41",
+                    "first 6:16",
+                    "second 6:28",
+                    // `Kind::Two` is a type, like any capitalized path.
+                    "one 7:12",
+                    "chosen 11:5",
+                    "wrapper 13:34",
+                    // The targets of a destructuring assignment are expressions too.
+                    "a 14:14",
+                    "b 14:17",
+                    "b 14:23",
+                    "a 14:26",
+                ],
+            ),
+            (
+                Grammar::Go,
+                r#"package main
+
+var hook = install
+
+func run(items []int) func() {
+    f := parse
+    sort.Slice(items, less)
+    h := Handler{OnDone: finish, Retry: pkg.Retry}
+    h.next, g = first, h.second
+    list := []func(){one, two}
+    return wrap
+}
+
+const B = A
+"#,
+                &[
+                    "install 3:12",
+                    "parse 6:10",
+                    "items 7:16",
+                    "less 7:23",
+                    "finish 8:26",
+                    "Retry 8:45",
+                    "first 9:17",
+                    "second 9:26",
+                    "one 10:22",
+                    "two 10:27",
+                    "wrap 11:12",
+                    "A 14:11",
+                ],
+            ),
+            (
+                Grammar::Python,
+                r#"hook = install
+
+def run(items, cb=finish, *, key: Callable = pkg.key):
+    f = parse
+    items.sort(key=less)
+    table = {"a": first, "b": self.second}
+    options = [one, cls.two], (three,), {four}
+    a, b = left, right
+    return wrap, self.other
+"#,
+                &[
+                    "install 1:8",
+                    "finish 3:19",
+                    "key 3:50",
+                    "parse 4:9",
+                    "less 5:20",
+                    "first 6:19",
+                    "second 6:36",
+                    "one 7:16",
+                    "two 7:25",
+                    "three 7:32",
+                    "four 7:42",
+                    "left 8:12",
+                    "right 8:18",
+                    "wrap 9:12",
+                    "other 9:23",
+                ],
+            ),
+            (
+                Grammar::JavaScript,
+                r#"const hook = install
+function run(items) {
+  items.map(render).forEach(this.log)
+  let cb
+  cb = finish
+  const table = { a: first, b: this.second, retry }
+  const list = [one, ns.two]
+  return <Button onClick={handle} render={this.draw}>{wrap}</Button>
+}
+function later(cb = noop, { done = finish } = {}) {}
+class K { handler = this.onClick }
+"#,
+                &[
+                    "install 1:14",
+                    "render 3:13",
+                    "log 3:34",
+                    "finish 5:8",
+                    "first 6:22",
+                    "second 6:37",
+                    "retry 6:45",
+                    "one 7:17",
+                    "two 7:25",
+                    "handle 8:27",
+                    "draw 8:48",
+                    "wrap 8:55",
+                    "noop 10:21",
+                    "finish 10:36",
+                    "onClick 11:26",
+                ],
+            ),
+            (
+                Grammar::TypeScript,
+                r#"const hook: () => void = install
+export function run(items: number[]): () => void {
+  items.map(render)
+  return wrap
+}
+function later(cb: () => void = noop, n = count) {}
+class K { handler = this.onClick; constructor(private svc = dflt) {} }
+"#,
+                &[
+                    "install 1:26",
+                    "render 3:13",
+                    "wrap 4:10",
+                    "noop 6:33",
+                    "count 6:43",
+                    "onClick 7:26",
+                    "dflt 7:61",
+                ],
+            ),
+            (
+                Grammar::Tsx,
+                "const v = <Button onClick={handle} render={this.draw}>{label}</Button>\n",
+                &["handle 1:28", "draw 1:49", "label 1:56"],
+            ),
+            (
+                Grammar::Java,
+                r#"class A {
+  Runnable hook = this::install;
+  Runnable run(List<Integer> items) {
+    items.forEach(System.out::println);
+    items.sort(comparator);
+    Function<String, Integer> f = Integer::parseInt;
+    Supplier<Box> s = Box::new;
+    var g = Foo::<T>conv;
+    cb = finish;
+    int[] list = {one, this.two};
+    return wrap;
+  }
+}
+"#,
+                &[
+                    "install 2:25",
+                    "println 4:31",
+                    "comparator 5:16",
+                    "parseInt 6:44",
+                    "conv 8:21",
+                    "finish 9:10",
+                    "one 10:19",
+                    "two 10:29",
+                    "wrap 11:12",
+                ],
+            ),
+            (
+                Grammar::C,
+                r#"static int (*hook)(void) = install;
+static struct ops dev_ops = { .open = dev_open, dev_close };
+int run(int *items, size_t n) {
+    qsort(items, n, sizeof *items, compare);
+    cb = finish;
+    p->next = &first;
+    use(NULL, s.field);
+    return wrap;
+}
+"#,
+                &[
+                    "install 1:28",
+                    "dev_open 2:39",
+                    "dev_close 2:49",
+                    "items 4:11",
+                    "n 4:18",
+                    "compare 4:36",
+                    "finish 5:10",
+                    "field 7:17",
+                    "wrap 8:12",
+                ],
+            ),
+            (
+                Grammar::Cpp,
+                r#"static auto hook = install;
+int run(std::vector<int> &items) {
+    std::sort(items.begin(), items.end(), compare);
+    auto f = &Widget::draw;
+    auto g = ns::inner::make;
+    cb = finish;
+    Ops ops{one, ns::two};
+    use(nullptr, NULL, obj.field, ptr->next);
+    return wrap;
+}
+void later(int x = dflt, auto h = a::b::c::deep);
+struct S { int y = member_init; };
+"#,
+                &[
+                    "install 1:20",
+                    "compare 3:43",
+                    "draw 4:23",
+                    "make 5:25",
+                    "finish 6:10",
+                    "one 7:13",
+                    "two 7:22",
+                    "field 8:28",
+                    "next 8:40",
+                    "wrap 9:12",
+                    "dflt 11:20",
+                    "deep 11:44",
+                    "member_init 12:20",
+                ],
+            ),
+        ];
+        for (grammar, src, wanted) in cases {
+            let values: Vec<String> = refs(grammar, src)
+                .iter()
+                .filter_map(|r| r.strip_prefix("value ").map(String::from))
+                .collect();
+            assert_eq!(values, wanted, "{grammar:?}");
+        }
+        // The parameter types of a `Callable` are a list, and types.
+        assert_eq!(
+            refs(
+                Grammar::Python,
+                "def g(on: Callable[[Req, pkg.Resp], None]): pass\n"
+            ),
+            ["type Callable 1:11", "type Req 1:21", "type Resp 1:30"]
+        );
+    }
+
+    #[test]
+    fn the_tags_version_is_raised_with_the_queries_and_the_grammars() {
+        // FNV-1a, which is stable across builds, of the query of every grammar and of the node types of the grammars,
+        // which change with most releases that parse differently.
+        let node_types = [
+            tree_sitter_rust::NODE_TYPES,
+            tree_sitter_go::NODE_TYPES,
+            tree_sitter_python::NODE_TYPES,
+            tree_sitter_typescript::TYPESCRIPT_NODE_TYPES,
+            tree_sitter_typescript::TSX_NODE_TYPES,
+            tree_sitter_javascript::NODE_TYPES,
+            tree_sitter_java::NODE_TYPES,
+            tree_sitter_c::NODE_TYPES,
+            tree_sitter_cpp::NODE_TYPES,
+        ];
+        let queries = Grammar::ALL.map(tags_query);
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for text in queries.iter().map(String::as_str).chain(node_types) {
+            for &byte in text.as_bytes().iter().chain(b"\0") {
+                hash = (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
+            }
+        }
+        assert_eq!(
+            (TAGS_VERSION, format!("{hash:016x}")),
+            (1, "ff5321d759a217ce".to_string()),
+            "a query or a grammar has changed: raise TAGS_VERSION if the tags of some file change, and put it here with \
+             the new hash"
+        );
+    }
+
+    #[test]
     fn kinds_are_the_known_ones() {
         let defs = [
             "function",
@@ -1672,7 +2008,7 @@ Foo::Foo() {}
             "namespace",
             "macro",
         ];
-        let refs = ["call", "type", "class", "implementation"];
+        let refs = ["call", "type", "class", "implementation", "value"];
         for (grammar, src) in FIXTURES {
             for tag in tags(grammar, src) {
                 let known = if tag.is_def {

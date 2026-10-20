@@ -459,6 +459,231 @@
 ((namespace_identifier) @name @reference.type
     (#not-eq? @name "std"))
 
+; names used as values, like a function that is passed or kept: passed to a call or a constructor
+; (`std::sort(b, e, compare)`, `std::thread(&Worker::run, this)`), returned, assigned (`auto f = ns::parse;`, a default
+; argument or member `cb = noop`) or held in an initializer (`{ .open = dev_open }`, `Handlers{on_open, on_close}`); up
+; to three qualifiers, like a call. A query cannot tell a function from a variable, so variables are tagged too
+; (`NULL` is no identifier). A plain `&x` is left out: it is mostly a variable passed by address.
+
+([
+    (argument_list
+        [
+            (identifier) @name
+            (field_expression
+                field: (field_identifier) @name)
+            (qualified_identifier
+                name: (identifier) @name)
+            (qualified_identifier
+                name: (qualified_identifier
+                    name: (identifier) @name))
+            (qualified_identifier
+                name: (qualified_identifier
+                    name: (qualified_identifier
+                        name: (identifier) @name)))
+            (pointer_expression
+                argument: [
+                    (qualified_identifier
+                        name: (identifier) @name)
+                    (qualified_identifier
+                        name: (qualified_identifier
+                            name: (identifier) @name))
+                    (qualified_identifier
+                        name: (qualified_identifier
+                            name: (qualified_identifier
+                                name: (identifier) @name)))
+                ])
+        ])
+    (return_statement
+        [
+            (identifier) @name
+            (field_expression
+                field: (field_identifier) @name)
+            (qualified_identifier
+                name: (identifier) @name)
+            (qualified_identifier
+                name: (qualified_identifier
+                    name: (identifier) @name))
+            (qualified_identifier
+                name: (qualified_identifier
+                    name: (qualified_identifier
+                        name: (identifier) @name)))
+            (pointer_expression
+                argument: [
+                    (qualified_identifier
+                        name: (identifier) @name)
+                    (qualified_identifier
+                        name: (qualified_identifier
+                            name: (identifier) @name))
+                    (qualified_identifier
+                        name: (qualified_identifier
+                            name: (qualified_identifier
+                                name: (identifier) @name)))
+                ])
+        ])
+    (init_declarator
+        value: [
+            (identifier) @name
+            (field_expression
+                field: (field_identifier) @name)
+            (qualified_identifier
+                name: (identifier) @name)
+            (qualified_identifier
+                name: (qualified_identifier
+                    name: (identifier) @name))
+            (qualified_identifier
+                name: (qualified_identifier
+                    name: (qualified_identifier
+                        name: (identifier) @name)))
+            (pointer_expression
+                argument: [
+                    (qualified_identifier
+                        name: (identifier) @name)
+                    (qualified_identifier
+                        name: (qualified_identifier
+                            name: (identifier) @name))
+                    (qualified_identifier
+                        name: (qualified_identifier
+                            name: (qualified_identifier
+                                name: (identifier) @name)))
+                ])
+        ])
+    (assignment_expression
+        right: [
+            (identifier) @name
+            (field_expression
+                field: (field_identifier) @name)
+            (qualified_identifier
+                name: (identifier) @name)
+            (qualified_identifier
+                name: (qualified_identifier
+                    name: (identifier) @name))
+            (qualified_identifier
+                name: (qualified_identifier
+                    name: (qualified_identifier
+                        name: (identifier) @name)))
+            (pointer_expression
+                argument: [
+                    (qualified_identifier
+                        name: (identifier) @name)
+                    (qualified_identifier
+                        name: (qualified_identifier
+                            name: (identifier) @name))
+                    (qualified_identifier
+                        name: (qualified_identifier
+                            name: (qualified_identifier
+                                name: (identifier) @name)))
+                ])
+        ])
+    (optional_parameter_declaration
+        default_value: [
+            (identifier) @name
+            (field_expression
+                field: (field_identifier) @name)
+            (qualified_identifier
+                name: (identifier) @name)
+            (qualified_identifier
+                name: (qualified_identifier
+                    name: (identifier) @name))
+            (qualified_identifier
+                name: (qualified_identifier
+                    name: (qualified_identifier
+                        name: (identifier) @name)))
+            (pointer_expression
+                argument: [
+                    (qualified_identifier
+                        name: (identifier) @name)
+                    (qualified_identifier
+                        name: (qualified_identifier
+                            name: (identifier) @name))
+                    (qualified_identifier
+                        name: (qualified_identifier
+                            name: (qualified_identifier
+                                name: (identifier) @name)))
+                ])
+        ])
+    (field_declaration
+        default_value: [
+            (identifier) @name
+            (field_expression
+                field: (field_identifier) @name)
+            (qualified_identifier
+                name: (identifier) @name)
+            (qualified_identifier
+                name: (qualified_identifier
+                    name: (identifier) @name))
+            (qualified_identifier
+                name: (qualified_identifier
+                    name: (qualified_identifier
+                        name: (identifier) @name)))
+            (pointer_expression
+                argument: [
+                    (qualified_identifier
+                        name: (identifier) @name)
+                    (qualified_identifier
+                        name: (qualified_identifier
+                            name: (identifier) @name))
+                    (qualified_identifier
+                        name: (qualified_identifier
+                            name: (qualified_identifier
+                                name: (identifier) @name)))
+                ])
+        ])
+    (initializer_list
+        [
+            (identifier) @name
+            (field_expression
+                field: (field_identifier) @name)
+            (qualified_identifier
+                name: (identifier) @name)
+            (qualified_identifier
+                name: (qualified_identifier
+                    name: (identifier) @name))
+            (qualified_identifier
+                name: (qualified_identifier
+                    name: (qualified_identifier
+                        name: (identifier) @name)))
+            (pointer_expression
+                argument: [
+                    (qualified_identifier
+                        name: (identifier) @name)
+                    (qualified_identifier
+                        name: (qualified_identifier
+                            name: (identifier) @name))
+                    (qualified_identifier
+                        name: (qualified_identifier
+                            name: (qualified_identifier
+                                name: (identifier) @name)))
+                ])
+        ])
+    (initializer_pair
+        value: [
+            (identifier) @name
+            (field_expression
+                field: (field_identifier) @name)
+            (qualified_identifier
+                name: (identifier) @name)
+            (qualified_identifier
+                name: (qualified_identifier
+                    name: (identifier) @name))
+            (qualified_identifier
+                name: (qualified_identifier
+                    name: (qualified_identifier
+                        name: (identifier) @name)))
+            (pointer_expression
+                argument: [
+                    (qualified_identifier
+                        name: (identifier) @name)
+                    (qualified_identifier
+                        name: (qualified_identifier
+                            name: (identifier) @name))
+                    (qualified_identifier
+                        name: (qualified_identifier
+                            name: (qualified_identifier
+                                name: (identifier) @name)))
+                ])
+        ])
+]) @reference.value
+
 ; every type position (defined types are matched by the patterns above)
 
 (type_identifier) @name @reference.type

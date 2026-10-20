@@ -46,6 +46,100 @@
             attribute: (identifier) @name)
     ]) @reference.call
 
+; the parameter types of `Callable[[A, B], C]`, which are a list, except the builtin types
+
+((type
+    (list
+        [
+            (identifier) @name
+            (attribute
+                attribute: (identifier) @name)
+        ])) @reference.type
+    (#not-match? @name "^(bool|bytes|complex|dict|float|frozenset|int|list|object|set|str|tuple|type)$"))
+
+; names used as values, like a function that is wrapped or kept: passed to a call (`deco(f)`, `Thread(target=f)`),
+; returned (`return wrapper`), assigned (`handler = f`, a default `cb=f`) or held (`[f, g]`, `{"a": f}`); a query cannot
+; tell a function from a variable, so variables are tagged too, except `self` and `cls`
+
+((call
+    arguments: (argument_list
+        [
+            (identifier) @name
+            (attribute
+                attribute: (identifier) @name)
+            (keyword_argument
+                value: [
+                    (identifier) @name
+                    (attribute
+                        attribute: (identifier) @name)
+                ])
+        ])) @reference.value
+    (#not-match? @name "^(self|cls)$"))
+
+(([
+    (return_statement
+        [
+            (identifier) @name
+            (attribute
+                attribute: (identifier) @name)
+            (expression_list
+                [
+                    (identifier) @name
+                    (attribute
+                        attribute: (identifier) @name)
+                ])
+        ])
+    (assignment
+        right: [
+            (identifier) @name
+            (attribute
+                attribute: (identifier) @name)
+            (expression_list
+                [
+                    (identifier) @name
+                    (attribute
+                        attribute: (identifier) @name)
+                ])
+        ])
+    (default_parameter
+        value: [
+            (identifier) @name
+            (attribute
+                attribute: (identifier) @name)
+        ])
+    (typed_default_parameter
+        value: [
+            (identifier) @name
+            (attribute
+                attribute: (identifier) @name)
+        ])
+    (list
+        [
+            (identifier) @name
+            (attribute
+                attribute: (identifier) @name)
+        ])
+    (tuple
+        [
+            (identifier) @name
+            (attribute
+                attribute: (identifier) @name)
+        ])
+    (set
+        [
+            (identifier) @name
+            (attribute
+                attribute: (identifier) @name)
+        ])
+    (pair
+        value: [
+            (identifier) @name
+            (attribute
+                attribute: (identifier) @name)
+        ])
+]) @reference.value
+    (#not-match? @name "^(self|cls)$"))
+
 ; base classes
 
 (class_definition

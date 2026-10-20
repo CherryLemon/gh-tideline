@@ -63,6 +63,51 @@
 (annotation
     name: (identifier) @name) @reference.type
 
+; names used as values, like a method that is passed or kept: a method reference (`list.forEach(this::process)`,
+; `Foo::parse`), and a name passed to a call or `new`, returned, assigned or held in an array initializer; a query cannot
+; tell a constant from a variable, so variables are tagged too
+
+(method_reference
+    [
+        "::"
+        (type_arguments)
+    ]
+    .
+    (identifier) @name) @reference.value
+
+([
+    (argument_list
+        [
+            (identifier) @name
+            (field_access
+                field: (identifier) @name)
+        ])
+    (return_statement
+        [
+            (identifier) @name
+            (field_access
+                field: (identifier) @name)
+        ])
+    (variable_declarator
+        value: [
+            (identifier) @name
+            (field_access
+                field: (identifier) @name)
+        ])
+    (assignment_expression
+        right: [
+            (identifier) @name
+            (field_access
+                field: (identifier) @name)
+        ])
+    (array_initializer
+        [
+            (identifier) @name
+            (field_access
+                field: (identifier) @name)
+        ])
+]) @reference.value
+
 ; every other type position (`implements Foo`, declarations, generics, casts), except `var`
 
 ((type_identifier) @name @reference.type

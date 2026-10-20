@@ -75,6 +75,68 @@
                 name: (type_identifier) @name)
         ])) @reference.call
 
+; names used as values, like a function that is passed or kept: passed to a call (`http.HandleFunc("/", handle)`),
+; returned, assigned (`h := s.handle`, `var h = handle`, `const B = A`) or held (`[]func(){a, b}`,
+; `Handler{Fn: handle}`); a query cannot tell a function from a variable, so variables are tagged too
+
+([
+    (argument_list
+        [
+            (identifier) @name
+            (selector_expression
+                field: (field_identifier) @name)
+        ])
+    (return_statement
+        (expression_list
+            [
+                (identifier) @name
+                (selector_expression
+                    field: (field_identifier) @name)
+            ]))
+    (assignment_statement
+        right: (expression_list
+            [
+                (identifier) @name
+                (selector_expression
+                    field: (field_identifier) @name)
+            ]))
+    (short_var_declaration
+        right: (expression_list
+            [
+                (identifier) @name
+                (selector_expression
+                    field: (field_identifier) @name)
+            ]))
+    (var_spec
+        value: (expression_list
+            [
+                (identifier) @name
+                (selector_expression
+                    field: (field_identifier) @name)
+            ]))
+    (const_spec
+        value: (expression_list
+            [
+                (identifier) @name
+                (selector_expression
+                    field: (field_identifier) @name)
+            ]))
+    (literal_value
+        (literal_element
+            [
+                (identifier) @name
+                (selector_expression
+                    field: (field_identifier) @name)
+            ]))
+    (keyed_element
+        value: (literal_element
+            [
+                (identifier) @name
+                (selector_expression
+                    field: (field_identifier) @name)
+            ]))
+]) @reference.value
+
 ; every type position except the predeclared types (declared types are matched by the patterns above)
 
 ((type_identifier) @name @reference.type
