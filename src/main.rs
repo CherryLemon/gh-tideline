@@ -3,6 +3,7 @@ mod config;
 mod error;
 mod git;
 mod github;
+mod index;
 mod pr;
 mod server;
 mod state;
@@ -106,7 +107,16 @@ async fn run(cli: Cli) -> Result<(), String> {
             None
         }
     };
-    let pr_service = Arc::new(pr::PrService::new(repos, state_db));
+    // Without it only code navigation across the repository is lost; a file's symbols are still
+    // parsed on demand.
+    let index_db = match index::db::IndexDb::open(&paths.cache_dir.join("index.sqlite")) {
+        Ok(db) => Some(db),
+        Err(e) => {
+            eprintln!("gh-tideline: code navigation index is disabled: {e}");
+            None
+        }
+    };
+    let pr_service = Arc::new(pr::PrService::new(repos, state_db, index_db));
     let state = server::state(
         port,
         secret.clone(),

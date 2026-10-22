@@ -49,10 +49,24 @@ Tideline sits in between:
 - **Drafts survive a reload**: unsent text is kept per tab. Pending comments live on GitHub, so a review started here can be finished on github.com and the other way round.
 - **Viewed marks** sync both ways with GitHub. `v` marks the file and moves to the next unviewed one.
 
+**Code navigation**
+- **Go to definition**: `Ctrl+B` on a name, or `Ctrl+click` on it (`Cmd+click` on macOS). The name under the pointer is underlined while `Ctrl` is held; keywords, and names in comments and strings, are not links. One definition, or the one in the same file, opens at its line; otherwise they are listed to choose from, nearest first. A file the PR changes opens as a diff; any other file opens read-only from the head tree.
+- **Usages**: `Ctrl+click` or `Ctrl+B` on the name of a definition itself lists the places that use it, with the line of each. Names are matched, not resolved by type, and the list says "matched by name".
+- **Back and forward**: `Ctrl+Alt+←` / `Ctrl+Alt+→` step through the places you visited, as in JetBrains. Every jump is a browser history entry, so the browser's Back and Forward work too and return to the caret. GNOME and KDE may take `Ctrl+Alt+←/→` for switching workspaces; the browser's keys still work there.
+- **Sticky header**: the functions and classes around the first visible line (up to four, fewer in a short editor or where a bar of collapsed unchanged lines is near the top) stay pinned at the top of each editor, and a click on a row goes to it. The **Sticky** button in the top bar turns it off.
+- **Built on the first jump**, not when a PR opens: tree-sitter indexes the source files of the PR's head (and of its merge base, when you jump from the old side) behind a dialog that shows progress and can be cancelled with `Esc`. The index is kept per file content, so another PR in the same repo only indexes what is new. It is stored in `index.sqlite` in the cache directory, and nothing is evicted yet.
+- **Languages**: Rust, Go, Python, TypeScript/TSX, JavaScript, Java, C and C++ (a `.h` file is C++ when its content says so).
+- **Speed**: the first index of cli/cli takes about 4 s, and that of microsoft/vscode (15,000 source files) less than a minute. A lookup takes milliseconds.
+
+<p align="center">
+  <img src="docs/images/navigation.png" alt="Ctrl+click on HelperConfig in cli/cli#14673 lists its three declarations while the sticky header pins the enclosing function loginRun" width="900">
+</p>
+
 **JetBrains-style keyboard**
 - `F7` / `Shift+F7`: next/previous change. At the end of a file it continues into the next file.
 - `Alt+↓` / `Alt+↑`: next/previous file.
 - `Shift Shift` or `Ctrl+P`: fuzzy file finder.
+- `Ctrl+B` / `Ctrl+click`: go to definition; on a definition's own name, its usages. `Ctrl+Alt+←` / `Ctrl+Alt+→`: back / forward.
 - `v`: mark the file as viewed; `c`: comment on the current line or selection; `Ctrl+Enter`: send a comment or submit the review.
 
 **Changes tree**
@@ -141,7 +155,8 @@ The local server holds your GitHub token, so it treats every website and every o
 | A malicious SVG or HTML file in a PR runs script on the app's origin | Blobs are always served as `octet-stream` with `nosniff` and `CSP: sandbox`; SVGs are converted to PNG on a canvas before display |
 | A comment's HTML runs script, or leaks the local URL to the sites it links or loads images from | GitHub's rendered HTML is sanitized with DOMPurify (no styles, forms or frames; `https:` links only), and the app page has a strict Content-Security-Policy and `Referrer-Policy: no-referrer` |
 | A website posts comments or reviews in your name | Writes need the session cookie, a same-origin `Origin` and the custom header, like every other API call |
-| Other users read cached private code | Cache and config directories are `0700`; the secret file is `0600` |
+| Other users read cached private code | Cache and config directories are `0700`; the secret file and the code navigation index (`index.sqlite`) are `0600` |
+| A line of source in a popup list or the sticky header runs as markup | Both show repository text as text. The colors of the sticky header are read from Monaco's output through an inert `DOMParser` document, keeping only the text and its token classes |
 | The token shows up in the process list | It reaches git through `GIT_CONFIG_*` environment variables, never command-line arguments, and git gets only an allowlisted environment |
 
 ## Roadmap
@@ -149,10 +164,7 @@ The local server holds your GitHub token, so it treats every website and every o
 - [x] **M0 – read diffs** (v0.1.0)
 - [x] **M1 – review context** (v0.2.0): viewed state synced with GitHub, the full project tree
 - [x] **M2 – review threads and writing** (v0.3.0): threads in the diff, comments, replies, resolving, submitting reviews, Markdown preview
-- [ ] **M3 – code navigation** (v0.4.0)
-  - tree-sitter based go to definition (`Ctrl+B` / `Ctrl+click`) and find usages (`Alt+F7`)
-  - Sticky header showing the current function or class
-  - Back / forward through visited locations with `Ctrl+Alt+←` / `Ctrl+Alt+→`, as in JetBrains
+- [x] **M3 – code navigation** (v0.4.0): tree-sitter based go to definition and usages (`Ctrl+B` / `Ctrl+click`), a sticky header with the enclosing function or class, back / forward through visited locations (`Ctrl+Alt+←` / `Ctrl+Alt+→`)
 - [ ] **Later**
   - Per-commit and commit-range views
   - "Since my last review", showing only the author's own changes even after a rebase
@@ -173,7 +185,7 @@ make dev     # prints the dev workflow
 - **Without a backend:** run `pnpm dev:mock` to work on the UI against a built-in fake PR.
 - **After frontend changes:** debug builds read `web/dist` from disk, so the result of `pnpm build` shows up without recompiling the backend.
 
-**Releasing:** bump `version` in `Cargo.toml` (and `Cargo.lock` via `cargo check`) and in `web/package.json`, commit, then push a matching tag such as `v0.3.0`. The [release workflow](.github/workflows/release.yml) tests, builds the binaries and publishes the GitHub release.
+**Releasing:** bump `version` in `Cargo.toml` (and `Cargo.lock` via `cargo check`) and in `web/package.json`, commit, then push a matching tag such as `v0.4.0`. The [release workflow](.github/workflows/release.yml) tests, builds the binaries and publishes the GitHub release.
 
 ## License
 

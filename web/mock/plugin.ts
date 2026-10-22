@@ -33,6 +33,8 @@ export function mockApi(): Plugin {
     async configureServer(server) {
       const data = await import('./data.ts')
       const review = await import('./review.ts')
+      const nav = await import('./nav.ts')
+      const index = new nav.MockIndex((oid) => data.blobs.get(oid))
       server.config.logger.info(`  [mock] serving fake PR with ${data.files.length} files at /github.com/acme/demo-app/pull/42`)
 
       server.middlewares.use((req: IncomingMessage, res: ServerResponse, next: () => void) => {
@@ -62,6 +64,25 @@ export function mockApi(): Plugin {
         if (url.pathname === '/api/__mock/push' && req.method === 'POST') {
           data.setHead('e'.repeat(40))
           return json(res, 200, { ok: true })
+        }
+        // Test hook: every commit unindexed again. `{"durationMs": 1500}`: how long the builds to come take;
+        // `{"unavailable": true}`: the index cannot be used (503).
+        if (url.pathname === '/api/__mock/index-reset' && req.method === 'POST') {
+          void readJson(req).then((body) => {
+            index.reset(body as { durationMs?: unknown; unavailable?: unknown } | null)
+            json(res, 200, { ok: true })
+          })
+          return
+        }
+        // Test hook: the next index build to start fails part of the way through, with this message.
+        if (url.pathname === '/api/__mock/index-fail-next' && req.method === 'POST') {
+          void readJson(req).then((body) => {
+            const { message = 'Could not download the files: connection reset' } = (body ?? {}) as { message?: unknown }
+            if (typeof message !== 'string') return error(res, 400, 'bad_request', 'expected {message?}')
+            index.failNext(message)
+            json(res, 200, { ok: true })
+          })
+          return
         }
         if (url.pathname === '/api/__mock/fail-next' && req.method === 'POST') {
           void readJson(req).then((body) => {
@@ -98,6 +119,12 @@ export function mockApi(): Plugin {
               // Like the server: a head it has moved on from gets the new head and no entries.
               const asked = url.searchParams.get('head')
               return json(res, 200, { head: pr.head.sha, entries: asked && asked !== pr.head.sha ? [] : data.tree })
+            }
+            if ((sub === 'index' || sub === 'definitions' || sub === 'references') && parts.length === 6) {
+              const body = req.method === 'POST' ? await readJson(req) : null
+              const pull = { head: pr.head.sha, commits: { head: { sha: pr.head.sha, tree: data.tree }, base: { sha: pr.mergeBase, tree: data.baseTree } } }
+              const r = index.handle(req.method ?? 'GET', sub, n, url.searchParams, body, pull)
+              if (r) return json(res, r.status, r.body)
             }
             if (sub === 'threads' && parts.length === 6 && req.method === 'GET') {
               await delay(250)
@@ -165,6 +192,16 @@ export function mockApi(): Plugin {
             await delay(300)
             const r = review.renderPreview(body)
             return json(res, r.status, r.body)
+          }
+          if (kind === 'blobs' && id && sub === 'symbols' && req.method === 'GET') {
+            if (!/^[0-9a-f]{40}$/.test(id)) return error(res, 400, 'bad_request', 'invalid oid')
+            const blob = data.blobs.get(id)
+            if (!blob) return error(res, 404, 'not_found', `blob ${id} not found`)
+            const path = url.searchParams.get('path')
+            if (!path || path.length > 4096 || /[\x00-\x1f]/.test(path)) return error(res, 400, 'bad_request', 'invalid path')
+            await delay(30)
+            res.setHeader('Cache-Control', 'no-store')
+            return json(res, 200, nav.fileSymbols(path, blob))
           }
           if (kind === 'blobs' && id && sub === undefined) {
             if (!/^[0-9a-f]{40}$/.test(id)) return error(res, 400, 'bad_request', 'invalid oid')

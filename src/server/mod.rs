@@ -1,6 +1,7 @@
 //! HTTP server: routes, auth flow, API handlers and static assets.
 
 mod assets;
+mod nav;
 mod review;
 pub mod security;
 
@@ -74,6 +75,20 @@ pub fn router(state: AppState) -> Router {
             put(set_viewed),
         )
         .route(
+            "/api/{host}/{owner}/{repo}/pulls/{n}/index",
+            post(nav::start_index)
+                .get(nav::index_status)
+                .delete(nav::cancel_index),
+        )
+        .route(
+            "/api/{host}/{owner}/{repo}/pulls/{n}/definitions",
+            get(nav::definitions),
+        )
+        .route(
+            "/api/{host}/{owner}/{repo}/pulls/{n}/references",
+            get(nav::references),
+        )
+        .route(
             "/api/{host}/{owner}/{repo}/pulls/{n}/threads",
             get(review::threads).post(review::create_thread),
         )
@@ -94,6 +109,10 @@ pub fn router(state: AppState) -> Router {
             patch(review::edit_comment).delete(review::delete_comment),
         )
         .route("/api/{host}/{owner}/{repo}/blobs/{oid}", get(blob))
+        .route(
+            "/api/{host}/{owner}/{repo}/blobs/{oid}/symbols",
+            get(nav::symbols),
+        )
         .route(
             "/api/{host}/{owner}/{repo}/markdown",
             post(review::markdown),
